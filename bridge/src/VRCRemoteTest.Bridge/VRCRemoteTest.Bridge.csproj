@@ -1,0 +1,42 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    v1 uses plain net10.0 (no Windows-specific APIs yet: no WMI/System.Management).
+    .NET 10 is an LTS release, matching the SDK/runtime available on the dev machine.
+    Phase 4 (VRChat process monitoring / auto-launch) will require switching to
+    net10.0-windows when System.Management is introduced. See docs/sdk-api-notes.md.
+  -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <RootNamespace>VRCRemoteTest.Bridge</RootNamespace>
+    <AssemblyName>VRCRemoteTest.Bridge</AssemblyName>
+    <InvariantGlobalization>true</InvariantGlobalization>
+  </PropertyGroup>
+
+  <!--
+    RuntimeIdentifier/SelfContained/PublishSingleFile are deliberately scoped to
+    publish-only (not a plain PropertyGroup), so plain build/test commands still
+    produce a normal framework-dependent output the test project can load on any
+    dev machine (including macOS). The actual Windows single-file binary is
+    produced via the publish command documented in bridge/README.md.
+  -->
+  <PropertyGroup Condition="'$(PublishSingleFile)' == 'true' Or '$(_IsPublishing)' == 'true'">
+    <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Extensions.Hosting" Version="8.0.1" />
+    <PackageReference Include="Serilog" Version="4.2.0" />
+    <PackageReference Include="Serilog.Extensions.Hosting" Version="8.0.0" />
+    <PackageReference Include="Serilog.Sinks.Console" Version="6.0.0" />
+    <PackageReference Include="Serilog.Sinks.File" Version="6.0.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="VRCRemoteTest.Bridge.Tests" />
+  </ItemGroup>
+
+</Project>

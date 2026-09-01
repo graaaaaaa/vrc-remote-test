@@ -1,0 +1,122 @@
+# ============================================================================
+# VRC Remote Test — monorepo .gitignore
+# ============================================================================
+# このリポジトリは以下を含む:
+#   package/  — Unity Editor用VPMパッケージ
+#   bridge/   — Windows Bridge (.NET 10 プロジェクト)
+#
+# Unityプロジェクト本体はこのリポジトリには含まない。
+# Unityプロジェクト向けの.gitignoreはALCOM/VCCが生成する。
+# 参照: https://vcc.docs.vrchat.com/vpm/source-control/
+
+# ============================================================================
+# .NET (Windows Bridge)
+# ============================================================================
+bridge/**/bin/
+bridge/**/obj/
+bridge/**/publish/
+
+# ============================================================================
+# VRC Remote Test — ランタイム生成物 (コミット対象外)
+# ============================================================================
+# Build artifact
+*.vrcw
+*.part
+
+# Bridge staging/processing directories
+**/incoming/
+**/processing/
+**/archive/
+**/failed/
+**/results/
+
+# Bridge status (heartbeat等)
+**/status/
+
+# VRChat log mirror
+**/logs/vrchat-latest.log
+
+# ============================================================================
+# ローカル設定 / シークレット (コミット対象外)
+# ============================================================================
+# Bridge config は %LOCALAPPDATA% に置くが、リポジトリに混入した場合に備える
+config.json
+*.secret
+*.pfx
+*.pem
+
+# ============================================================================
+# Unity パッケージ開発用
+# ============================================================================
+# Unity が自動生成するプロジェクトファイル (package/ 内には生成されないが念のため)
+# 注意: bridge/ の .csproj/.sln は実プロジェクトファイルなので除外しない
+/package/**/*.csproj
+/package/**/*.sln
+
+# Unity 自動生成
+[Ll]ibrary/
+[Tt]emp/
+[Oo]bj/
+[Bb]uild/
+[Bb]uilds/
+[Ll]ogs/
+[Uu]ser[Ss]ettings/
+[Mm]emoryCaptures/
+[Rr]ecordings/
+ExportedObj/
+
+# Unity meta (対応するアセットが無視される場合のみ)
+*.pidb.meta
+*.pdb.meta
+*.mdb.meta
+sysinfo.txt
+crashlytics-build.log
+
+# Unity ビルド出力
+*.apk
+*.aab
+*.unitypackage
+*.app
+
+# VPM パッケージは VCC/ALCOM のリゾルバーが復元する
+# (VRChat SDK を Git にコミットしてはならない)
+# 参照: https://vcc.docs.vrchat.com/vpm/source-control/
+
+# ============================================================================
+# Claude Code
+# ============================================================================
+.claude/settings.local.json
+
+# ============================================================================
+# IDE / エディタ
+# ============================================================================
+.vs/
+.idea/
+.vscode/
+.consulo/
+*.suo
+*.user
+*.userprefs
+*.swp
+*.pidb
+*.booproj
+*.svd
+*.pdb
+*.mdb
+*.opendb
+*.VC.db
+*.unityproj
+
+# ============================================================================
+# OS
+# ============================================================================
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
