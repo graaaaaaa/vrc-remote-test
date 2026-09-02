@@ -27,7 +27,7 @@ public class BuildManifestSerializationTests
         manifest.BuildId.Should().Be("20260901T112522481Z-a91f02cc");
         manifest.FileName.Should().Be("20260901T112522481Z-a91f02cc.vrcw");
         manifest.Size.Should().Be(48233421);
-        manifest.Sha256.Should().Be("3a7bd3e2360a3d29eea436fcfb7e44c735d117c42d1c1835420b6b9942dd4f1");
+        manifest.Sha256.Should().Be("8f2a5f6802f9dc5307740870312b2df9a99104960df3a9df66166d54665d4d7c");
         manifest.CreatedAtUtc.Should().Be(DateTimeOffset.Parse("2026-09-01T11:25:22.481Z"));
     }
 

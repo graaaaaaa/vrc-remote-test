@@ -65,6 +65,12 @@ config.json
 [Rr]ecordings/
 ExportedObj/
 
+# 上記 [Bb]uild/ はUnityのビルド出力ディレクトリを想定した除外ルールだが、
+# package/ 内には "Build" という名前のソースコードディレクトリ
+# (package/Editor/Build/, package/Tests/Editor/Build/) が存在するため、
+# それらを明示的に復活させる。
+!package/**/Build/
+
 # Unity meta (対応するアセットが無視される場合のみ)
 *.pidb.meta
 *.pdb.meta
