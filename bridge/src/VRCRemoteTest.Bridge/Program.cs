@@ -64,6 +64,10 @@ try
     builder.Services.AddSingleton<IVrchatStatusWriter, VrchatStatusWriter>();
     builder.Services.AddHostedService<VrchatMonitorService>();
 
+    // Phase 4.1: reuses IVrchatProcessMonitor above; only invoked by StagingWatcher when AutoLaunchVrchat is true.
+    builder.Services.AddSingleton<IVrchatLauncher, VrchatLauncher>();
+    builder.Services.AddSingleton<IVrchatReadinessCoordinator, VrchatReadinessCoordinator>();
+
     using var host = builder.Build();
 
     // Fail fast on invalid configuration (e.g. missing VrchatWorldsDirectory) before

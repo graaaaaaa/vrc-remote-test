@@ -4,6 +4,7 @@ using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using VRCRemoteTest.Bridge.Configuration;
 using VRCRemoteTest.Bridge.Protocol;
+using VRCRemoteTest.Bridge.VRChat;
 
 namespace VRCRemoteTest.Bridge.Deployment;
 
@@ -29,6 +30,7 @@ public sealed class StagingWatcher : BackgroundService, IBridgeWatcher
     private readonly IWorldInstaller _installer;
     private readonly IResultWriter _resultWriter;
     private readonly ICleanupService _cleanupService;
+    private readonly IVrchatReadinessCoordinator _readinessCoordinator;
     private readonly ILogger<StagingWatcher> _logger;
 
     public StagingWatcher(
@@ -37,6 +39,7 @@ public sealed class StagingWatcher : BackgroundService, IBridgeWatcher
         IWorldInstaller installer,
         IResultWriter resultWriter,
         ICleanupService cleanupService,
+        IVrchatReadinessCoordinator readinessCoordinator,
         ILogger<StagingWatcher> logger)
     {
         _options = options.Value;
@@ -44,6 +47,7 @@ public sealed class StagingWatcher : BackgroundService, IBridgeWatcher
         _installer = installer;
         _resultWriter = resultWriter;
         _cleanupService = cleanupService;
+        _readinessCoordinator = readinessCoordinator;
         _logger = logger;
     }
 
@@ -205,6 +209,39 @@ public sealed class StagingWatcher : BackgroundService, IBridgeWatcher
                 validation.ErrorMessage ?? "Validation failed.",
                 ResultsDir);
             return;
+        }
+
+        if (_options.AutoLaunchVrchat)
+        {
+            ReadinessResult readiness;
+            try
+            {
+                readiness = await _readinessCoordinator.EnsureReadyAsync(cancellationToken);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                // Without this catch, an unexpected exception here would escape to
+                // ExecuteAsync's outer catch, leaving no BuildResult written at
+                // all -- Unity would then hit a generic RESULT_TIMEOUT instead of
+                // an immediate, informative VRCHAT_START_FAILED (Codex plan
+                // review Phase 4.1, Round 2, confidence 0.93).
+                _logger.LogError(
+                    ex, "Unexpected error during VRChat readiness check for build {BuildId}.", manifest.BuildId);
+                MoveToFailed(claimedManifestPath, artifactPath);
+                _resultWriter.WriteFailure(manifest.BuildId, ErrorCode.VrchatStartFailed, ex.Message, ResultsDir);
+                return;
+            }
+
+            if (!readiness.IsReady)
+            {
+                _logger.LogWarning(
+                    "Build {BuildId}: VRChat readiness check failed: {Code} {Message}",
+                    manifest.BuildId, readiness.ErrorCode, readiness.ErrorMessage);
+                MoveToFailed(claimedManifestPath, artifactPath);
+                _resultWriter.WriteFailure(
+                    manifest.BuildId, readiness.ErrorCode!, readiness.ErrorMessage!, ResultsDir);
+                return;
+            }
         }
 
         try

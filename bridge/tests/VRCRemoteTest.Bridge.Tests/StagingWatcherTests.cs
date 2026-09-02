@@ -7,6 +7,7 @@ using Microsoft.Extensions.Options;
 using VRCRemoteTest.Bridge.Configuration;
 using VRCRemoteTest.Bridge.Deployment;
 using VRCRemoteTest.Bridge.Protocol;
+using VRCRemoteTest.Bridge.VRChat;
 using Xunit;
 
 namespace VRCRemoteTest.Bridge.Tests;
@@ -35,7 +36,11 @@ public class StagingWatcherTests : IDisposable
         try { Directory.Delete(_tempDir, recursive: true); } catch (IOException) { }
     }
 
-    private StagingWatcher CreateWatcher(long maxSize = 1024, int retainBuilds = 10) =>
+    private StagingWatcher CreateWatcher(
+        long maxSize = 1024,
+        int retainBuilds = 10,
+        bool autoLaunchVrchat = false,
+        IVrchatReadinessCoordinator? readinessCoordinator = null) =>
         new(
             Options.Create(new BridgeOptions
             {
@@ -43,11 +48,13 @@ public class StagingWatcherTests : IDisposable
                 VrchatWorldsDirectory = _worldsDir,
                 MaxArtifactSizeBytes = maxSize,
                 RetainBuilds = retainBuilds,
+                AutoLaunchVrchat = autoLaunchVrchat,
             }),
             new PackageValidator(),
             new WorldInstaller(),
             new ResultWriter(),
             new CleanupService(),
+            readinessCoordinator ?? new FakeVrchatReadinessCoordinator(),
             NullLogger<StagingWatcher>.Instance);
 
     private static void WriteIncomingBuild(string stagingDir, string buildId, byte[] artifactBytes)
@@ -212,5 +219,77 @@ public class StagingWatcherTests : IDisposable
         }
 
         Directory.GetFiles(_worldsDir, "vrc-remote-*.vrcw").Should().HaveCount(2);
+    }
+
+    [Fact]
+    public async Task AutoLaunchVrchat_disabled_never_calls_the_readiness_coordinator()
+    {
+        var readiness = new FakeVrchatReadinessCoordinator();
+        var watcher = CreateWatcher(autoLaunchVrchat: false, readinessCoordinator: readiness);
+        WriteIncomingBuild(_stagingDir, "build-no-autolaunch", Encoding.UTF8.GetBytes("fake-world-bundle"));
+
+        await watcher.RunOnceAsync(CancellationToken.None);
+
+        readiness.EnsureReadyCalled.Should().BeFalse();
+        File.Exists(Path.Combine(_worldsDir, "vrc-remote-build-no-autolaunch.vrcw")).Should().BeTrue();
+    }
+
+    [Fact]
+    public async Task AutoLaunchVrchat_enabled_calls_the_readiness_coordinator_before_deploying()
+    {
+        var readiness = new FakeVrchatReadinessCoordinator { ResultToReturn = ReadinessResult.Ready() };
+        var watcher = CreateWatcher(autoLaunchVrchat: true, readinessCoordinator: readiness);
+        WriteIncomingBuild(_stagingDir, "build-autolaunch-ok", Encoding.UTF8.GetBytes("fake-world-bundle"));
+
+        await watcher.RunOnceAsync(CancellationToken.None);
+
+        readiness.EnsureReadyCalled.Should().BeTrue();
+        File.Exists(Path.Combine(_worldsDir, "vrc-remote-build-autolaunch-ok.vrcw")).Should().BeTrue();
+    }
+
+    [Fact]
+    public async Task AutoLaunchVrchat_enabled_and_readiness_failure_quarantines_the_build_without_deploying()
+    {
+        var readiness = new FakeVrchatReadinessCoordinator
+        {
+            ResultToReturn = ReadinessResult.Failure(ErrorCode.VrchatStartTimeout, "Timed out waiting for VRChat."),
+        };
+        var watcher = CreateWatcher(autoLaunchVrchat: true, readinessCoordinator: readiness);
+        WriteIncomingBuild(_stagingDir, "build-autolaunch-timeout", Encoding.UTF8.GetBytes("fake-world-bundle"));
+
+        await watcher.RunOnceAsync(CancellationToken.None);
+
+        Directory.GetFiles(_worldsDir).Should().BeEmpty();
+        File.Exists(Path.Combine(_stagingDir, "failed", "build-autolaunch-timeout.ready.json")).Should().BeTrue();
+
+        var resultJson = await File.ReadAllTextAsync(
+            Path.Combine(_stagingDir, "results", "build-autolaunch-timeout.json"));
+        var result = JsonSerializer.Deserialize<BuildResult>(
+            resultJson, new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+        result!.Status.Should().Be("failed");
+        result.ErrorCode.Should().Be(ErrorCode.VrchatStartTimeout);
+    }
+
+    [Fact]
+    public async Task AutoLaunchVrchat_enabled_and_readiness_throws_writes_VrchatStartFailed_without_crashing()
+    {
+        var readiness = new FakeVrchatReadinessCoordinator
+        {
+            ThrowOnEnsureReady = new InvalidOperationException("simulated WMI failure"),
+        };
+        var watcher = CreateWatcher(autoLaunchVrchat: true, readinessCoordinator: readiness);
+        WriteIncomingBuild(_stagingDir, "build-autolaunch-throws", Encoding.UTF8.GetBytes("fake-world-bundle"));
+
+        var act = async () => await watcher.RunOnceAsync(CancellationToken.None);
+
+        await act.Should().NotThrowAsync();
+        Directory.GetFiles(_worldsDir).Should().BeEmpty();
+
+        var resultJson = await File.ReadAllTextAsync(
+            Path.Combine(_stagingDir, "results", "build-autolaunch-throws.json"));
+        var result = JsonSerializer.Deserialize<BuildResult>(
+            resultJson, new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+        result!.Status.Should().Be("failed");
+        result.ErrorCode.Should().Be(ErrorCode.VrchatStartFailed);
     }
 }

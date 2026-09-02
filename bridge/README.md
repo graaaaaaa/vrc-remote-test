@@ -16,7 +16,7 @@ bridge/
 │   ├── Configuration/              — config.json読み込み・検証
 │   ├── Protocol/                   — BuildManifest / BuildResult / VrchatStatus (JSON wire format)
 │   ├── Deployment/                 — 検証・配置・クリーンアップ・監視ループ
-│   └── VRChat/                     — VRChatプロセス監視 (Phase 4a)
+│   └── VRChat/                     — VRChatプロセス監視 (Phase 4a) + 自動起動 (Phase 4.1)
 └── tests/VRCRemoteTest.Bridge.Tests/ — xUnit
     └── fixtures/                   — golden JSONフィクスチャ (Unity側と共有)
 ```
@@ -26,7 +26,8 @@ bridge/
 Codexレビューを経て、Bridgeは「フルオーケストレーションサービス」ではなく「ファイル検証・配置に特化したプロモーター」として設計しています。
 
 - **heartbeatなし**: ビルドごとに1つの結果ファイル (`results/{buildId}.json`) のみ
-- **VRChatプロセス監視のみ、自動起動なし**: `VrchatMonitorService`が10秒間隔でVRChatプロセスと`--watch-worlds`引数の有無を`status/vrchat-status.json`へ書き出す（Phase 4a）。Unity側のpreflight表示専用で、ビルドの成否には一切影響しない。VRChatの自動起動（`autoLaunch`）は未実装（Phase 4.1で計画予定）
+- **VRChatプロセス監視**: `VrchatMonitorService`が10秒間隔でVRChatプロセスと`--watch-worlds`引数の有無を`status/vrchat-status.json`へ書き出す（Phase 4a）。Unity側のpreflight表示専用で、ビルドの成否には一切影響しない
+- **VRChat自動起動（`AutoLaunchVrchat`、デフォルトOFF）**: 有効時、VRChat未起動ならBridgeが`--watch-worlds`付きで自動起動し、準備が整うまで待ってからdeployする（Phase 4.1）。既に`--watch-worlds`無しで起動中のVRChatは勝手に再起動しない。準備確認は仕様書§31の「新しいoutput_logファイル出現」ではなく、`VrchatMonitorService`と同じWMIベースのプロセス監視シグナルの安定確認＋起動時刻からの最低待機時間（`StartupSettleDelay`）を組み合わせた方式を採用している（意図的な仕様逸脱、詳細は`VrchatReadinessCoordinator.cs`のコメント参照）
 - **認証はSMB ACLのみ**: HMAC署名はv1.1で追加予定
 
 ## ビルド・テスト方法
@@ -57,12 +58,16 @@ dotnet publish src/VRCRemoteTest.Bridge/VRCRemoteTest.Bridge.csproj -c Release -
     "StagingDirectory": "C:\\VRCRemoteTest",
     "VrchatWorldsDirectory": "C:\\Users\\USER\\AppData\\LocalLow\\VRChat\\VRChat\\Worlds",
     "MaxArtifactSizeBytes": 524288000,
-    "RetainBuilds": 10
+    "RetainBuilds": 10,
+    "VrchatExecutable": "C:\\Program Files (x86)\\Steam\\steamapps\\common\\VRChat\\VRChat.exe",
+    "VrchatMode": "Desktop",
+    "AutoLaunchVrchat": false,
+    "VrchatStartupTimeoutSeconds": 60
   }
 }
 ```
 
-`VrchatWorldsDirectory`が実在しない場合、Bridgeは起動を拒否します（勝手に別の場所を推測しません）。
+`VrchatWorldsDirectory`が実在しない場合、Bridgeは起動を拒否します（勝手に別の場所を推測しません）。`VrchatExecutable`/`VrchatMode`/`AutoLaunchVrchat`/`VrchatStartupTimeoutSeconds`はPhase 4.1（VRChat自動起動）用の設定で、`AutoLaunchVrchat: true`の場合のみ`VrchatExecutable`が検証される（絶対パス・非UNC・`.exe`拡張子・ファイル名が`VRChat.exe`と完全一致・実在、の全てを満たす必要がある）。`VrchatStartupTimeoutSeconds`は45秒未満に設定できない（`VrchatReadinessCoordinator`の`StartupSettleDelay`15秒+安定確認ポーリング分+実起動時間のばらつきに対するマージンとして必要）。
 
 ## ステージングディレクトリ構造
 

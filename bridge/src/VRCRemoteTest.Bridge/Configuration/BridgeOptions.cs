@@ -25,4 +25,29 @@ public sealed class BridgeOptions
     public long MaxArtifactSizeBytes { get; set; } = 500L * 1024 * 1024;
 
     public int RetainBuilds { get; set; } = 10;
+
+    // === Phase 4.1: VRChat autoLaunch ===
+
+    /// <summary>
+    /// Absolute path to VRChat.exe. Required (and validated) only when
+    /// <see cref="AutoLaunchVrchat"/> is true.
+    /// </summary>
+    public string VrchatExecutable { get; set; } = string.Empty;
+
+    /// <summary>"Desktop" or "VR" (case-insensitive). Controls whether --no-vr is passed.</summary>
+    public string VrchatMode { get; set; } = "Desktop";
+
+    /// <summary>
+    /// Default false: never launches VRChat on its own unless explicitly opted in.
+    /// An already-running VRChat lacking --watch-worlds is never auto-restarted
+    /// regardless of this setting (spec section 32).
+    /// </summary>
+    public bool AutoLaunchVrchat { get; set; } = false;
+
+    /// <summary>
+    /// Readiness timeout after launching VRChat. Default is 60s (not 30s) to
+    /// leave real margin beyond the ~15-17s minimum imposed by
+    /// VrchatReadinessCoordinator's StartupSettleDelay + stability polling.
+    /// </summary>
+    public int VrchatStartupTimeoutSeconds { get; set; } = 60;
 }

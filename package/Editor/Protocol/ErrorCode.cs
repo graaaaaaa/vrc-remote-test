@@ -13,6 +13,11 @@ namespace VRCRemoteTest
         public const string DeployFailed = "DEPLOY_FAILED";
         public const string UnknownError = "UNKNOWN_ERROR";
 
+        // === Phase 4.1: VRChat autoLaunch (Bridge wire codes) ===
+        public const string VrchatStartFailed = "VRCHAT_START_FAILED";
+        public const string VrchatStartTimeout = "VRCHAT_START_TIMEOUT";
+        public const string VrchatWatchWorldsMissing = "VRCHAT_WATCH_WORLDS_MISSING";
+
         // === Unity-side-only codes (never sent over the wire) ===
         public const string SdkNotAvailable = "SDK_NOT_AVAILABLE";
         public const string SdkBuildFailed = "SDK_BUILD_FAILED";

@@ -147,6 +147,33 @@ VRChatのホーム画面到達を確認したら準備完了。以降はUnity側
 
 ---
 
+## 8. （任意）VRChat自動起動の有効化（Phase 4.1）
+
+手順7を毎回手動で行いたくない場合、Bridgeに任せることができる。`config.json`に以下を追加:
+
+```json
+{
+  "Bridge": {
+    "StagingDirectory": "C:\\VRCRemoteTest",
+    "VrchatWorldsDirectory": "C:\\Users\\<ユーザー名>\\AppData\\LocalLow\\VRChat\\VRChat\\Worlds",
+    "MaxArtifactSizeBytes": 524288000,
+    "RetainBuilds": 10,
+    "VrchatExecutable": "C:\\Program Files (x86)\\Steam\\steamapps\\common\\VRChat\\VRChat.exe",
+    "VrchatMode": "Desktop",
+    "AutoLaunchVrchat": true,
+    "VrchatStartupTimeoutSeconds": 60
+  }
+}
+```
+
+- `VrchatExecutable`は実際のSteamインストール先に合わせて調整する。ファイル名は`VRChat.exe`と完全一致している必要がある（大文字小文字は不問）
+- 有効化するとBridgeは、VRChatが未起動の状態でビルドを受け取った際に自動的に`--watch-worlds`付きで起動し、準備が整うまで待ってからWorldsディレクトリへ配置する
+- **既に`--watch-worlds`無しでVRChatが起動中の場合、Bridgeは自動的に再起動・終了させない**（`VRCHAT_WATCH_WORLDS_MISSING`でビルド失敗となる）。この場合は手動でVRChatを終了させるか、手順7の通り`--watch-worlds`付きで起動し直す
+
+**Unity側のResult Timeout推奨値**: `AutoLaunchVrchat: true`の場合、Bridge側の起動待機（最短でも約15〜17秒、デフォルトタイムアウト60秒）が発生するため、Unity側の `VRC Remote Test` ウィンドウ設定foldoutにある `Result Timeout (s)` はデフォルトの60秒のままだとBridge側のタイムアウトと競合する可能性がある。**90秒以上に引き上げることを推奨**する。
+
+---
+
 ## トラブルシューティング
 
 | 症状 | 原因 | 対処 |
