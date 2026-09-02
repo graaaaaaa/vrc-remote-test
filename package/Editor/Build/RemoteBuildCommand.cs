@@ -18,7 +18,14 @@ namespace VRCRemoteTest
     {
         private static RemoteBuildCoordinator _coordinator;
 
-        private static RemoteBuildCoordinator GetCoordinator()
+        /// <summary>
+        /// internal (not private) so RemoteTestWindow shares the same
+        /// coordinator instance instead of constructing its own — two separate
+        /// instances would each hold their own SemaphoreSlim, silently
+        /// defeating the single-flight concurrency guard between the menu item
+        /// and the window.
+        /// </summary>
+        internal static RemoteBuildCoordinator GetCoordinator()
         {
             if (_coordinator == null)
             {
@@ -28,6 +35,26 @@ namespace VRCRemoteTest
             }
 
             return _coordinator;
+        }
+
+        /// <summary>
+        /// Call after SharePath changes so the next build picks up the new
+        /// value — the coordinator caches its IRemoteTransport at construction
+        /// time. Returns false (and leaves the existing coordinator in place)
+        /// if a build is currently running: discarding it mid-flight would
+        /// hand a new caller a fresh SemaphoreSlim, re-enabling the exact
+        /// concurrency bug this internal-sharing design exists to prevent
+        /// (Codex plan review Phase 3, confidence 0.95).
+        /// </summary>
+        internal static bool InvalidateCoordinator()
+        {
+            if (_coordinator != null && _coordinator.IsRunning)
+            {
+                return false;
+            }
+
+            _coordinator = null;
+            return true;
         }
 
         /// <summary>

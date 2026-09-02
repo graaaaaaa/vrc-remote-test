@@ -268,5 +268,185 @@ namespace VRCRemoteTest.Tests
 
             Assert.IsFalse(RemoteBuildCoordinator.IsValidResult(result, "20260901T112522481Z-a91f02cc"));
         }
+
+        [Test]
+        public void IsRunning_reflects_in_flight_build()
+        {
+            var blockingBuild = new TaskCompletionSource<string>();
+            var sdkAdapter = new FakeVrcSdkBuildAdapter { BuildTaskOverride = blockingBuild.Task };
+            var transport = new FakeRemoteTransport
+            {
+                // Resolve immediately once the build unblocks so this test
+                // isn't stuck waiting out the real polling timeout — it only
+                // cares about the IsRunning transition, not deploy behavior.
+                ResultFactory = buildId => new BuildResult
+                {
+                    ProtocolVersion = ProtocolConstants.CurrentProtocolVersion,
+                    BuildId = buildId,
+                    Status = "deployed",
+                    DeployedFileName = $"vrc-remote-{buildId}.vrcw",
+                    UpdatedAtUtc = DateTimeOffset.UtcNow,
+                },
+            };
+            var coordinator = new RemoteBuildCoordinator(sdkAdapter, transport);
+
+            Assert.IsFalse(coordinator.IsRunning);
+
+            var runTask = coordinator.ExecuteRemoteBuildAsync();
+            Assert.IsTrue(coordinator.IsRunning);
+
+            blockingBuild.SetResult(_validArtifactPath);
+            runTask.GetAwaiter().GetResult();
+
+            Assert.IsFalse(coordinator.IsRunning);
+        }
+
+        [Test]
+        public void LastArtifact_is_null_before_any_build()
+        {
+            var coordinator = new RemoteBuildCoordinator(new FakeVrcSdkBuildAdapter(), new FakeRemoteTransport());
+
+            Assert.IsNull(coordinator.LastArtifact);
+        }
+
+        [Test]
+        public void LastArtifact_is_set_even_when_upload_or_poll_fails()
+        {
+            RemoteTestSettings.ResultTimeoutSeconds = 1;
+            RemoteTestSettings.PollIntervalSeconds = 1;
+
+            var sdkAdapter = new FakeVrcSdkBuildAdapter { ReturnedPath = _validArtifactPath };
+            var transport = new FakeRemoteTransport(); // ResultQueue empty -> timeout
+            var coordinator = new RemoteBuildCoordinator(sdkAdapter, transport);
+
+            LogAssert.Expect(LogType.Error, new Regex(@"^\[VRC Remote Test\] RESULT_TIMEOUT:"));
+            var outcome = coordinator.ExecuteRemoteBuildAsync().GetAwaiter().GetResult();
+
+            Assert.IsFalse(outcome.Succeeded);
+            Assert.IsNotNull(coordinator.LastArtifact);
+            Assert.AreEqual(_validArtifactPath, coordinator.LastArtifact.FullPath);
+        }
+
+        [Test]
+        public void DeployLastBuildAsync_fails_when_no_previous_artifact()
+        {
+            var coordinator = new RemoteBuildCoordinator(new FakeVrcSdkBuildAdapter(), new FakeRemoteTransport());
+
+            var outcome = coordinator.DeployLastBuildAsync().GetAwaiter().GetResult();
+
+            Assert.IsFalse(outcome.Succeeded);
+            Assert.AreEqual(ErrorCode.ArtifactNotFound, outcome.ErrorCode);
+        }
+
+        [Test]
+        public void DeployLastBuildAsync_succeeds_after_a_prior_successful_build()
+        {
+            var sdkAdapter = new FakeVrcSdkBuildAdapter { ReturnedPath = _validArtifactPath };
+            var transport = new FakeRemoteTransport
+            {
+                ResultFactory = buildId => new BuildResult
+                {
+                    ProtocolVersion = ProtocolConstants.CurrentProtocolVersion,
+                    BuildId = buildId,
+                    Status = "deployed",
+                    DeployedFileName = $"vrc-remote-{buildId}.vrcw",
+                    Sha256 = "8f2a5f6802f9dc5307740870312b2df9a99104960df3a9df66166d54665d4d7c",
+                    UpdatedAtUtc = DateTimeOffset.UtcNow,
+                },
+            };
+            var coordinator = new RemoteBuildCoordinator(sdkAdapter, transport);
+            coordinator.ExecuteRemoteBuildAsync().GetAwaiter().GetResult();
+
+            var outcome = coordinator.DeployLastBuildAsync().GetAwaiter().GetResult();
+
+            Assert.IsTrue(outcome.Succeeded);
+        }
+
+        [Test]
+        public void DeployLastBuildAsync_is_rejected_while_a_build_is_running()
+        {
+            var blockingBuild = new TaskCompletionSource<string>();
+            var sdkAdapter = new FakeVrcSdkBuildAdapter { BuildTaskOverride = blockingBuild.Task };
+            var transport = new FakeRemoteTransport
+            {
+                ResultFactory = buildId => new BuildResult
+                {
+                    ProtocolVersion = ProtocolConstants.CurrentProtocolVersion,
+                    BuildId = buildId,
+                    Status = "deployed",
+                    DeployedFileName = $"vrc-remote-{buildId}.vrcw",
+                    UpdatedAtUtc = DateTimeOffset.UtcNow,
+                },
+            };
+            var coordinator = new RemoteBuildCoordinator(sdkAdapter, transport);
+
+            var runTask = coordinator.ExecuteRemoteBuildAsync();
+
+            var deployOutcome = coordinator.DeployLastBuildAsync().GetAwaiter().GetResult();
+
+            Assert.IsFalse(deployOutcome.Succeeded);
+            Assert.AreEqual(ErrorCode.BuildAlreadyRunning, deployOutcome.ErrorCode);
+
+            blockingBuild.SetResult(_validArtifactPath);
+            runTask.GetAwaiter().GetResult();
+        }
+
+        [Test]
+        public void DeployLastBuildAsync_fails_when_artifact_file_was_deleted()
+        {
+            var sdkAdapter = new FakeVrcSdkBuildAdapter { ReturnedPath = _validArtifactPath };
+            var transport = new FakeRemoteTransport
+            {
+                ResultFactory = buildId => new BuildResult
+                {
+                    ProtocolVersion = ProtocolConstants.CurrentProtocolVersion,
+                    BuildId = buildId,
+                    Status = "deployed",
+                    DeployedFileName = $"vrc-remote-{buildId}.vrcw",
+                    UpdatedAtUtc = DateTimeOffset.UtcNow,
+                },
+            };
+            var coordinator = new RemoteBuildCoordinator(sdkAdapter, transport);
+            coordinator.ExecuteRemoteBuildAsync().GetAwaiter().GetResult();
+
+            File.Delete(_validArtifactPath);
+
+            var outcome = coordinator.DeployLastBuildAsync().GetAwaiter().GetResult();
+
+            Assert.IsFalse(outcome.Succeeded);
+            Assert.AreEqual(ErrorCode.ArtifactNotFound, outcome.ErrorCode);
+        }
+
+        [Test]
+        public void DeployLastBuildAsync_rehashes_stale_artifact_before_uploading()
+        {
+            var sdkAdapter = new FakeVrcSdkBuildAdapter { ReturnedPath = _validArtifactPath };
+            var transport = new FakeRemoteTransport
+            {
+                ResultFactory = buildId => new BuildResult
+                {
+                    ProtocolVersion = ProtocolConstants.CurrentProtocolVersion,
+                    BuildId = buildId,
+                    Status = "deployed",
+                    DeployedFileName = $"vrc-remote-{buildId}.vrcw",
+                    UpdatedAtUtc = DateTimeOffset.UtcNow,
+                },
+            };
+            var coordinator = new RemoteBuildCoordinator(sdkAdapter, transport);
+            coordinator.ExecuteRemoteBuildAsync().GetAwaiter().GetResult();
+            var originalHash = coordinator.LastArtifact.Sha256;
+
+            // Simulate the artifact changing on disk since the original build
+            // (e.g. a separate Unity build run outside the Remote Build flow).
+            File.WriteAllText(_validArtifactPath, "different fake vrcw bytes, now longer");
+            var expectedNewHash = Sha256Calculator.ComputeHash(_validArtifactPath);
+
+            LogAssert.Expect(LogType.Warning, new Regex(@"^\[VRC Remote Test\] Artifact changed since last build\."));
+            var outcome = coordinator.DeployLastBuildAsync().GetAwaiter().GetResult();
+
+            Assert.IsTrue(outcome.Succeeded);
+            Assert.AreNotEqual(originalHash, expectedNewHash);
+            Assert.AreEqual(expectedNewHash, coordinator.LastArtifact.Sha256);
+        }
     }
 }

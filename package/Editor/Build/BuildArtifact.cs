@@ -16,7 +16,13 @@ namespace VRCRemoteTest
     {
         public string FullPath { get; }
         public string FileName { get; }
-        public long Size { get; }
+
+        /// <summary>
+        /// Mutable: DeployLastBuildAsync re-stats the file before redeploying
+        /// and updates this if it has changed since the original build (Codex
+        /// plan review Phase 3, confidence 0.93).
+        /// </summary>
+        public long Size { get; set; }
         public string Sha256 { get; set; }
 
         private BuildArtifact(string fullPath, string fileName, long size)

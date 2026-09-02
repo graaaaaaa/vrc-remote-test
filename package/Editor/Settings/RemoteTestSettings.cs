@@ -18,9 +18,13 @@ namespace VRCRemoteTest
 
         private const string ResultTimeoutKey = Prefix + "ResultTimeoutSeconds";
         private const int DefaultResultTimeoutSeconds = 60;
+        private const int MinResultTimeoutSeconds = 1;
+        private const int MaxResultTimeoutSeconds = 3600;
 
         private const string PollIntervalKey = Prefix + "PollIntervalSeconds";
         private const int DefaultPollIntervalSeconds = 2;
+        private const int MinPollIntervalSeconds = 1;
+        private const int MaxPollIntervalSeconds = 60;
 
         /// <summary>
         /// No default value — headless invocation must fail fast if unset
@@ -60,16 +64,50 @@ namespace VRCRemoteTest
             set => EditorPrefs.SetString(SharePathKey, value);
         }
 
+        /// <summary>
+        /// Non-throwing variant of <see cref="SharePath"/> for callers (e.g. the
+        /// interactive UI) that need to handle "not configured" as a normal
+        /// state rather than an exception.
+        /// </summary>
+        public static bool TryGetSharePath(out string path)
+        {
+            try
+            {
+                path = SharePath;
+                return true;
+            }
+            catch (RemoteBuildException)
+            {
+                path = null;
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// Clamped at both write and read time (Codex plan review Phase 3,
+        /// Round 3 confidence 0.95): a zero or negative PollIntervalSeconds
+        /// turns PollForResultAsync into a tight spin loop or throws from
+        /// Task.Delay, and these values can be set programmatically via
+        /// EditorPrefs outside of any UI-side clamping.
+        /// </summary>
         public static int ResultTimeoutSeconds
         {
-            get => EditorPrefs.GetInt(ResultTimeoutKey, DefaultResultTimeoutSeconds);
-            set => EditorPrefs.SetInt(ResultTimeoutKey, value);
+            get => System.Math.Clamp(
+                EditorPrefs.GetInt(ResultTimeoutKey, DefaultResultTimeoutSeconds),
+                MinResultTimeoutSeconds, MaxResultTimeoutSeconds);
+            set => EditorPrefs.SetInt(
+                ResultTimeoutKey,
+                System.Math.Clamp(value, MinResultTimeoutSeconds, MaxResultTimeoutSeconds));
         }
 
         public static int PollIntervalSeconds
         {
-            get => EditorPrefs.GetInt(PollIntervalKey, DefaultPollIntervalSeconds);
-            set => EditorPrefs.SetInt(PollIntervalKey, value);
+            get => System.Math.Clamp(
+                EditorPrefs.GetInt(PollIntervalKey, DefaultPollIntervalSeconds),
+                MinPollIntervalSeconds, MaxPollIntervalSeconds);
+            set => EditorPrefs.SetInt(
+                PollIntervalKey,
+                System.Math.Clamp(value, MinPollIntervalSeconds, MaxPollIntervalSeconds));
         }
     }
 }
