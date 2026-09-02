@@ -62,12 +62,15 @@ dotnet publish src/VRCRemoteTest.Bridge/VRCRemoteTest.Bridge.csproj -c Release -
     "VrchatExecutable": "C:\\Program Files (x86)\\Steam\\steamapps\\common\\VRChat\\VRChat.exe",
     "VrchatMode": "Desktop",
     "AutoLaunchVrchat": false,
-    "VrchatStartupTimeoutSeconds": 60
+    "VrchatStartupTimeoutSeconds": 60,
+    "VrchatStartupSettleDelaySeconds": 30
   }
 }
 ```
 
-`VrchatWorldsDirectory`が実在しない場合、Bridgeは起動を拒否します（勝手に別の場所を推測しません）。`VrchatExecutable`/`VrchatMode`/`AutoLaunchVrchat`/`VrchatStartupTimeoutSeconds`はPhase 4.1（VRChat自動起動）用の設定で、`AutoLaunchVrchat: true`の場合のみ`VrchatExecutable`が検証される（絶対パス・非UNC・`.exe`拡張子・ファイル名が`VRChat.exe`と完全一致・実在、の全てを満たす必要がある）。`VrchatStartupTimeoutSeconds`は45秒未満に設定できない（`VrchatReadinessCoordinator`の`StartupSettleDelay`15秒+安定確認ポーリング分+実起動時間のばらつきに対するマージンとして必要）。
+`VrchatWorldsDirectory`が実在しない場合、Bridgeは起動を拒否します（勝手に別の場所を推測しません）。`VrchatExecutable`/`VrchatMode`/`AutoLaunchVrchat`/`VrchatStartupTimeoutSeconds`/`VrchatStartupSettleDelaySeconds`はPhase 4.1（VRChat自動起動）用の設定で、`AutoLaunchVrchat: true`の場合のみ`VrchatExecutable`が検証される（絶対パス・非UNC・`.exe`拡張子・ファイル名が`VRChat.exe`と完全一致・実在、の全てを満たす必要がある）。
+
+`VrchatStartupSettleDelaySeconds`（デフォルト30秒）は、VRChatプロセス起動後、実際にWorldsディレクトリの監視が有効になる（と推定される）まで待つ最低時間。WMIでの`--watch-worlds`引数検出はプロセス起動直後にほぼ即座に可能になるが、それは「VRChatが実際にファイル配置を検知できる状態」を意味しない。**実機検証（2026-09-02）で、デフォルト15秒では短すぎてリロードが発生しないケースを確認した**（VRChatがホーム画面に到達するまで体感15〜30秒程度）。マシンやVRChatのバージョンによって実際の起動時間は変動するため、必要に応じて値を調整すること。`VrchatStartupTimeoutSeconds`は`VrchatStartupSettleDelaySeconds + 30秒`未満に設定できない。
 
 ## ステージングディレクトリ構造
 

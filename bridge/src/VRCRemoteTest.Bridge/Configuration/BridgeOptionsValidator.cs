@@ -11,11 +11,14 @@ public sealed class BridgeOptionsValidator : IValidateOptions<BridgeOptions>
     private static readonly string[] ValidVrchatModes = { "Desktop", "VR" };
 
     /// <summary>
-    /// VrchatReadinessCoordinator's StartupSettleDelay (15s) plus a 2-poll
-    /// stabilization allowance plus 30s of real margin for VRChat's own boot
-    /// time variance (Codex plan review Phase 4.1, Round 3).
+    /// Real margin beyond VrchatStartupSettleDelaySeconds + a 2-poll
+    /// stabilization allowance, for VRChat's own boot time variance (Codex plan
+    /// review Phase 4.1, Round 3; margin value unchanged, but the timeout floor
+    /// is now relative to the configurable settle delay rather than a fixed
+    /// constant, since real-hardware testing on 2026-09-02 showed VRChat's
+    /// actual boot-to-home-screen time needs per-machine tuning).
     /// </summary>
-    private const int MinVrchatStartupTimeoutSeconds = 45;
+    private const int MinTimeoutMarginSeconds = 30;
 
     public ValidateOptionsResult Validate(string? name, BridgeOptions options)
     {
@@ -60,11 +63,18 @@ public sealed class BridgeOptionsValidator : IValidateOptions<BridgeOptions>
                 $"VrchatMode '{options.VrchatMode}' is invalid. Must be 'Desktop' or 'VR' (case-insensitive).");
         }
 
-        if (options.VrchatStartupTimeoutSeconds < MinVrchatStartupTimeoutSeconds)
+        if (options.VrchatStartupSettleDelaySeconds <= 0)
+        {
+            failures.Add("VrchatStartupSettleDelaySeconds must be positive.");
+        }
+
+        var minTimeout = options.VrchatStartupSettleDelaySeconds + MinTimeoutMarginSeconds;
+        if (options.VrchatStartupTimeoutSeconds < minTimeout)
         {
             failures.Add(
-                $"VrchatStartupTimeoutSeconds must be at least {MinVrchatStartupTimeoutSeconds} " +
-                "(VrchatReadinessCoordinator's own startup settle delay plus real margin for VRChat's boot time).");
+                $"VrchatStartupTimeoutSeconds must be at least {minTimeout} " +
+                $"(VrchatStartupSettleDelaySeconds [{options.VrchatStartupSettleDelaySeconds}] plus " +
+                $"{MinTimeoutMarginSeconds}s of real margin for VRChat's boot time).");
         }
 
         return failures.Count == 0

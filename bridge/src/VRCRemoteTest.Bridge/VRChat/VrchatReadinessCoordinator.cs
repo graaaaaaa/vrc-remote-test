@@ -27,7 +27,6 @@ public sealed class VrchatReadinessCoordinator : IVrchatReadinessCoordinator
 {
     private const int RequiredStablePolls = 2;
 
-    private static readonly TimeSpan DefaultStartupSettleDelay = TimeSpan.FromSeconds(15);
     private static readonly TimeSpan DefaultPollInterval = TimeSpan.FromSeconds(1);
 
     private readonly BridgeOptions _options;
@@ -42,7 +41,13 @@ public sealed class VrchatReadinessCoordinator : IVrchatReadinessCoordinator
         IVrchatProcessMonitor processMonitor,
         IVrchatLauncher launcher,
         ILogger<VrchatReadinessCoordinator> logger)
-        : this(options, processMonitor, launcher, logger, DefaultStartupSettleDelay, DefaultPollInterval)
+        : this(
+            options,
+            processMonitor,
+            launcher,
+            logger,
+            TimeSpan.FromSeconds(options.Value.VrchatStartupSettleDelaySeconds),
+            DefaultPollInterval)
     {
     }
 

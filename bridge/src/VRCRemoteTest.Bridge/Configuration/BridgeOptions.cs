@@ -45,9 +45,22 @@ public sealed class BridgeOptions
     public bool AutoLaunchVrchat { get; set; } = false;
 
     /// <summary>
-    /// Readiness timeout after launching VRChat. Default is 60s (not 30s) to
-    /// leave real margin beyond the ~15-17s minimum imposed by
-    /// VrchatReadinessCoordinator's StartupSettleDelay + stability polling.
+    /// Readiness timeout after launching VRChat. Must leave real margin beyond
+    /// VrchatStartupSettleDelaySeconds + stability polling.
     /// </summary>
     public int VrchatStartupTimeoutSeconds { get; set; } = 60;
+
+    /// <summary>
+    /// Minimum time VrchatReadinessCoordinator waits after VRChat's process
+    /// StartTimeUtc before declaring readiness, even if the WMI-based
+    /// IsRunning/WatchWorldsDetected signal is already stable -- the command
+    /// line is visible to WMI essentially at process creation, long before
+    /// VRChat has actually finished booting to its home screen and armed its
+    /// Worlds-directory watcher. Default (30s) is a starting point; tune this
+    /// per machine based on how long VRChat actually takes to reach the home
+    /// screen (real-hardware testing on 2026-09-02 observed ~15-30s, and the
+    /// original 15s default proved too short -- a build deployed at that point
+    /// did not trigger a reload).
+    /// </summary>
+    public int VrchatStartupSettleDelaySeconds { get; set; } = 30;
 }

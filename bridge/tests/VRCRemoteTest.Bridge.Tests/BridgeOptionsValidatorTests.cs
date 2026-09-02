@@ -229,11 +229,12 @@ public class BridgeOptionsValidatorTests : IDisposable
     }
 
     [Theory]
-    [InlineData(44)]
+    [InlineData(59)]
     [InlineData(0)]
     [InlineData(-1)]
     public void Fails_when_VrchatStartupTimeoutSeconds_is_below_the_minimum(int timeoutSeconds)
     {
+        // Default VrchatStartupSettleDelaySeconds is 30, so the floor is 30+30=60.
         var options = ValidBaseOptions();
         options.VrchatStartupTimeoutSeconds = timeoutSeconds;
 
@@ -247,10 +248,41 @@ public class BridgeOptionsValidatorTests : IDisposable
     public void Succeeds_at_the_minimum_VrchatStartupTimeoutSeconds()
     {
         var options = ValidBaseOptions();
-        options.VrchatStartupTimeoutSeconds = 45;
+        options.VrchatStartupTimeoutSeconds = 60;
 
         var result = _validator.Validate(name: null, options);
 
+        result.Succeeded.Should().BeTrue();
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(-1)]
+    public void Fails_when_VrchatStartupSettleDelaySeconds_is_not_positive(int settleDelaySeconds)
+    {
+        var options = ValidBaseOptions();
+        options.VrchatStartupSettleDelaySeconds = settleDelaySeconds;
+
+        var result = _validator.Validate(name: null, options);
+
+        result.Failed.Should().BeTrue();
+        result.Failures.Should().Contain(f => f.Contains("VrchatStartupSettleDelaySeconds"));
+    }
+
+    [Fact]
+    public void VrchatStartupTimeoutSeconds_minimum_scales_with_a_custom_VrchatStartupSettleDelaySeconds()
+    {
+        var options = ValidBaseOptions();
+        options.VrchatStartupSettleDelaySeconds = 45;
+        options.VrchatStartupTimeoutSeconds = 74; // 45 + 30 - 1
+
+        var result = _validator.Validate(name: null, options);
+
+        result.Failed.Should().BeTrue();
+        result.Failures.Should().Contain(f => f.Contains("VrchatStartupTimeoutSeconds"));
+
+        options.VrchatStartupTimeoutSeconds = 75; // 45 + 30
+        result = _validator.Validate(name: null, options);
         result.Succeeded.Should().BeTrue();
     }
 }
