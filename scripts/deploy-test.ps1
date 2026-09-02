@@ -47,9 +47,12 @@ if (-not (Test-Path -LiteralPath $WorldsDirectory -PathType Container)) {
 }
 
 if ($Cleanup) {
-    $targets = Get-ChildItem -LiteralPath $WorldsDirectory -Filter 'vrc-test-*.vrcw' -File -ErrorAction SilentlyContinue
+    $targets = @(
+        Get-ChildItem -LiteralPath $WorldsDirectory -Filter 'vrc-test-*.vrcw' -File -ErrorAction SilentlyContinue
+        Get-ChildItem -LiteralPath $WorldsDirectory -Filter '.vrc-test-*.vrcw.tmp' -File -Force -ErrorAction SilentlyContinue
+    )
     if (-not $targets) {
-        Write-Host "削除対象の vrc-test-*.vrcw は見つかりませんでした。" -ForegroundColor Yellow
+        Write-Host "削除対象の vrc-test-*.vrcw / .vrc-test-*.vrcw.tmp は見つかりませんでした。" -ForegroundColor Yellow
         return
     }
     foreach ($f in $targets) {

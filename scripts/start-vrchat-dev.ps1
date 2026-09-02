@@ -59,10 +59,17 @@ $launchArgs.Add('--enable-debug-gui')
 $launchArgs.Add('--enable-sdk-log-levels')
 $launchArgs.Add('--enable-udon-debug-logging')
 
+if (-not $NoWatchWorlds) {
+    $existing = Get-Process -Name 'VRChat' -ErrorAction SilentlyContinue
+    if ($existing) {
+        Write-Warning "VRChatは既に起動中です（PID: $($existing.Id -join ', ')）。ネガティブベースライン検証中の場合、この既存プロセスが結果を汚染する可能性があります。"
+    }
+}
+
 Write-Host "Starting VRChat ($Mode mode$(if ($NoWatchWorlds) { ', --watch-worlds DISABLED (negative baseline)' }))..." -ForegroundColor Cyan
 Write-Host "Path: $VrChatPath"
 Write-Host "Args: $($launchArgs -join ' ')"
 
-Start-Process -LiteralPath $VrChatPath -ArgumentList $launchArgs
+Start-Process -FilePath $VrChatPath -ArgumentList $launchArgs
 
 Write-Host "起動しました。VRChatのホーム画面到達を確認してから deploy-test.ps1 を実行してください。" -ForegroundColor Green
