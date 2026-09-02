@@ -26,9 +26,15 @@ namespace VRCRemoteTest
 
         private const long MaxVrchatStatusFileBytes = 64 * 1024;
 
+        // Above the Bridge's 384 KiB publish cap for headroom (Codex plan
+        // review Phase 5, Round 2, confidence 0.90): a full-to-cap published
+        // file can never fail this guard.
+        private const long MaxVrchatLogFileBytes = 512 * 1024;
+
         private string IncomingDir => Path.Combine(_sharePath, "incoming");
         private string ResultsDir => Path.Combine(_sharePath, "results");
         private string StatusDir => Path.Combine(_sharePath, "status");
+        private string LogsDir => Path.Combine(_sharePath, "logs");
 
         public bool IsAvailable
         {
@@ -132,6 +138,36 @@ namespace VRCRemoteTest
                 });
             }
             catch (Exception ex) when (ex is IOException or JsonException)
+            {
+                return null;
+            }
+        }
+
+        /// <summary>
+        /// Phase 5 advisory log content, purely for display — never gates any
+        /// build decision. Plain text, not JSON, so no JsonException catch is
+        /// needed (only IOException for the transient mid-write race, same
+        /// tolerance as PollResult/PollVrchatStatus).
+        /// </summary>
+        public string PollVrchatLog()
+        {
+            var logPath = CombineUnderRoot(LogsDir, "vrchat-latest.log");
+            if (!File.Exists(logPath))
+            {
+                return null;
+            }
+
+            try
+            {
+                var info = new FileInfo(logPath);
+                if (info.Length > MaxVrchatLogFileBytes)
+                {
+                    return null;
+                }
+
+                return File.ReadAllText(logPath);
+            }
+            catch (IOException)
             {
                 return null;
             }

@@ -109,5 +109,82 @@ namespace VRCRemoteTest
                 PollIntervalKey,
                 System.Math.Clamp(value, MinPollIntervalSeconds, MaxPollIntervalSeconds));
         }
+
+        // === Phase 5: Log Viewer ===
+
+        private const string LogAutoRefreshKey = Prefix + "LogAutoRefresh";
+
+        public static bool LogAutoRefresh
+        {
+            get => EditorPrefs.GetBool(LogAutoRefreshKey, true);
+            set => EditorPrefs.SetBool(LogAutoRefreshKey, value);
+        }
+
+        // === Phase 5: Moonlight ===
+
+        private const string MoonlightApplicationNameKey = Prefix + "MoonlightApplicationName";
+        private const string DefaultMoonlightApplicationName = "Moonlight";
+        private const int MaxMoonlightApplicationNameLength = 255;
+
+        /// <summary>
+        /// Clamped at write time to a safe app-name shape (Codex plan review
+        /// Phase 5, Round 2, confidence 0.91): non-empty, no control
+        /// characters, no "/" (this is an application name for `open -a`, not
+        /// a path), bounded length. Invalid input falls back to the previous
+        /// value rather than storing something MoonlightLauncher would reject
+        /// at launch time anyway. MoonlightLauncher.Launch() re-validates
+        /// defensively since EditorPrefs can be edited outside this setter.
+        /// </summary>
+        public static string MoonlightApplicationName
+        {
+            get
+            {
+                var value = EditorPrefs.GetString(MoonlightApplicationNameKey, DefaultMoonlightApplicationName);
+                return string.IsNullOrWhiteSpace(value) ? DefaultMoonlightApplicationName : value;
+            }
+            set
+            {
+                if (IsValidMoonlightApplicationName(value))
+                {
+                    EditorPrefs.SetString(MoonlightApplicationNameKey, value);
+                }
+            }
+        }
+
+        internal static bool IsValidMoonlightApplicationName(string value)
+        {
+            if (string.IsNullOrWhiteSpace(value))
+            {
+                return false;
+            }
+
+            if (value.Length > MaxMoonlightApplicationNameLength)
+            {
+                return false;
+            }
+
+            if (value.Contains('/'))
+            {
+                return false;
+            }
+
+            foreach (var c in value)
+            {
+                if (char.IsControl(c))
+                {
+                    return false;
+                }
+            }
+
+            return true;
+        }
+
+        private const string FocusMoonlightAfterDeployKey = Prefix + "FocusMoonlightAfterDeploy";
+
+        public static bool FocusMoonlightAfterDeploy
+        {
+            get => EditorPrefs.GetBool(FocusMoonlightAfterDeployKey, false);
+            set => EditorPrefs.SetBool(FocusMoonlightAfterDeployKey, value);
+        }
     }
 }

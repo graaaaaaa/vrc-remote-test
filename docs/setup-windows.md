@@ -176,6 +176,21 @@ VRChatのホーム画面到達を確認したら準備完了。以降はUnity側
 
 ---
 
+## 9. （任意）Moonlight連携（Phase 5）
+
+Moonlight（NVIDIA GameStream/Sunshine互換のリモートデスクトップクライアント）でWindows実機のVRChat画面をmacOS側から見ている場合、Unity側の `VRC Remote Test` ウィンドウから直接Moonlightを起動・フォーカスできる。
+
+- **`[Open Moonlight]`ボタン**（`DrawActionButtons`内）: macOS側にインストール済みのMoonlightアプリを`open -a`で起動（既に起動中なら前面に呼び出す）。Windows側の設定は不要 — この機能は完全にmacOS側で完結する
+- **Settings foldoutの `Moonlight Application Name`**: `open -a`に渡すアプリ名。通常はデフォルトの`Moonlight`のままでよいが、App Store版など名称が異なるインストールの場合はここで変更する
+- **Settings foldoutの `Focus Moonlight after deploy`**（デフォルトOFF）: 有効にすると、`Remote Build & Test`または`Deploy Last Build`が成功した直後に自動でMoonlightを前面に呼び出す。ビルドがVRChat側にリロードされる様子をすぐ確認したい場合に有効化する
+- Moonlight側のホスト接続設定（Sunshine側のペアリング等）は本ツールの範囲外。あらかじめMoonlightで対象のWindowsマシンに接続済みであることが前提
+
+## 10. （任意）VRChat Log Viewer（Phase 5）
+
+`RemoteBuildCommand`が使う同じSMB共有経由で、BridgeがVRChatの`output_log_*.txt`（最新200行、直近ウィンドウのスナップショット）を5秒間隔で配信する。Windows側の追加設定は不要 — `VrchatWorldsDirectory`が正しく設定済みであれば自動的に有効になる。Unity側の `VRC Remote Test` ウィンドウの `VRChat Log` foldoutから、カテゴリフィルタ（All/Error/Exception/Udon/Shader/Warning）付きで閲覧できる。表示専用で、readiness判定やビルドの成否には一切影響しない。
+
+---
+
 ## トラブルシューティング
 
 | 症状 | 原因 | 対処 |

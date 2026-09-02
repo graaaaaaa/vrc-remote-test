@@ -1,4 +1,5 @@
 using System;
+using System.Linq;
 using System.Threading;
 using UnityEditor;
 using UnityEngine;
@@ -29,6 +30,25 @@ namespace VRCRemoteTest
         // beyond "not wildly skewed" (Codex plan review Phase 4a, Round 2,
         // confidence 0.91).
         private const float VrchatStatusStaleAfterSeconds = 30f;
+
+        // Matches the Bridge's VrchatLogService poll interval (5s) so the
+        // viewer doesn't Repaint() faster than new content can actually
+        // arrive. Only ticks while the Log Viewer foldout is open and Auto
+        // Refresh is enabled (checked inside OnEditorUpdate every tick,
+        // rather than subscribing/unsubscribing on toggle — Codex plan
+        // review Phase 5, Round 3, confidence 0.90).
+        private const float LogRefreshIntervalSeconds = 5f;
+        private const float LogViewportHeight = 200f;
+        private const float LogBottomThresholdPixels = 20f;
+
+        private static readonly string[] LogCategories = { "All", "Error", "Exception", "Udon", "Shader", "Warning" };
+
+        private bool _logFoldout;
+        private string _logCategory = "All";
+        private Vector2 _logScrollPosition;
+        private bool _logPinnedToBottom = true;
+        private string _lastRenderedLogContent = string.Empty;
+        private double _lastLogCheckTime = double.NegativeInfinity;
 
         private bool _shareConfigured;
         private bool _shareReachable;
@@ -61,13 +81,39 @@ namespace VRCRemoteTest
             minSize = new Vector2(360, 320);
             LoadSettingsIntoFields();
             RefreshPreflightStatus();
+            EditorApplication.update += OnEditorUpdate;
         }
 
         private void OnDisable()
         {
+            EditorApplication.update -= OnEditorUpdate;
             _cts?.Cancel();
             _cts?.Dispose();
             _cts = null;
+        }
+
+        /// <summary>
+        /// Explicit tick-based refresh for the Log Viewer's Auto Refresh, kept
+        /// independent of the existing OnGUI-embedded preflight TTL check
+        /// above: preflight status is advisory and stale-tolerant, but a log
+        /// viewer a developer is actively watching needs a refresh even while
+        /// the window isn't receiving input events (Codex plan review Phase
+        /// 5, Round 2, confidence 0.90).
+        /// </summary>
+        private void OnEditorUpdate()
+        {
+            if (!_logFoldout || !RemoteTestSettings.LogAutoRefresh)
+            {
+                return;
+            }
+
+            if (EditorApplication.timeSinceStartup - _lastLogCheckTime < LogRefreshIntervalSeconds)
+            {
+                return;
+            }
+
+            _lastLogCheckTime = EditorApplication.timeSinceStartup;
+            Repaint();
         }
 
         private void OnGUI()
@@ -86,6 +132,8 @@ namespace VRCRemoteTest
             DrawProgressSection();
             EditorGUILayout.Space();
             DrawLastDeploymentSection();
+            EditorGUILayout.Space();
+            DrawLogViewerSection();
             EditorGUILayout.Space();
             DrawSettingsFoldout();
         }
@@ -191,7 +239,93 @@ namespace VRCRemoteTest
             {
                 EditorGUILayout.HelpBox(
                     $"{_lastOutcome.ErrorCode}: {_lastOutcome.ErrorMessage}", MessageType.Error);
+
+                var guidance = ErrorGuidance.GetGuidance(_lastOutcome.ErrorCode);
+                if (guidance != null)
+                {
+                    EditorGUILayout.HelpBox(guidance, MessageType.Info);
+                }
             }
+        }
+
+        /// <summary>
+        /// Foldout (default closed), category toolbar filter, Auto Refresh
+        /// toggle, and a scrollable read-only view of the Bridge's published
+        /// vrchat-latest.log (spec section 47, "Unity log viewer"). Never
+        /// wired into readiness detection — display only (Phase 5 plan,
+        /// explicit non-goal).
+        /// </summary>
+        private void DrawLogViewerSection()
+        {
+            _logFoldout = EditorGUILayout.Foldout(_logFoldout, "VRChat Log");
+            if (!_logFoldout)
+            {
+                return;
+            }
+
+            var rawLog = RemoteBuildCommand.GetCoordinator().VrchatLog;
+            var lines = string.IsNullOrEmpty(rawLog) ? Array.Empty<string>() : rawLog.Split('\n');
+
+            var selectedIndex = Array.IndexOf(LogCategories, _logCategory);
+            var newSelectedIndex = GUILayout.Toolbar(Math.Max(0, selectedIndex), LogCategories);
+            _logCategory = LogCategories[newSelectedIndex];
+
+            var newAutoRefresh = EditorGUILayout.ToggleLeft("Auto Refresh", RemoteTestSettings.LogAutoRefresh);
+            if (newAutoRefresh != RemoteTestSettings.LogAutoRefresh)
+            {
+                RemoteTestSettings.LogAutoRefresh = newAutoRefresh;
+            }
+
+            var filtered = FilterLogLines(lines, _logCategory);
+            var displayText = filtered.Length == 0
+                ? "(no log content yet)"
+                : string.Join("\n", filtered);
+
+            // Only jump to the bottom on new content if the user was already
+            // there — otherwise a Repaint mid-review would yank them away
+            // from lines they're actively reading (Codex plan review Phase
+            // 5, Round 3, confidence 0.89).
+            if (displayText != _lastRenderedLogContent)
+            {
+                _lastRenderedLogContent = displayText;
+                if (_logPinnedToBottom)
+                {
+                    _logScrollPosition.y = float.MaxValue;
+                }
+            }
+
+            _logScrollPosition = EditorGUILayout.BeginScrollView(
+                _logScrollPosition, GUILayout.Height(LogViewportHeight));
+            EditorGUILayout.SelectableLabel(
+                displayText, EditorStyles.textArea, GUILayout.ExpandHeight(true), GUILayout.MinHeight(LogViewportHeight));
+            var contentRect = GUILayoutUtility.GetLastRect();
+            EditorGUILayout.EndScrollView();
+
+            _logPinnedToBottom =
+                _logScrollPosition.y + LogViewportHeight >= contentRect.height - LogBottomThresholdPixels;
+        }
+
+        /// <summary>
+        /// Internal (not private) so RemoteTestWindowFilterTests can exercise
+        /// it directly without going through IMGUI. Simple case-insensitive
+        /// substring match — no structured log parsing (Phase 5 plan,
+        /// explicit non-goal).
+        /// </summary>
+        internal static string[] FilterLogLines(string[] lines, string category)
+        {
+            if (lines == null)
+            {
+                return Array.Empty<string>();
+            }
+
+            if (string.IsNullOrEmpty(category) || category == "All")
+            {
+                return lines;
+            }
+
+            return lines
+                .Where(line => line != null && line.IndexOf(category, StringComparison.OrdinalIgnoreCase) >= 0)
+                .ToArray();
         }
 
         private void DrawActionButtons()
@@ -220,6 +354,11 @@ namespace VRCRemoteTest
                     "Deploy Last Build is available after a successful Remote Build & Test " +
                     "in this Editor session (not preserved across a domain reload).",
                     MessageType.None);
+            }
+
+            if (GUILayout.Button("Open Moonlight"))
+            {
+                MoonlightLauncher.Launch(RemoteTestSettings.MoonlightApplicationName);
             }
         }
 
@@ -268,6 +407,23 @@ namespace VRCRemoteTest
                 {
                     RemoteTestSettings.PollIntervalSeconds = newInterval;
                 }
+            }
+
+            // Not gated by the DisabledScope above — these are independent of
+            // the coordinator's transport/SharePath and safe to change
+            // mid-build.
+            var newMoonlightName = EditorGUILayout.DelayedTextField(
+                "Moonlight Application Name", RemoteTestSettings.MoonlightApplicationName);
+            if (newMoonlightName != RemoteTestSettings.MoonlightApplicationName)
+            {
+                RemoteTestSettings.MoonlightApplicationName = newMoonlightName;
+            }
+
+            var newFocusAfterDeploy = EditorGUILayout.ToggleLeft(
+                "Focus Moonlight after deploy", RemoteTestSettings.FocusMoonlightAfterDeploy);
+            if (newFocusAfterDeploy != RemoteTestSettings.FocusMoonlightAfterDeploy)
+            {
+                RemoteTestSettings.FocusMoonlightAfterDeploy = newFocusAfterDeploy;
             }
         }
 
@@ -327,6 +483,11 @@ namespace VRCRemoteTest
             _lastOutcome = outcome;
             _lastOutcomeTime = DateTime.UtcNow;
             _currentStatus = outcome.Succeeded ? RemoteBuildStatus.Succeeded : RemoteBuildStatus.Failed;
+
+            if (outcome.Succeeded && RemoteTestSettings.FocusMoonlightAfterDeploy)
+            {
+                MoonlightLauncher.Launch(RemoteTestSettings.MoonlightApplicationName);
+            }
         }
 
         private void LoadSettingsIntoFields()

@@ -50,6 +50,14 @@ namespace VRCRemoteTest
         public VrchatStatus VrchatStatus => _transport.PollVrchatStatus();
 
         /// <summary>
+        /// Phase 5 advisory log content (recent VRChat output_log lines,
+        /// republished by the Bridge). Never gates build success — display
+        /// only. Null if the Bridge hasn't published a log yet or it couldn't
+        /// be read.
+        /// </summary>
+        public string VrchatLog => _transport.PollVrchatLog();
+
+        /// <summary>
         /// Set as soon as SHA-256 has been computed for a successful SDK
         /// build, even if the subsequent upload/poll fails — a build that got
         /// this far is "redeployable" (spec section 40's Deploy Last Build use

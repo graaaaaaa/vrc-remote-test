@@ -208,5 +208,37 @@ namespace VRCRemoteTest.Tests
             var transport = new SmbRemoteTransport(_shareRoot);
             Assert.IsNull(transport.PollVrchatStatus());
         }
+
+        [Test]
+        public void PollVrchatLog_returns_null_when_no_log_file()
+        {
+            var transport = new SmbRemoteTransport(_shareRoot);
+            Assert.IsNull(transport.PollVrchatLog());
+        }
+
+        [Test]
+        public void PollVrchatLog_returns_content_when_present()
+        {
+            var logsDir = Path.Combine(_shareRoot, "logs");
+            Directory.CreateDirectory(logsDir);
+            File.WriteAllText(Path.Combine(logsDir, "vrchat-latest.log"), "2026.09.02 12:00:00 Debug - hello");
+
+            var transport = new SmbRemoteTransport(_shareRoot);
+            Assert.AreEqual("2026.09.02 12:00:00 Debug - hello", transport.PollVrchatLog());
+        }
+
+        [Test]
+        public void PollVrchatLog_returns_null_when_file_exceeds_size_guard()
+        {
+            var logsDir = Path.Combine(_shareRoot, "logs");
+            Directory.CreateDirectory(logsDir);
+            // Deliberately oversized (>512 KiB) to exercise the size guard
+            // (Codex plan review Phase 5, Round 2, confidence 0.90).
+            var oversized = new string('a', 520 * 1024);
+            File.WriteAllText(Path.Combine(logsDir, "vrchat-latest.log"), oversized);
+
+            var transport = new SmbRemoteTransport(_shareRoot);
+            Assert.IsNull(transport.PollVrchatLog());
+        }
     }
 }

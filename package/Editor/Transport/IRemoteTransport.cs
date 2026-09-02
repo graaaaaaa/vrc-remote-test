@@ -38,5 +38,13 @@ namespace VRCRemoteTest
         /// "unknown", never as an error.
         /// </summary>
         VrchatStatus PollVrchatStatus();
+
+        /// <summary>
+        /// Reads the Bridge's continuously-republished logs/vrchat-latest.log
+        /// (Phase 5). Returns null if the file does not exist, could not be
+        /// read, or exceeds the size guard — callers treat this the same as
+        /// "no log available", never as an error.
+        /// </summary>
+        string PollVrchatLog();
     }
 }

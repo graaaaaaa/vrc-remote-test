@@ -46,5 +46,9 @@ namespace VRCRemoteTest.Tests
         public VrchatStatus VrchatStatusToReturn { get; set; }
 
         public VrchatStatus PollVrchatStatus() => VrchatStatusToReturn;
+
+        public string VrchatLogToReturn { get; set; }
+
+        public string PollVrchatLog() => VrchatLogToReturn;
     }
 }

@@ -16,7 +16,7 @@ bridge/
 │   ├── Configuration/              — config.json読み込み・検証
 │   ├── Protocol/                   — BuildManifest / BuildResult / VrchatStatus (JSON wire format)
 │   ├── Deployment/                 — 検証・配置・クリーンアップ・監視ループ
-│   └── VRChat/                     — VRChatプロセス監視 (Phase 4a) + 自動起動 (Phase 4.1)
+│   └── VRChat/                     — VRChatプロセス監視 (Phase 4a) + 自動起動 (Phase 4.1) + ログ配信 (Phase 5)
 └── tests/VRCRemoteTest.Bridge.Tests/ — xUnit
     └── fixtures/                   — golden JSONフィクスチャ (Unity側と共有)
 ```
@@ -28,6 +28,7 @@ Codexレビューを経て、Bridgeは「フルオーケストレーションサ
 - **heartbeatなし**: ビルドごとに1つの結果ファイル (`results/{buildId}.json`) のみ
 - **VRChatプロセス監視**: `VrchatMonitorService`が10秒間隔でVRChatプロセスと`--watch-worlds`引数の有無を`status/vrchat-status.json`へ書き出す（Phase 4a）。Unity側のpreflight表示専用で、ビルドの成否には一切影響しない
 - **VRChat自動起動（`AutoLaunchVrchat`、デフォルトOFF）**: 有効時、VRChat未起動ならBridgeが`--watch-worlds`付きで自動起動し、準備が整うまで待ってからdeployする（Phase 4.1）。既に`--watch-worlds`無しで起動中のVRChatは勝手に再起動しない。準備確認は仕様書§31の「新しいoutput_logファイル出現」ではなく、`VrchatMonitorService`と同じWMIベースのプロセス監視シグナルの安定確認＋起動時刻からの最低待機時間（`StartupSettleDelay`）を組み合わせた方式を採用している（意図的な仕様逸脱、詳細は`VrchatReadinessCoordinator.cs`のコメント参照）
+- **VRChatログ配信（`VrchatLogService`、Phase 5）**: 5秒間隔で`output_log_*.txt`の最新ファイル末尾を状態を持たずに再読み込みし、直近200行を`logs/vrchat-latest.log`へ書き出す。Unity側Log Viewer（表示専用）のためのもので、readiness判定には一切使用しない
 - **認証はSMB ACLのみ**: HMAC署名はv1.1で追加予定
 
 ## ビルド・テスト方法
@@ -83,7 +84,8 @@ dotnet publish src/VRCRemoteTest.Bridge/VRCRemoteTest.Bridge.csproj -c Release -
 ├── archive/      — 処理完了（冪等性判定に使用）
 ├── failed/       — 検証失敗・quarantine
 ├── results/      — ビルドごとの結果ファイル (Unity側がポーリング)
-└── status/       — VrchatMonitorServiceが10秒間隔で上書きするvrchat-status.json (Phase 4a)
+├── status/       — VrchatMonitorServiceが10秒間隔で上書きするvrchat-status.json (Phase 4a)
+└── logs/         — VrchatLogServiceが5秒間隔で上書きするvrchat-latest.log (Phase 5、表示専用)
 ```
 
 ## 手動テスト（Unity不要）

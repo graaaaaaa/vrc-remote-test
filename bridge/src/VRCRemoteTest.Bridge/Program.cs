@@ -68,6 +68,10 @@ try
     builder.Services.AddSingleton<IVrchatLauncher, VrchatLauncher>();
     builder.Services.AddSingleton<IVrchatReadinessCoordinator, VrchatReadinessCoordinator>();
 
+    // Phase 5: independent stateless snapshot reader + its own polling BackgroundService.
+    builder.Services.AddSingleton<IVrchatLogReader, VrchatLogReader>();
+    builder.Services.AddHostedService<VrchatLogService>();
+
     using var host = builder.Build();
 
     // Fail fast on invalid configuration (e.g. missing VrchatWorldsDirectory) before
