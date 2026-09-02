@@ -1,0 +1,169 @@
+# Windows側セットアップ手順
+
+VRC Remote Testを使うために、Windows実機（VRChatクライアントを動かすマシン）側で一度だけ行う設定をまとめる。実際の初回E2Eテスト（2026-09-02実施、macOS Unity → SDK Build → SMBアップロード → Windows Bridge → VRChat `--watch-worlds`リロード、まで実機で成功）で得た手順・詰まりどころをそのまま反映している。
+
+**前提**: README記載のSetup Flow（仕様書§63）のうち、1〜4（Bridge install〜VRChat launch設定）がこのドキュメントの対象。5以降（ALCOMでのpackage追加、Unity側操作）はmacOS側の操作であり対象外。
+
+---
+
+## 前提条件
+
+- [ ] Windows 11マシン（管理者権限を持つアカウントでログイン可能なこと）
+- [ ] Steam + VRChatがインストール済み
+- [ ] PowerShell 7（`pwsh`）がインストール済み — Windows標準のPowerShell 5.1では`start-vrchat-dev.ps1`等が動かない（`#Requires -Version 7.0`）
+- [ ] macOS開発機で `dotnet publish` によりBridgeのwin-x64単一ファイル実行体を発行済み（`bridge/README.md`参照）、またはWindows実機に.NET 10 SDKを入れて直接ビルド
+
+---
+
+## 1. Bridge実行体の配置
+
+macOS開発機で発行:
+
+```bash
+cd bridge
+dotnet publish src/VRCRemoteTest.Bridge/VRCRemoteTest.Bridge.csproj \
+  -c Release -r win-x64 --self-contained -p:PublishSingleFile=true
+```
+
+出力（`bridge/src/VRCRemoteTest.Bridge/bin/Release/net10.0/win-x64/publish/VRCRemoteTest.Bridge.exe`）をWindows実機の任意の場所（例: `C:\VRCRemoteTest\bin\`）へコピーする。
+
+**現状の運用**: `scripts/install-bridge.ps1`（Task Scheduler "At log on" への自動登録）は未実装。当面は`VRCRemoteTest.Bridge.exe`をコンソールから手動起動し、動作確認する運用とする。自動起動が必要になった場合はPhase 4以降で対応する。
+
+---
+
+## 2. ステージングディレクトリとconfig.jsonの作成
+
+```powershell
+New-Item -ItemType Directory -Path C:\VRCRemoteTest -Force
+```
+
+`%LOCALAPPDATA%\VRCRemoteTest\config.json` を作成する（**Bridgeは自動生成しない。手動作成が必須**）:
+
+```powershell
+New-Item -ItemType Directory -Path "$env:LOCALAPPDATA\VRCRemoteTest" -Force
+@'
+{
+  "Bridge": {
+    "StagingDirectory": "C:\\VRCRemoteTest",
+    "VrchatWorldsDirectory": "C:\\Users\\<ユーザー名>\\AppData\\LocalLow\\VRChat\\VRChat\\Worlds",
+    "MaxArtifactSizeBytes": 524288000,
+    "RetainBuilds": 10
+  }
+}
+'@ | Set-Content -Path "$env:LOCALAPPDATA\VRCRemoteTest\config.json" -Encoding utf8
+```
+
+`<ユーザー名>`は実際のWindowsログインユーザー名に置き換える。`VrchatWorldsDirectory`が実在しない場合Bridgeは起動を拒否する（勝手な推測をしない設計）ので、VRChatを一度でも起動してWorldsディレクトリが生成済みであることを事前に確認しておく。
+
+---
+
+## 3. SMB共有の作成（管理者権限必須）
+
+`New-SmbShare`は非管理者セッションでは `Windows System Error 5`（access denied）で失敗する。**管理者としてPowerShellを起動**すること。
+
+```powershell
+# SMB共有を作成
+New-SmbShare -Name "VRCRemoteTest" -Path "C:\VRCRemoteTest" -FullAccess "Everyone"
+
+# ファイアウォール: 「ファイルとプリンター共有」規則を有効化
+# 注意: 日本語版WindowsではDisplayGroup名 "File and Printer Sharing" が
+# ローカライズされているため、-DisplayGroup 指定は失敗する。
+# ロケール非依存の固定ルール名を使うこと。
+Get-NetFirewallRule -Name "FPS-SMB-In-TCP" | Enable-NetFirewallRule
+```
+
+SMB共有アクセス権限（`Grant-SmbShareAccess`）だけでなく、**NTFSレベルのアクセス権限も別途必要**（片方だけでは実際のファイル書き込みができない）:
+
+```powershell
+icacls "C:\VRCRemoteTest" /grant "<ユーザーまたはグループ名>:(OI)(CI)F" /T
+```
+
+---
+
+## 4. SMB認証 — PINログイン環境での注意
+
+**Windows Helloの PIN ログインはSMBネットワーク認証には使えない。** SMBはWindowsアカウントの実パスワードを要求するが、PINはローカルデバイス限定の認証情報であり、ネットワーク越しの認証には使われない。
+
+ログイン用アカウントに実パスワードを設定していない・思い出せない場合、**SMB専用のローカルアカウントを新規作成**するのが最も簡単:
+
+```powershell
+$securePassword = Read-Host -AsSecureString "vrcremote アカウントのパスワードを入力"
+New-LocalUser -Name "vrcremote" -Password $securePassword -PasswordNeverExpires
+
+# 作成したアカウントに共有アクセス権限を付与
+Grant-SmbShareAccess -Name "VRCRemoteTest" -AccountName "vrcremote" -AccessRight Full -Force
+icacls "C:\VRCRemoteTest" /grant "vrcremote:(OI)(CI)F" /T
+```
+
+Mac側からのマウント時は、Windowsのメインアカウントではなく `vrcremote` のユーザー名・パスワードで認証する。
+
+---
+
+## 5. macOS側: SMB共有のマウント
+
+Finderの「サーバへ接続」（`Cmd+K`）で以下を入力:
+
+```
+smb://vrcremote@<Windowsマシンのホスト名またはIPアドレス>/VRCRemoteTest
+```
+
+パスワード入力を求められたら、手順4で設定した`vrcremote`アカウントのパスワードを入力する。マウント後、`/Volumes/VRCRemoteTest`として書き込み可能であることを確認する:
+
+```bash
+touch /Volumes/VRCRemoteTest/test.txt && rm /Volumes/VRCRemoteTest/test.txt && echo OK
+```
+
+---
+
+## 6. Bridgeの起動
+
+管理者権限は不要（Bridgeはインタラクティブユーザーセッションで非elevated実行する設計 — 仕様書§20）。
+
+```powershell
+C:\VRCRemoteTest\bin\VRCRemoteTest.Bridge.exe
+```
+
+起動ログ（`%LOCALAPPDATA%\VRCRemoteTest\logs\bridge-*.log`、およびコンソール）に `VRC Remote Test Bridge starting.` が出力され、設定エラーで即終了しないことを確認する。設定エラーの場合は`Configuration error: ...`が出力されるので、`config.json`の`VrchatWorldsDirectory`のパスを再確認する。
+
+---
+
+## 7. VRChatの起動（`--watch-worlds`付き）
+
+PowerShell 7（`pwsh`）で:
+
+```powershell
+& "\\<Macのホスト名>\...\scripts\start-vrchat-dev.ps1" -Mode Desktop
+```
+
+またはリポジトリをWindows側にもコピーしてある場合はローカルパスから直接実行する。初回実行時、スクリプトファイルが「ブロック」されている場合は事前に以下を実行:
+
+```powershell
+Unblock-File -Path .\start-vrchat-dev.ps1
+# それでも実行ポリシーで弾かれる場合
+Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned
+```
+
+VRChatのホーム画面到達を確認したら準備完了。以降はUnity側の `VRChat SDK > VRC Remote Test` ウィンドウから `Remote Build & Test` を実行する（Mac側の操作、仕様書§60）。
+
+---
+
+## トラブルシューティング
+
+| 症状 | 原因 | 対処 |
+|------|------|------|
+| `New-SmbShare`が`Windows System Error 5`で失敗 | 非管理者PowerShellで実行している | PowerShellを「管理者として実行」し直す |
+| `Enable-NetFirewallRule -DisplayGroup "File and Printer Sharing"`が規則を見つけられない | 日本語版Windowsでは`DisplayGroup`名がローカライズされている | `Get-NetFirewallRule -Name "FPS-SMB-In-TCP"`という固定名で指定する |
+| SMB共有はマウントできるが、ファイル作成/更新が失敗する（読み取りは可能） | `Grant-SmbShareAccess`（SMB層）のみで、NTFS層のACLが未設定 | `icacls`で該当ユーザーに`(OI)(CI)F`権限を追加する |
+| SMBマウント時のパスワード認証が繰り返し失敗する | PINでログインしているアカウントには、SMBが要求する実パスワードが設定されていない/不明 | SMB専用のローカルアカウント（例: `vrcremote`）を新規作成し、そちらの資格情報でマウントする |
+| `.ps1`スクリプトの実行が"このシステムではスクリプトの実行が無効になっているため"のエラーで拒否される | 実行ポリシー、またはダウンロード/コピーされたファイルの「ブロック」属性 | `Unblock-File`を実行。それでも失敗する場合は`Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned` |
+| `start-vrchat-dev.ps1`が構文エラー等で動かない | Windows標準のPowerShell 5.1で実行している（スクリプトは7.0以降が必要） | `pwsh`（PowerShell 7）から実行する |
+| Bridgeが起動直後に`Configuration error`で終了する | `config.json`の`VrchatWorldsDirectory`が存在しない、またはパスが誤っている | VRChatを一度起動してWorldsディレクトリを生成させてから、正確なパスを`config.json`に設定する |
+
+---
+
+## 関連ドキュメント
+
+- `bridge/README.md` — Bridge本体のビルド・設定ファイル・ステージング構造の詳細
+- `docs/validation/watch-worlds-spike.md` — `--watch-worlds`挙動の実機検証記録（Phase 0.5）
+- `docs/sdk-api-notes.md` — Unity側SDK APIの調査ノート
+- `VRC Remote Test — 実装仕様書.md` §16（Windows Share）、§44（Windows config）、§63（Setup Flow）
