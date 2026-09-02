@@ -42,5 +42,9 @@ namespace VRCRemoteTest.Tests
 
             return ResultQueue.Count > 0 ? ResultQueue.Dequeue() : null;
         }
+
+        public VrchatStatus VrchatStatusToReturn { get; set; }
+
+        public VrchatStatus PollVrchatStatus() => VrchatStatusToReturn;
     }
 }

@@ -14,8 +14,9 @@ bridge/
 ├── src/VRCRemoteTest.Bridge/       — 本体 (net10.0, win-x64 self-contained single-file)
 │   ├── Program.cs                  — エントリポイント、Generic Host組み立て
 │   ├── Configuration/              — config.json読み込み・検証
-│   ├── Protocol/                   — BuildManifest / BuildResult (JSON wire format)
-│   └── Deployment/                 — 検証・配置・クリーンアップ・監視ループ
+│   ├── Protocol/                   — BuildManifest / BuildResult / VrchatStatus (JSON wire format)
+│   ├── Deployment/                 — 検証・配置・クリーンアップ・監視ループ
+│   └── VRChat/                     — VRChatプロセス監視 (Phase 4a)
 └── tests/VRCRemoteTest.Bridge.Tests/ — xUnit
     └── fixtures/                   — golden JSONフィクスチャ (Unity側と共有)
 ```
@@ -25,7 +26,7 @@ bridge/
 Codexレビューを経て、Bridgeは「フルオーケストレーションサービス」ではなく「ファイル検証・配置に特化したプロモーター」として設計しています。
 
 - **heartbeatなし**: ビルドごとに1つの結果ファイル (`results/{buildId}.json`) のみ
-- **VRChatプロセス監視・自動起動なし**: v1ではVRChatが`--watch-worlds`付きで起動済みであることを前提とする（Phase 4で追加予定）
+- **VRChatプロセス監視のみ、自動起動なし**: `VrchatMonitorService`が10秒間隔でVRChatプロセスと`--watch-worlds`引数の有無を`status/vrchat-status.json`へ書き出す（Phase 4a）。Unity側のpreflight表示専用で、ビルドの成否には一切影響しない。VRChatの自動起動（`autoLaunch`）は未実装（Phase 4.1で計画予定）
 - **認証はSMB ACLのみ**: HMAC署名はv1.1で追加予定
 
 ## ビルド・テスト方法
@@ -73,7 +74,8 @@ dotnet publish src/VRCRemoteTest.Bridge/VRCRemoteTest.Bridge.csproj -c Release -
 ├── processing/   — 処理中（claim済み）
 ├── archive/      — 処理完了（冪等性判定に使用）
 ├── failed/       — 検証失敗・quarantine
-└── results/      — ビルドごとの結果ファイル (Unity側がポーリング)
+├── results/      — ビルドごとの結果ファイル (Unity側がポーリング)
+└── status/       — VrchatMonitorServiceが10秒間隔で上書きするvrchat-status.json (Phase 4a)
 ```
 
 ## 手動テスト（Unity不要）

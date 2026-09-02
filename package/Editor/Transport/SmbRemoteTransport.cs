@@ -24,8 +24,11 @@ namespace VRCRemoteTest
             _sharePath = sharePath;
         }
 
+        private const long MaxVrchatStatusFileBytes = 64 * 1024;
+
         private string IncomingDir => Path.Combine(_sharePath, "incoming");
         private string ResultsDir => Path.Combine(_sharePath, "results");
+        private string StatusDir => Path.Combine(_sharePath, "status");
 
         public bool IsAvailable
         {
@@ -94,6 +97,42 @@ namespace VRCRemoteTest
             {
                 // Transient: the Bridge may be mid-write (it uses .json.tmp ->
                 // rename, but there is a brief window). Caller keeps polling.
+                return null;
+            }
+        }
+
+        /// <summary>
+        /// Phase 4a advisory status, never a build-blocking value. The 64 KiB size
+        /// guard is stricter than PollResult's (no guard) because this file is
+        /// rewritten roughly every 10s versus once per build, giving a partial-read
+        /// race over SMB more chances to be hit in practice (Codex plan review
+        /// Phase 4a, Round 2, confidence 0.80).
+        /// </summary>
+        public VrchatStatus PollVrchatStatus()
+        {
+            var statusPath = CombineUnderRoot(StatusDir, "vrchat-status.json");
+            if (!File.Exists(statusPath))
+            {
+                return null;
+            }
+
+            try
+            {
+                var info = new FileInfo(statusPath);
+                if (info.Length > MaxVrchatStatusFileBytes)
+                {
+                    return null;
+                }
+
+                var json = File.ReadAllText(statusPath);
+                return JsonConvert.DeserializeObject<VrchatStatus>(json, new JsonSerializerSettings
+                {
+                    TypeNameHandling = TypeNameHandling.None,
+                    MaxDepth = 8,
+                });
+            }
+            catch (Exception ex) when (ex is IOException or JsonException)
+            {
                 return null;
             }
         }

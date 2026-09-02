@@ -1,10 +1,16 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
   <!--
-    v1 uses plain net10.0 (no Windows-specific APIs yet: no WMI/System.Management).
     .NET 10 is an LTS release, matching the SDK/runtime available on the dev machine.
-    Phase 4 (VRChat process monitoring / auto-launch) will require switching to
-    net10.0-windows when System.Management is introduced. See docs/sdk-api-notes.md.
+    Phase 4a added System.Management (WMI) for VRChat watch worlds flag detection, but
+    TargetFramework deliberately stays plain net10.0 rather than switching to
+    net10.0-windows: System.Management is referenceable from net10.0 directly, and all
+    actual WMI calls are guarded with OperatingSystem.IsWindows() at the call site
+    (see VRChat/VrchatProcessMonitor.cs). Verified via a macOS build+test spike and a
+    win-x64 self-contained single-file publish spike, both succeeding with the package
+    referenced (Codex plan review Phase 4a). Switching to net10.0-windows would only
+    suppress CA1416 analyzer warnings, which the runtime guard already makes moot, and
+    would add TFM complexity to the test project for no behavioral benefit.
   -->
   <PropertyGroup>
     <OutputType>Exe</OutputType>
@@ -33,6 +39,7 @@
     <PackageReference Include="Serilog.Extensions.Hosting" Version="8.0.0" />
     <PackageReference Include="Serilog.Sinks.Console" Version="6.0.0" />
     <PackageReference Include="Serilog.Sinks.File" Version="6.0.0" />
+    <PackageReference Include="System.Management" Version="10.0.11" />
   </ItemGroup>
 
   <ItemGroup>

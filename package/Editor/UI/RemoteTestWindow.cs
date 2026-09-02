@@ -23,10 +23,18 @@ namespace VRCRemoteTest
         // 2, confidence 0.88).
         private const float PreflightCheckIntervalSeconds = 2.5f;
 
+        // Independent of the Bridge's own VrchatMonitorService poll interval
+        // (10s) — a conservative fixed value on the Unity side so staleness
+        // detection doesn't depend on Mac/Windows clock sync assumptions
+        // beyond "not wildly skewed" (Codex plan review Phase 4a, Round 2,
+        // confidence 0.91).
+        private const float VrchatStatusStaleAfterSeconds = 30f;
+
         private bool _shareConfigured;
         private bool _shareReachable;
         private bool _sdkAvailable;
         private bool _hasLastArtifact;
+        private VrchatStatus _vrchatStatus;
         private double _lastPreflightCheckTime = double.NegativeInfinity;
 
         private RemoteBuildStatus _currentStatus = RemoteBuildStatus.Idle;
@@ -102,6 +110,33 @@ namespace VRCRemoteTest
             }
 
             DrawStatusLine("VRChat SDK", _sdkAvailable, "Available", "Not available");
+
+            DrawVrchatStatusLine();
+        }
+
+        /// <summary>
+        /// Phase 4a: advisory only, never gates the build buttons (unlike Remote
+        /// Share/VRChat SDK which do via DrawActionButtons' DisabledScope). A
+        /// stale or missing status (Bridge not running Phase 4a's monitor, or an
+        /// older Bridge build without it) reads as "Unknown", never green — the
+        /// UI never trusts an old IsRunning=true (Codex plan review Phase 4a,
+        /// Round 2, confidence 0.91).
+        /// </summary>
+        private void DrawVrchatStatusLine()
+        {
+            var fresh = _vrchatStatus != null
+                && (DateTimeOffset.UtcNow - _vrchatStatus.UpdatedAtUtc) <= TimeSpan.FromSeconds(VrchatStatusStaleAfterSeconds);
+            var running = fresh && _vrchatStatus.IsRunning;
+            var text = !fresh ? "Unknown" : (_vrchatStatus.IsRunning ? "Running" : "Not running");
+
+            DrawStatusLine("VRChat", running, text, text);
+
+            if (fresh && _vrchatStatus.IsRunning && !_vrchatStatus.WatchWorldsDetected)
+            {
+                EditorGUILayout.HelpBox(
+                    "VRChat is running without --watch-worlds — builds will deploy but won't auto-reload.",
+                    MessageType.Warning);
+            }
         }
 
         private void DrawBuildTargetSection()
@@ -309,6 +344,7 @@ namespace VRCRemoteTest
                 _shareReachable = false;
                 _sdkAvailable = false;
                 _hasLastArtifact = false;
+                _vrchatStatus = null;
                 return;
             }
 
@@ -318,12 +354,14 @@ namespace VRCRemoteTest
                 _shareReachable = coordinator.IsShareReachable;
                 _sdkAvailable = coordinator.IsSdkAvailable;
                 _hasLastArtifact = coordinator.LastArtifact != null;
+                _vrchatStatus = coordinator.VrchatStatus;
             }
             catch (RemoteBuildException)
             {
                 _shareReachable = false;
                 _sdkAvailable = false;
                 _hasLastArtifact = false;
+                _vrchatStatus = null;
             }
         }
 

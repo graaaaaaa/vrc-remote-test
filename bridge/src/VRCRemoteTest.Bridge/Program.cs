@@ -5,6 +5,7 @@ using Microsoft.Extensions.Options;
 using Serilog;
 using VRCRemoteTest.Bridge.Configuration;
 using VRCRemoteTest.Bridge.Deployment;
+using VRCRemoteTest.Bridge.VRChat;
 
 var localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
 var configDir = Path.Combine(localAppData, "VRCRemoteTest");
@@ -57,6 +58,11 @@ try
     builder.Services.AddSingleton<StagingWatcher>();
     builder.Services.AddSingleton<IBridgeWatcher>(sp => sp.GetRequiredService<StagingWatcher>());
     builder.Services.AddHostedService(sp => sp.GetRequiredService<StagingWatcher>());
+
+    // Phase 4a: independent of StagingWatcher, see VrchatMonitorService's doc comment.
+    builder.Services.AddSingleton<IVrchatProcessMonitor, VrchatProcessMonitor>();
+    builder.Services.AddSingleton<IVrchatStatusWriter, VrchatStatusWriter>();
+    builder.Services.AddHostedService<VrchatMonitorService>();
 
     using var host = builder.Build();
 

@@ -43,6 +43,13 @@ namespace VRCRemoteTest
         public bool IsSdkAvailable => _sdkAdapter.IsAvailable;
 
         /// <summary>
+        /// Phase 4a advisory status (VRChat process running / --watch-worlds
+        /// detected). Never gates build success — display only. Null if the
+        /// Bridge hasn't written a status file yet or it couldn't be read.
+        /// </summary>
+        public VrchatStatus VrchatStatus => _transport.PollVrchatStatus();
+
+        /// <summary>
         /// Set as soon as SHA-256 has been computed for a successful SDK
         /// build, even if the subsequent upload/poll fails — a build that got
         /// this far is "redeployable" (spec section 40's Deploy Last Build use

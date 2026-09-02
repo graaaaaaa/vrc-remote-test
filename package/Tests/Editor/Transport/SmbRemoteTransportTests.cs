@@ -157,5 +157,56 @@ namespace VRCRemoteTest.Tests
             var transport = new SmbRemoteTransport(_shareRoot);
             Assert.IsNull(transport.PollResult(buildId));
         }
+
+        [Test]
+        public void PollVrchatStatus_returns_null_when_no_status_file()
+        {
+            var transport = new SmbRemoteTransport(_shareRoot);
+            Assert.IsNull(transport.PollVrchatStatus());
+        }
+
+        [Test]
+        public void PollVrchatStatus_deserializes_valid_status()
+        {
+            var statusDir = Path.Combine(_shareRoot, "status");
+            Directory.CreateDirectory(statusDir);
+            File.WriteAllText(
+                Path.Combine(statusDir, "vrchat-status.json"),
+                "{\"isRunning\":true,\"watchWorldsDetected\":true,\"processId\":4321," +
+                "\"startTimeUtc\":\"2026-09-02T12:00:00Z\",\"updatedAtUtc\":\"2026-09-02T12:00:05Z\"}");
+
+            var transport = new SmbRemoteTransport(_shareRoot);
+            var status = transport.PollVrchatStatus();
+
+            Assert.IsNotNull(status);
+            Assert.IsTrue(status.IsRunning);
+            Assert.IsTrue(status.WatchWorldsDetected);
+            Assert.AreEqual(4321, status.ProcessId);
+        }
+
+        [Test]
+        public void PollVrchatStatus_returns_null_for_corrupt_json()
+        {
+            var statusDir = Path.Combine(_shareRoot, "status");
+            Directory.CreateDirectory(statusDir);
+            File.WriteAllText(Path.Combine(statusDir, "vrchat-status.json"), "{ not valid json");
+
+            var transport = new SmbRemoteTransport(_shareRoot);
+            Assert.IsNull(transport.PollVrchatStatus());
+        }
+
+        [Test]
+        public void PollVrchatStatus_returns_null_when_file_exceeds_size_guard()
+        {
+            var statusDir = Path.Combine(_shareRoot, "status");
+            Directory.CreateDirectory(statusDir);
+            // Deliberately oversized (>64 KiB) to exercise the size guard
+            // (Codex plan review Phase 4a, Round 2, confidence 0.80).
+            var oversizedJson = "{\"padding\":\"" + new string('a', 70 * 1024) + "\"}";
+            File.WriteAllText(Path.Combine(statusDir, "vrchat-status.json"), oversizedJson);
+
+            var transport = new SmbRemoteTransport(_shareRoot);
+            Assert.IsNull(transport.PollVrchatStatus());
+        }
     }
 }

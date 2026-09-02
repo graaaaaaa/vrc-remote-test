@@ -30,5 +30,13 @@ namespace VRCRemoteTest
         /// polling in that case, not treat it as failure.
         /// </summary>
         BuildResult PollResult(string buildId);
+
+        /// <summary>
+        /// Reads the Bridge's continuously-updated status/vrchat-status.json
+        /// (Phase 4a). Returns null if the file does not exist, could not be
+        /// read, or exceeds the size guard — callers treat this the same as
+        /// "unknown", never as an error.
+        /// </summary>
+        VrchatStatus PollVrchatStatus();
     }
 }
