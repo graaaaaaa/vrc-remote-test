@@ -161,6 +161,16 @@ public sealed class VrchatReadinessCoordinator : IVrchatReadinessCoordinator
             }
         }
 
+        // The while loop's guard (!linkedCts.IsCancellationRequested) can already be
+        // false on entry to a given iteration if the external cancellationToken fires
+        // between two polls -- on a slow/loaded runner this can happen before the loop
+        // ever reaches the Task.Delay that would normally rethrow it below. Without this
+        // check, that race silently downgrades a real external cancellation into a
+        // VrchatStartTimeout failure result instead of propagating OperationCanceledException
+        // (observed as CI-only flakiness on a shared GitHub Actions runner; did not
+        // reproduce locally where scheduling is fast enough to always hit Task.Delay first).
+        cancellationToken.ThrowIfCancellationRequested();
+
         var message = $"Timed out after {startupTimeout.TotalSeconds}s waiting for VRChat to become ready.";
         _logger.LogError(message);
         return ReadinessResult.Failure(ErrorCode.VrchatStartTimeout, message);
