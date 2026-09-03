@@ -14,7 +14,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: release-package-${{ github.ref_name }}
+  group: release-package
   cancel-in-progress: false
 
 jobs:
@@ -24,103 +24,226 @@ jobs:
     permissions:
       contents: write
     steps:
+      # Validated before checkout, straight off the raw ref name — no repo
+      # content is needed for this check. Every value derived from the tag
+      # is threaded through `env:` (never `${{ }}` inside a `run:` body)
+      # from here on, so a tag name can never be spliced into a shell
+      # command before bash gets to parse it (git tag names are allowed to
+      # contain shell metacharacters like `` ` `` / `$()` — confirmed via
+      # git-check-ref-format; a glob trigger like `v*.*.*` does not exclude
+      # them either — Codex code review, Round 1, confidence 0.9+ across
+      # all 3 perspectives).
+      - name: Validate tag format strictly
+        env:
+          RAW_TAG: ${{ github.ref_name }}
+        run: |
+          if [[ ! "$RAW_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Tag '$RAW_TAG' does not match strict vMAJOR.MINOR.PATCH format"
+            exit 1
+          fi
+
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
       - name: Derive tag/version
         id: version
+        env:
+          RAW_TAG: ${{ github.ref_name }}
         run: |
-          TAG="${GITHUB_REF_NAME}"
-          VERSION="${TAG#v}"
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=$RAW_TAG" >> "$GITHUB_OUTPUT"
+          echo "version=${RAW_TAG#v}" >> "$GITHUB_OUTPUT"
 
       - name: Verify tag points at a commit already on main
         run: |
-          git fetch origin main
+          git fetch origin +refs/heads/main:refs/remotes/origin/main
           if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
-            echo "::error::Tag $GITHUB_REF_NAME (commit $GITHUB_SHA) is not an ancestor of main. Refusing to release an unreviewed/un-merged commit."
+            echo "::error::Tag is not an ancestor of main. Refusing to release an unreviewed/un-merged commit."
             exit 1
           fi
 
-      - name: Verify package.json version matches tag
+      # Read from the TAGGED commit specifically (git show "$GITHUB_SHA:...")
+      # rather than whatever main happens to be checked out to later — main
+      # can move between the tag being pushed and this job running (or on a
+      # delayed/retried run), and the release asset must describe the exact
+      # commit it was built from (Codex code review, Round 1, confidence
+      # 0.9+ across all 3 perspectives).
+      - name: Snapshot package.json/CHANGELOG.md from the tagged commit
+        id: snapshot
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
-          PKG_VERSION=$(jq -r '.version' package/package.json)
-          if [ "$PKG_VERSION" != "${{ steps.version.outputs.version }}" ]; then
-            echo "::error::package/package.json version ($PKG_VERSION) does not match tag version (${{ steps.version.outputs.version }})"
-            exit 1
-          fi
-
-      - name: Verify CHANGELOG has an entry for this version
-        run: |
-          if ! grep -q "^## \[${{ steps.version.outputs.version }}\]" package/CHANGELOG.md; then
-            echo "::error::package/CHANGELOG.md has no '## [${{ steps.version.outputs.version }}]' heading"
-            exit 1
-          fi
-
-      - name: Build zip (package/ contents at the root, no wrapper folder)
-        id: zip
-        run: |
-          PKG_NAME=$(jq -r '.name' package/package.json)
-          ASSET="${PKG_NAME}-${{ steps.version.outputs.version }}.zip"
           mkdir -p dist
-          (cd package && find . -type f ! -name .DS_Store -print | sed 's#^./##' | LC_ALL=C sort | zip -X -q "../dist/$ASSET" -@)
-          echo "asset=$ASSET" >> "$GITHUB_OUTPUT"
+          git show "$GITHUB_SHA:package/package.json" > dist/package.json.snapshot
+
+          PKG_VERSION=$(jq -r '.version' dist/package.json.snapshot)
+          PKG_NAME=$(jq -r '.name' dist/package.json.snapshot)
+          # Belt-and-braces: PKG_NAME only reaches this workflow via a
+          # merged-to-main package.json, but a stray "/" or newline would
+          # otherwise corrupt $GITHUB_OUTPUT or the zip asset path/URL
+          # (Codex code review, Round 3, confidence 0.87, SUGGESTION).
+          if [[ ! "$PKG_NAME" =~ ^[a-z0-9]([a-z0-9._-]*[a-z0-9])?$ ]]; then
+            echo "::error::package/package.json name '$PKG_NAME' at the tagged commit is not a safe lowercase dotted identifier"
+            exit 1
+          fi
+          if [ "$PKG_VERSION" != "$VERSION" ]; then
+            echo "::error::package/package.json version ($PKG_VERSION) at the tagged commit does not match tag version ($VERSION)"
+            exit 1
+          fi
+
+          if ! git show "$GITHUB_SHA:package/CHANGELOG.md" | grep -qF "## [$VERSION]"; then
+            echo "::error::package/CHANGELOG.md at the tagged commit has no '## [$VERSION]' heading"
+            exit 1
+          fi
+
           echo "pkg_name=$PKG_NAME" >> "$GITHUB_OUTPUT"
 
-      - name: Verify zip structure
+      - name: Build zip from the tagged commit (package/ contents at the root, no wrapper folder)
+        id: zip
+        env:
+          PKG_NAME: ${{ steps.snapshot.outputs.pkg_name }}
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
-          unzip -Z1 "dist/${{ steps.zip.outputs.asset }}" | grep -qx "package.json"
-          if unzip -Z1 "dist/${{ steps.zip.outputs.asset }}" | grep -q "^package/"; then
+          ASSET="${PKG_NAME}-${VERSION}.zip"
+          (cd package && find . -type f ! -name .DS_Store -print | sed 's#^./##' | LC_ALL=C sort | zip -X -q "../dist/$ASSET" -@)
+          echo "asset=$ASSET" >> "$GITHUB_OUTPUT"
+
+      - name: Verify zip structure
+        env:
+          ASSET: ${{ steps.zip.outputs.asset }}
+        run: |
+          unzip -Z1 "dist/$ASSET" | grep -qx "package.json"
+          if unzip -Z1 "dist/$ASSET" | grep -q "^package/"; then
             echo "::error::zip contains a package/ wrapper directory; VPM/UPM expects package.json at the zip root"
             exit 1
           fi
 
       - name: Compute SHA-256
         id: hash
-        run: |
-          SHA=$(sha256sum "dist/${{ steps.zip.outputs.asset }}" | cut -d' ' -f1)
-          echo "sha256=$SHA" >> "$GITHUB_OUTPUT"
-
-      - name: Extract release notes from CHANGELOG
-        run: |
-          awk '/^## \[${{ steps.version.outputs.version }}\]/{flag=1; next} /^## \[/{if(flag) exit} flag' \
-            package/CHANGELOG.md > release-notes.md
-
-      - name: Create GitHub Release
         env:
-          GH_TOKEN: ${{ github.token }}
+          ASSET: ${{ steps.zip.outputs.asset }}
         run: |
-          if gh release view "${{ steps.version.outputs.tag }}" >/dev/null 2>&1; then
-            echo "::error::Release ${{ steps.version.outputs.tag }} already exists. Aborting to avoid a partial re-run."
+          echo "sha256=$(sha256sum "dist/$ASSET" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+
+      - name: Extract release notes from CHANGELOG (tagged commit)
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          # CHANGELOG headings carry a trailing " - <date>" (e.g.
+          # "## [0.2.0] - 2026-09-03"), so match on the line STARTING with
+          # "## [<version>]" rather than an exact full-line match — an exact
+          # match silently produced empty release notes (Codex code review,
+          # Round 3, confidence 0.87; verified locally: the exact-match form
+          # emitted 0 bytes against this repo's real CHANGELOG.md).
+          git show "$GITHUB_SHA:package/CHANGELOG.md" | \
+            awk -v prefix="## [$VERSION]" '
+              index($0, prefix) == 1 {flag=1; next}
+              /^## \[/{if(flag) exit}
+              flag
+            ' > dist/release-notes.md
+
+      - name: Build the version entry JSON (fixed snapshot, reused for the release and index.json)
+        env:
+          REPO: ${{ github.repository }}
+          TAG: ${{ steps.version.outputs.tag }}
+          ASSET: ${{ steps.zip.outputs.asset }}
+          SHA256: ${{ steps.hash.outputs.sha256 }}
+        run: |
+          jq --arg url "https://github.com/$REPO/releases/download/$TAG/$ASSET" \
+             --arg sha "$SHA256" \
+             '. + {url: $url, zipSHA256: $sha}' dist/package.json.snapshot > dist/version-entry.json
+
+      # Re-check that the tag still points at the commit this run was
+      # triggered for. If a run for commit A is queued (e.g. behind the
+      # concurrency group) and the tag gets deleted and re-pushed at commit
+      # B before this step runs, `gh release create --verify-tag` only
+      # checks the tag EXISTS — not that it still points at A — so it would
+      # otherwise happily publish a release/asset built from the now-stale
+      # commit A under the tag name that actually points at B (Codex code
+      # review, Round 3, confidence 0.87).
+      - name: Re-verify the tag has not moved since checkout
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          CURRENT_SHA=$(git ls-remote origin "refs/tags/$TAG" | cut -f1)
+          if [ "$CURRENT_SHA" != "$GITHUB_SHA" ]; then
+            echo "::error::Tag $TAG now points at $CURRENT_SHA, not the commit this run was triggered for ($GITHUB_SHA). The tag was moved after this run started; aborting rather than publishing a release built from a stale commit."
             exit 1
           fi
-          gh release create "${{ steps.version.outputs.tag }}" "dist/${{ steps.zip.outputs.asset }}" \
-            --verify-tag --title "${{ steps.version.outputs.tag }}" --notes-file release-notes.md
 
-      - name: Update index.json on main
+      # Idempotent: if the release already exists (a previous run created it
+      # but failed before updating index.json, or this run is a retry), we
+      # do not blindly skip — it must be published (not a leftover draft)
+      # and its asset digest must match what we just built from the tagged
+      # commit, otherwise something is inconsistent and we fail hard rather
+      # than publish a listing entry that doesn't match the real asset
+      # (Codex code review, Round 2 confidence 0.85, Round 3 confidence 0.87
+      # for the draft-detection gap).
+      - name: Create GitHub Release (idempotent, verified)
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+          ASSET: ${{ steps.zip.outputs.asset }}
+          SHA256: ${{ steps.hash.outputs.sha256 }}
         run: |
-          git fetch origin main
-          git checkout main
+          if gh release view "$TAG" --json assets,isDraft,publishedAt >/tmp/existing-release.json 2>/dev/null; then
+            IS_DRAFT=$(jq -r '.isDraft' /tmp/existing-release.json)
+            if [ "$IS_DRAFT" = "true" ]; then
+              echo "::error::Release $TAG exists as an unpublished draft (a previous run's gh release create likely failed partway through). Delete the draft manually and re-run, rather than risk publishing an incomplete release automatically."
+              exit 1
+            fi
 
-          VERSION_ENTRY=$(jq \
-            --arg url "https://github.com/${{ github.repository }}/releases/download/${{ steps.version.outputs.tag }}/${{ steps.zip.outputs.asset }}" \
-            --arg sha "${{ steps.hash.outputs.sha256 }}" \
-            '. + {url: $url, zipSHA256: $sha}' package/package.json)
+            EXISTING_DIGEST=$(jq -r --arg name "$ASSET" '.assets[] | select(.name == $name) | .digest' /tmp/existing-release.json)
+            if [ "$EXISTING_DIGEST" != "sha256:$SHA256" ]; then
+              echo "::error::Release $TAG already exists but its asset digest ($EXISTING_DIGEST) does not match the zip just built from this tag (sha256:$SHA256). Refusing to overwrite index.json with mismatched metadata."
+              exit 1
+            fi
+            echo "Release $TAG already exists, published, with a matching asset; skipping creation (recovering from a previous partial run)."
+          else
+            gh release create "$TAG" "dist/$ASSET" \
+              --verify-tag --title "$TAG" --notes-file dist/release-notes.md
+          fi
 
-          jq --argjson entry "$VERSION_ENTRY" \
-            --arg name "${{ steps.zip.outputs.pkg_name }}" \
-            --arg ver "${{ steps.version.outputs.version }}" \
-            '.packages[$name].versions[$ver] = $entry' index.json > index.json.tmp
-          mv index.json.tmp index.json
-
-          jq empty index.json
-
+      # Idempotent (git diff --quiet short-circuits a no-op) and retried on
+      # a push race against another concurrent run (moot under the
+      # single-slot `concurrency:` group above, but cheap defense in depth).
+      - name: Update index.json on main
+        env:
+          PKG_NAME: ${{ steps.snapshot.outputs.pkg_name }}
+          VERSION: ${{ steps.version.outputs.version }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add index.json
-          git commit -m "Add VPM listing for ${{ steps.version.outputs.tag }}"
-          git push origin HEAD:main
+
+          for attempt in 1 2 3 4 5; do
+            git fetch origin +refs/heads/main:refs/remotes/origin/main
+            git checkout -B main origin/main
+
+            jq --slurpfile entry dist/version-entry.json \
+               --arg name "$PKG_NAME" --arg ver "$VERSION" \
+               '.packages[$name].versions[$ver] = $entry[0]' index.json > index.json.tmp
+            mv index.json.tmp index.json
+            jq empty index.json
+
+            if git diff --quiet index.json; then
+              echo "index.json already up to date for $TAG; nothing to commit."
+              break
+            fi
+
+            git add index.json
+            git commit -m "Add VPM listing for $TAG"
+
+            if git push origin HEAD:main; then
+              echo "Pushed index.json update."
+              break
+            fi
+
+            if [ "$attempt" -eq 5 ]; then
+              echo "::error::Failed to push index.json update after 5 attempts."
+              exit 1
+            fi
+            echo "Push failed (attempt $attempt), retrying after fetch..."
+            git reset --hard origin/main
+            sleep $((attempt * 3))
+          done
