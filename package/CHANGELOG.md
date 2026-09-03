@@ -26,6 +26,6 @@
 
 ### Added
 
-- Phase 2 initial implementation: SDK adapter, build coordinator, atomic SMB transport, result polling.
+- Initial implementation: SDK adapter, build coordinator, atomic SMB transport, result polling.
 - Menu item: `VRChat SDK > Remote Build`.
 - Headless entry point for `-executeMethod` / CI invocation: `VRCRemoteTest.RemoteBuildCommand.ExecuteRemoteBuildHeadless`.

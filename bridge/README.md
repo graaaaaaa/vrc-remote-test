@@ -4,7 +4,7 @@ Windows側で動作する.NET 10 (LTS) コンソールアプリ。SMB共有の�
 
 VRChat自体（Unity/Mono/IL2CPPベースの独立プロセス）とはランタイム上の依存関係が一切ないため、.NETのバージョンはVRChat側の制約を受けません。開発機の環境に合わせて.NET 10 LTSを採用しています。
 
-Windows Serviceではなく、インタラクティブユーザーセッションで非elevated実行します（将来的なVRChat起動/監視機能のため）。
+Windows Serviceではなく、インタラクティブユーザーセッションで非elevated実行します（VRChat起動・監視機能のため）。
 
 ## 構成
 
@@ -16,21 +16,21 @@ bridge/
 │   ├── Configuration/              — config.json読み込み・検証
 │   ├── Protocol/                   — BuildManifest / BuildResult / VrchatStatus (JSON wire format)
 │   ├── Deployment/                 — 検証・配置・クリーンアップ・監視ループ
-│   └── VRChat/                     — VRChatプロセス監視 (Phase 4a) + 自動起動 (Phase 4.1) + ログ配信 (Phase 5)
+│   └── VRChat/                     — VRChatプロセス監視・自動起動・ログ配信
 └── tests/VRCRemoteTest.Bridge.Tests/ — xUnit
     └── fixtures/                   — golden JSONフィクスチャ (Unity側と共有)
 ```
 
-## v1スコープ（最小構成）
+## 機能概要
 
-Codexレビューを経て、Bridgeは「フルオーケストレーションサービス」ではなく「ファイル検証・配置に特化したプロモーター」として設計しています。
+Bridgeは「フルオーケストレーションサービス」ではなく「ファイル検証・配置に特化したプロモーター」として設計しています。
 
 - **heartbeatなし**: ビルドごとに1つの結果ファイル (`results/{buildId}.json`) のみ
-- **VRChatプロセス監視**: `VrchatMonitorService`が10秒間隔でVRChatプロセスと`--watch-worlds`引数の有無を`status/vrchat-status.json`へ書き出す（Phase 4a）。Unity側のpreflight表示専用で、ビルドの成否には一切影響しない
-- **VRChat自動起動（`AutoLaunchVrchat`、デフォルトOFF）**: 有効時、VRChat未起動ならBridgeが`--watch-worlds`付きで自動起動し、準備が整うまで待ってからdeployする（Phase 4.1）。既に`--watch-worlds`無しで起動中のVRChatは勝手に再起動しない。準備確認は仕様書§31の「新しいoutput_logファイル出現」ではなく、`VrchatMonitorService`と同じWMIベースのプロセス監視シグナルの安定確認＋起動時刻からの最低待機時間（`StartupSettleDelay`）を組み合わせた方式を採用している（意図的な仕様逸脱、詳細は`VrchatReadinessCoordinator.cs`のコメント参照）
-- **VRChatログ配信（`VrchatLogService`、Phase 5）**: 5秒間隔で`output_log_*.txt`の最新ファイル末尾を状態を持たずに再読み込みし、直近200行を`logs/vrchat-latest.log`へ書き出す。Unity側Log Viewer（表示専用）のためのもので、readiness判定には一切使用しない
-- **自動起動**: `scripts/install-bridge.ps1`でWindows Task Scheduler（Trigger: At log on、Principal: Interactive/Limitedで非elevated）へ登録できる（仕様書§21）。実行体はSMB共有の外側（既定`%LOCALAPPDATA%\Programs\VRCRemoteTest\Bridge\`）に配置する — SMB共有内に置くと、共有への書き込み権限を持つ者が実行体を差し替えることでログオン時に自動実行されるコードを乗っ取れてしまうため（Codexレビューで検出）。手順は`docs/setup-windows.md`、詳細は`scripts/install-bridge.ps1 -?`を参照
-- **認証はSMB ACLのみ**: HMAC署名はv1.1で追加予定
+- **VRChatプロセス監視**: `VrchatMonitorService`が10秒間隔でVRChatプロセスと`--watch-worlds`引数の有無を`status/vrchat-status.json`へ書き出す。Unity側のpreflight表示専用で、ビルドの成否には一切影響しない
+- **VRChat自動起動（`AutoLaunchVrchat`、デフォルトOFF）**: 有効時、VRChat未起動ならBridgeが`--watch-worlds`付きで自動起動し、準備が整うまで待ってからdeployする。既に`--watch-worlds`無しで起動中のVRChatは勝手に再起動しない。準備確認はWMIベースのプロセス監視シグナルの安定確認＋起動時刻からの最低待機時間（`StartupSettleDelay`）を組み合わせた方式（詳細は`VrchatReadinessCoordinator.cs`のコメント参照）
+- **VRChatログ配信（`VrchatLogService`）**: 5秒間隔で`output_log_*.txt`の最新ファイル末尾を状態を持たずに再読み込みし、直近200行を`logs/vrchat-latest.log`へ書き出す。Unity側Log Viewer（表示専用）のためのもので、readiness判定には一切使用しない
+- **自動起動**: `scripts/install-bridge.ps1`でWindows Task Scheduler（Trigger: At log on、Principal: Interactive/Limitedで非elevated）へ登録できる。実行体はSMB共有の外側（既定`%LOCALAPPDATA%\Programs\VRCRemoteTest\Bridge\`）に配置する — 共有への書き込み権限を持つ者が実行体を差し替えてログオン時の自動実行を乗っ取れないようにするため、意図的にSMB共有の外に配置する。手順は`docs/setup-windows.md`、詳細は`scripts/install-bridge.ps1 -?`を参照
+- **認証はSMB ACLのみ**: HMAC署名は将来検討事項
 
 ## ビルド・テスト方法
 
@@ -70,9 +70,9 @@ dotnet publish src/VRCRemoteTest.Bridge/VRCRemoteTest.Bridge.csproj -c Release -
 }
 ```
 
-`VrchatWorldsDirectory`が実在しない場合、Bridgeは起動を拒否します（勝手に別の場所を推測しません）。`VrchatExecutable`/`VrchatMode`/`AutoLaunchVrchat`/`VrchatStartupTimeoutSeconds`/`VrchatStartupSettleDelaySeconds`はPhase 4.1（VRChat自動起動）用の設定で、`AutoLaunchVrchat: true`の場合のみ`VrchatExecutable`が検証される（絶対パス・非UNC・`.exe`拡張子・ファイル名が`VRChat.exe`と完全一致・実在、の全てを満たす必要がある）。
+`VrchatWorldsDirectory`が実在しない場合、Bridgeは起動を拒否します（勝手に別の場所を推測しません）。`VrchatExecutable`/`VrchatMode`/`AutoLaunchVrchat`/`VrchatStartupTimeoutSeconds`/`VrchatStartupSettleDelaySeconds`はVRChat自動起動用の設定で、`AutoLaunchVrchat: true`の場合のみ`VrchatExecutable`が検証される（絶対パス・非UNC・`.exe`拡張子・ファイル名が`VRChat.exe`と完全一致・実在、の全てを満たす必要がある）。
 
-`VrchatStartupSettleDelaySeconds`（デフォルト30秒）は、VRChatプロセス起動後、実際にWorldsディレクトリの監視が有効になる（と推定される）まで待つ最低時間。WMIでの`--watch-worlds`引数検出はプロセス起動直後にほぼ即座に可能になるが、それは「VRChatが実際にファイル配置を検知できる状態」を意味しない。**実機検証（2026-09-02）で、デフォルト15秒では短すぎてリロードが発生しないケースを確認した**（VRChatがホーム画面に到達するまで体感15〜30秒程度）。マシンやVRChatのバージョンによって実際の起動時間は変動するため、必要に応じて値を調整すること。`VrchatStartupTimeoutSeconds`は`VrchatStartupSettleDelaySeconds + 30秒`未満に設定できない。
+`VrchatStartupSettleDelaySeconds`（デフォルト30秒）は、VRChatプロセス起動後、実際にWorldsディレクトリの監視が有効になる（と推定される）まで待つ最低時間。WMIでの`--watch-worlds`引数検出はプロセス起動直後にほぼ即座に可能になるが、それは「VRChatが実際にファイル配置を検知できる状態」を意味しない（VRChatがホーム画面に到達するまで体感15〜30秒程度）。マシンやVRChatのバージョンによって実際の起動時間は変動するため、必要に応じて値を調整すること。`VrchatStartupTimeoutSeconds`は`VrchatStartupSettleDelaySeconds + 30秒`未満に設定できない。
 
 ## ステージングディレクトリ構造
 
@@ -85,10 +85,10 @@ dotnet publish src/VRCRemoteTest.Bridge/VRCRemoteTest.Bridge.csproj -c Release -
 ├── archive/      — 処理完了（冪等性判定に使用）
 ├── failed/       — 検証失敗・quarantine
 ├── results/      — ビルドごとの結果ファイル (Unity側がポーリング)
-├── status/       — VrchatMonitorServiceが10秒間隔で上書きするvrchat-status.json (Phase 4a)
-└── logs/         — VrchatLogServiceが5秒間隔で上書きするvrchat-latest.log (Phase 5、表示専用)
+├── status/       — VrchatMonitorServiceが10秒間隔で上書きするvrchat-status.json
+└── logs/         — VrchatLogServiceが5秒間隔で上書きするvrchat-latest.log（表示専用）
 ```
 
 ## 手動テスト（Unity不要）
 
-Phase 1時点ではUnity実装がまだ存在しないため、`incoming/`へ手動でファイルを配置してBridgeの動作を確認できます。`tests/VRCRemoteTest.Bridge.Tests/fixtures/sample-manifest.json`を参考にmanifestを作成し、対応する`.vrcw`（ダミーファイルで可、サイズとSHA-256を一致させること）を`incoming/{buildId}.vrcw`として配置後、`incoming/{buildId}.ready.json`を書き込むと処理が始まります。
+`incoming/`へ手動でファイルを配置してBridgeの動作を確認できます。`tests/VRCRemoteTest.Bridge.Tests/fixtures/sample-manifest.json`を参考にmanifestを作成し、対応する`.vrcw`（ダミーファイルで可、サイズとSHA-256を一致させること）を`incoming/{buildId}.vrcw`として配置後、`incoming/{buildId}.ready.json`を書き込むと処理が始まります。

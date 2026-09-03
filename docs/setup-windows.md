@@ -1,6 +1,6 @@
 # Windows側セットアップ手順
 
-VRC Remote Testを使うために、Windows実機（VRChatクライアントを動かすマシン）側で一度だけ行う設定をまとめる。実際の初回E2Eテスト（2026-09-02実施、macOS Unity → SDK Build → SMBアップロード → Windows Bridge → VRChat `--watch-worlds`リロード、まで実機で成功）で得た手順・詰まりどころをそのまま反映している。
+VRC Remote Testを使うために、Windows実機（VRChatクライアントを動かすマシン）側で一度だけ行う設定をまとめる。
 
 **前提**: README記載のSetup Flow（仕様書§63）のうち、1〜4（Bridge install〜VRChat launch設定）がこのドキュメントの対象。5以降（ALCOMでのpackage追加、Unity側操作）はmacOS側の操作であり対象外。
 
@@ -175,7 +175,7 @@ VRChatのホーム画面到達を確認したら準備完了。以降はUnity側
 
 ---
 
-## 9. （任意）VRChat自動起動の有効化（Phase 4.1）
+## 9. （任意）VRChat自動起動の有効化
 
 手順8を毎回手動で行いたくない場合、Bridgeに任せることができる。`config.json`に以下を追加:
 
@@ -198,13 +198,13 @@ VRChatのホーム画面到達を確認したら準備完了。以降はUnity側
 - `VrchatExecutable`は実際のSteamインストール先に合わせて調整する。ファイル名は`VRChat.exe`と完全一致している必要がある（大文字小文字は不問）
 - 有効化するとBridgeは、VRChatが未起動の状態でビルドを受け取った際に自動的に`--watch-worlds`付きで起動し、準備が整うまで待ってからWorldsディレクトリへ配置する
 - **既に`--watch-worlds`無しでVRChatが起動中の場合、Bridgeは自動的に再起動・終了させない**（`VRCHAT_WATCH_WORLDS_MISSING`でビルド失敗となる）。この場合は手動でVRChatを終了させるか、手順8の通り`--watch-worlds`付きで起動し直す
-- **`VrchatStartupSettleDelaySeconds`（起動後の最低待機時間）は環境によって調整が必要**。実機検証（2026-09-02）ではデフォルト15秒（初期値）ではVRChatの実際の準備が間に合わず、ファイル配置は成功してもリロードされないケースが発生した。VRChatが実際にホーム画面へ到達するまでの体感時間を確認し、それに応じて値を調整すること（30秒でも不十分な場合はさらに引き上げる）
+- **`VrchatStartupSettleDelaySeconds`（起動後の最低待機時間）は環境によって調整が必要**。デフォルト30秒でも短すぎる場合、ファイル配置は成功してもリロードされないことがある。VRChatが実際にホーム画面へ到達するまでの体感時間を確認し、それに応じて値を調整すること
 
 **Unity側のResult Timeout推奨値**: `AutoLaunchVrchat: true`の場合、Bridge側の起動待機（最短でも約15〜17秒、デフォルトタイムアウト60秒）が発生するため、Unity側の `VRC Remote Test` ウィンドウ設定foldoutにある `Result Timeout (s)` はデフォルトの60秒のままだとBridge側のタイムアウトと競合する可能性がある。**90秒以上に引き上げることを推奨**する。
 
 ---
 
-## 10. （任意）Moonlight連携（Phase 5）
+## 10. （任意）Moonlight連携
 
 Moonlight（NVIDIA GameStream/Sunshine互換のリモートデスクトップクライアント）でWindows実機のVRChat画面をmacOS側から見ている場合、Unity側の `VRC Remote Test` ウィンドウから直接Moonlightを起動・フォーカスできる。
 
@@ -213,7 +213,7 @@ Moonlight（NVIDIA GameStream/Sunshine互換のリモートデスクトップク
 - **Settings foldoutの `Focus Moonlight after deploy`**（デフォルトOFF）: 有効にすると、`Remote Build & Test`または`Deploy Last Build`が成功した直後に自動でMoonlightを前面に呼び出す。ビルドがVRChat側にリロードされる様子をすぐ確認したい場合に有効化する
 - Moonlight側のホスト接続設定（Sunshine側のペアリング等）は本ツールの範囲外。あらかじめMoonlightで対象のWindowsマシンに接続済みであることが前提
 
-## 11. （任意）VRChat Log Viewer（Phase 5）
+## 11. （任意）VRChat Log Viewer
 
 `RemoteBuildCommand`が使う同じSMB共有経由で、BridgeがVRChatの`output_log_*.txt`（最新200行、直近ウィンドウのスナップショット）を5秒間隔で配信する。Windows側の追加設定は不要 — `VrchatWorldsDirectory`が正しく設定済みであれば自動的に有効になる。Unity側の `VRC Remote Test` ウィンドウの `VRChat Log` foldoutから、カテゴリフィルタ（All/Error/Exception/Udon/Shader/Warning）付きで閲覧できる。表示専用で、readiness判定やビルドの成否には一切影響しない。
 
@@ -238,6 +238,9 @@ Moonlight（NVIDIA GameStream/Sunshine互換のリモートデスクトップク
 ## 関連ドキュメント
 
 - `bridge/README.md` — Bridge本体のビルド・設定ファイル・ステージング構造の詳細
-- `docs/validation/watch-worlds-spike.md` — `--watch-worlds`挙動の実機検証記録（Phase 0.5）
+
+以下は開発者向け（このツールのセットアップ・利用には不要）:
+
+- `docs/validation/watch-worlds-spike.md` — `--watch-worlds`挙動の実機検証記録
 - `docs/sdk-api-notes.md` — Unity側SDK APIの調査ノート
 - `VRC Remote Test — 実装仕様書.md` §16（Windows Share）、§44（Windows config）、§63（Setup Flow）
