@@ -39,14 +39,20 @@ namespace VRCRemoteTest
         // review Phase 5, Round 3, confidence 0.90).
         private const float LogRefreshIntervalSeconds = 5f;
         private const float LogViewportHeight = 200f;
-        private const float LogBottomThresholdPixels = 20f;
+        private const float LogTopThresholdPixels = 20f;
 
         private static readonly string[] LogCategories = { "All", "Error", "Exception", "Udon", "Shader", "Warning" };
 
         private bool _logFoldout;
         private string _logCategory = "All";
         private Vector2 _logScrollPosition;
-        private bool _logPinnedToBottom = true;
+
+        // Newest-first display (real hardware feedback: scrolling to see the
+        // latest line was inconvenient) means "the user wants to see new
+        // content without acting" now means "stay pinned to the top", not
+        // the bottom. Default true so the very first render already sits at
+        // the newest line.
+        private bool _logPinnedToTop = true;
         private string _lastRenderedLogContent = string.Empty;
         private double _lastLogCheckTime = double.NegativeInfinity;
 
@@ -65,6 +71,13 @@ namespace VRCRemoteTest
         private bool _settingsFoldout;
         private string _sharePathInput = string.Empty;
         private CancellationTokenSource _cts;
+
+        // Wraps the whole window body: when this window is docked into a
+        // small tab area (rather than floating and freely resizable), its
+        // total content height can exceed the dock's fixed height with no
+        // other way to reach the rest (observed on real hardware — content
+        // below "VRChat Log" got clipped with no scrollbar).
+        private Vector2 _windowScrollPosition;
 
         [MenuItem("VRChat SDK/VRC Remote Test", false, 900)]
         public static void ShowWindow()
@@ -123,6 +136,8 @@ namespace VRCRemoteTest
                 RefreshPreflightStatus();
             }
 
+            _windowScrollPosition = EditorGUILayout.BeginScrollView(_windowScrollPosition);
+
             DrawPreflightSection();
             EditorGUILayout.Space();
             DrawBuildTargetSection();
@@ -136,6 +151,8 @@ namespace VRCRemoteTest
             DrawLogViewerSection();
             EditorGUILayout.Space();
             DrawSettingsFoldout();
+
+            EditorGUILayout.EndScrollView();
         }
 
         private void DrawPreflightSection()
@@ -277,32 +294,58 @@ namespace VRCRemoteTest
             }
 
             var filtered = FilterLogLines(lines, _logCategory);
+
+            // Newest-first: the file itself is oldest-to-newest (VRChat
+            // appends), so reverse for display only — real hardware feedback
+            // was that scrolling to the bottom just to see the latest line
+            // was inconvenient. Filtering/truncation upstream are unaffected.
             var displayText = filtered.Length == 0
                 ? "(no log content yet)"
-                : string.Join("\n", filtered);
+                : string.Join("\n", filtered.Reverse());
 
-            // Only jump to the bottom on new content if the user was already
-            // there — otherwise a Repaint mid-review would yank them away
-            // from lines they're actively reading (Codex plan review Phase
-            // 5, Round 3, confidence 0.89).
+            // With newest-first order, "show new content without the user
+            // having to act" means staying pinned to the TOP — only reset
+            // there if the user was already at/near it, otherwise a Repaint
+            // mid-review would yank them away from lines they're actively
+            // reading (Codex plan review Phase 5, Round 3, confidence 0.89,
+            // adapted for newest-first).
             if (displayText != _lastRenderedLogContent)
             {
                 _lastRenderedLogContent = displayText;
-                if (_logPinnedToBottom)
+
+                // SelectableLabel keeps an internal TextEditor keyed to its
+                // control ID; if that control still holds keyboard focus/a
+                // selection from a previous frame, Unity can keep rendering
+                // the old text even though displayText has already changed
+                // underneath it (observed on real hardware: switching the
+                // category toolbar kept showing the unfiltered "All" text).
+                // Dropping focus forces it to rebuild from the new string.
+                GUI.FocusControl(null);
+
+                if (_logPinnedToTop)
                 {
-                    _logScrollPosition.y = float.MaxValue;
+                    _logScrollPosition.y = 0f;
                 }
             }
+
+            // Computed explicitly rather than via GUILayout.ExpandHeight +
+            // GUILayoutUtility.GetLastRect inside the ScrollView: ExpandHeight
+            // does not reliably report the label's true unclipped content
+            // height there, which silently broke both the max scroll extent
+            // and the "was the user already at the top" pinning check
+            // (observed on real hardware: newest lines required manual
+            // scrolling every time despite Auto Refresh).
+            var contentWidth = Mathf.Max(0f, EditorGUIUtility.currentViewWidth - 24f);
+            var contentHeight = Mathf.Max(
+                LogViewportHeight, EditorStyles.textArea.CalcHeight(new GUIContent(displayText), contentWidth));
 
             _logScrollPosition = EditorGUILayout.BeginScrollView(
                 _logScrollPosition, GUILayout.Height(LogViewportHeight));
             EditorGUILayout.SelectableLabel(
-                displayText, EditorStyles.textArea, GUILayout.ExpandHeight(true), GUILayout.MinHeight(LogViewportHeight));
-            var contentRect = GUILayoutUtility.GetLastRect();
+                displayText, EditorStyles.textArea, GUILayout.Height(contentHeight));
             EditorGUILayout.EndScrollView();
 
-            _logPinnedToBottom =
-                _logScrollPosition.y + LogViewportHeight >= contentRect.height - LogBottomThresholdPixels;
+            _logPinnedToTop = _logScrollPosition.y <= LogTopThresholdPixels;
         }
 
         /// <summary>
