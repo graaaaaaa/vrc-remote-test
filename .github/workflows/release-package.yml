@@ -99,14 +99,24 @@ jobs:
           echo "pkg_name=$PKG_NAME" >> "$GITHUB_OUTPUT"
 
       # `git archive` builds the zip directly from git's object database
-      # (not the working tree), so it never embeds filesystem mtimes and is
-      # byte-for-byte reproducible for a given commit — required for the
-      # digest-verified idempotent recovery below to actually work. A plain
-      # `find | zip` of the checked-out working tree is NOT reproducible
-      # (mtimes vary per checkout) and was confirmed to produce a different
-      # SHA-256 for identical content on a second build (Codex code review,
-      # Round 1 v2, confidence 0.85). `<commit>:package` archives the
-      # CONTENTS of package/ at the zip root, with no wrapper folder.
+      # (not the working tree), so a plain `find | zip` of the checked-out
+      # working tree is NOT reproducible (filesystem mtimes vary per
+      # checkout — confirmed empirically, Codex code review Round 1 v2,
+      # confidence 0.85). `<commit>:package` archives the CONTENTS of
+      # package/ at the zip root, with no wrapper folder.
+      #
+      # git normally derives zip entry mtimes from the referenced commit's
+      # own committer time automatically — but ONLY when the archived
+      # tree-ish IS a commit. `<commit>:<path>` resolves to a bare TREE
+      # object (not the commit), so that auto-derivation does not kick in
+      # and git falls back to the CURRENT wall-clock time instead — this was
+      # NOT caught by an earlier same-second local re-run (both builds
+      # happened to land in the same second by coincidence), but WAS caught
+      # by rebuilding a second time after a real delay: two `git archive`
+      # calls 65s apart produced two different SHA-256 hashes with 1-minute-
+      # apart zip entry timestamps (Codex code review, Round 1 v3, confidence
+      # 0.85, then verified locally). `--mtime` pins it explicitly to the
+      # commit's own committer time, confirmed reproducible across a 5s gap.
       - name: Build zip from the tagged commit (package/ contents at the root, no wrapper folder)
         id: zip
         env:
@@ -114,7 +124,8 @@ jobs:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
           ASSET="${PKG_NAME}-${VERSION}.zip"
-          git archive --format=zip --output "dist/$ASSET" "$GITHUB_SHA:package"
+          COMMIT_EPOCH=$(git show -s --format=%ct "$GITHUB_SHA")
+          git archive --format=zip --mtime="@$COMMIT_EPOCH" --output "dist/$ASSET" "$GITHUB_SHA:package"
           echo "asset=$ASSET" >> "$GITHUB_OUTPUT"
 
       - name: Verify zip structure

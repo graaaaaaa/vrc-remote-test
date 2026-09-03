@@ -80,9 +80,49 @@ public class PackageValidatorTests : IDisposable
     [InlineData("PRN.vrcw")]
     [InlineData("COM1.vrcw")]
     [InlineData("LPT1.vrcw")]
+    // Windows treats a reserved device name as reserved regardless of what follows
+    // the FIRST '.' — "NUL.foo.vrcw" still addresses the NUL device. Path.GetFileNameWithoutExtension
+    // only strips the LAST extension (".vrcw"), which would previously leave "NUL.foo"
+    // and slip past the reserved-name check (Codex code review round 2, confidence 0.8).
+    [InlineData("NUL.foo.vrcw")]
     public void Rejects_windows_reserved_device_names(string reservedFileName)
     {
         var manifest = ManifestFor("build-1", reservedFileName, 128, new string('a', 64));
+
+        var result = _validator.Validate(manifest, Path.Combine(_tempDir, "irrelevant.vrcw"), maxArtifactSizeBytes: 1024);
+
+        result.IsValid.Should().BeFalse();
+        result.ErrorCode.Should().Be(ErrorCode.ManifestInvalid);
+    }
+
+    [Theory]
+    [InlineData("../../evil")]
+    [InlineData("..\\..\\evil")]
+    [InlineData("/etc/passwd")]
+    [InlineData("C:\\Windows\\evil")]
+    [InlineData("sub/dir")]
+    [InlineData("sub\\dir")]
+    [InlineData("..evil")]
+    [InlineData("")]
+    [InlineData("   ")]
+    public void Rejects_path_traversal_and_malformed_build_ids(string maliciousBuildId)
+    {
+        var manifest = ManifestFor(maliciousBuildId, "build.vrcw", 128, new string('a', 64));
+
+        var result = _validator.Validate(manifest, Path.Combine(_tempDir, "irrelevant.vrcw"), maxArtifactSizeBytes: 1024);
+
+        result.IsValid.Should().BeFalse();
+        result.ErrorCode.Should().Be(ErrorCode.ManifestInvalid);
+    }
+
+    [Theory]
+    [InlineData("CON")]
+    [InlineData("con")]
+    [InlineData("NUL.foo")]
+    [InlineData("COM1")]
+    public void Rejects_windows_reserved_device_names_in_build_id(string reservedBuildId)
+    {
+        var manifest = ManifestFor(reservedBuildId, "build.vrcw", 128, new string('a', 64));
 
         var result = _validator.Validate(manifest, Path.Combine(_tempDir, "irrelevant.vrcw"), maxArtifactSizeBytes: 1024);
 

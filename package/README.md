@@ -4,7 +4,7 @@ macOS上のUnityでビルドしたVRChat Worldを、Windows上のVRChat Remote T
 
 ## セットアップ
 
-1. Windows側で VRC Remote Test Bridge を起動しておく（Windows側の初期セットアップは`docs/setup-windows.md`を参照）。
+1. Windows側で VRC Remote Test Bridge を起動しておく（Windows側の初期セットアップは[docs/setup-windows.md](https://github.com/graaaaaaa/vrc-remote-test/blob/main/docs/setup-windows.md)を参照。このファイルはVPMパッケージには含まれないため、リポジトリ上のリンク先を参照すること）。
 2. Windows側のステージングディレクトリ（`C:\VRCRemoteTest`）をSMB共有し、Mac側からマウントする（例: `/Volumes/VRCRemoteTest`）。
 3. Unity上で `VRChat SDK > VRC Remote Test` からウィンドウを開き、`Share Path` にマウントしたパスを設定する。
 

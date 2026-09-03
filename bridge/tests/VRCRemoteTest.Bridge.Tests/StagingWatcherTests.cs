@@ -165,6 +165,94 @@ public class StagingWatcherTests : IDisposable
     }
 
     [Fact]
+    public async Task A_path_traversal_file_name_never_touches_the_file_it_points_at()
+    {
+        // Path.Combine(incomingDir, fileName) is evaluated (and File.Exists/File.Move
+        // attempted against the result) before PackageValidator.Validate() runs, so a
+        // rejection that only happens inside Validate() would be too late — the move
+        // could already have happened. This test plants a real file at the path the
+        // traversal resolves to and asserts it is left completely untouched, which
+        // only holds if the fileName is rejected before that Path.Combine result is
+        // ever used for filesystem I/O (Codex code review, confidence 0.85).
+        var watcher = CreateWatcher();
+        var incoming = Path.Combine(_stagingDir, "incoming");
+        Directory.CreateDirectory(incoming);
+
+        var victimPath = Path.Combine(_stagingDir, "victim.vrcw");
+        var victimBytes = Encoding.UTF8.GetBytes("do-not-touch-me");
+        File.WriteAllBytes(victimPath, victimBytes);
+        var victimLastWrite = File.GetLastWriteTimeUtc(victimPath);
+
+        var manifest = new BuildManifest
+        {
+            ProtocolVersion = ProtocolConstants.CurrentProtocolVersion,
+            BuildId = "build-traversal",
+            FileName = "../victim.vrcw", // incoming/../victim.vrcw == _stagingDir/victim.vrcw
+            Size = victimBytes.Length,
+            Sha256 = Convert.ToHexString(SHA256.HashData(victimBytes)).ToLowerInvariant(),
+            CreatedAtUtc = DateTimeOffset.UtcNow,
+        };
+        File.WriteAllText(Path.Combine(incoming, "build-traversal.ready.json"), JsonSerializer.Serialize(manifest));
+
+        await watcher.RunOnceAsync(CancellationToken.None);
+
+        Directory.GetFiles(_worldsDir).Should().BeEmpty();
+        File.Exists(Path.Combine(_stagingDir, "failed", "build-traversal.ready.json")).Should().BeTrue();
+        File.Exists(victimPath).Should().BeTrue("the traversal target must never be moved/consumed");
+        File.GetLastWriteTimeUtc(victimPath).Should().Be(victimLastWrite);
+        File.ReadAllBytes(victimPath).Should().Equal(victimBytes);
+    }
+
+    [Fact]
+    public async Task A_path_traversal_build_id_never_touches_the_file_it_points_at()
+    {
+        // buildId is used to build filesystem paths in StagingWatcher (archive manifest,
+        // checked before PackageValidator.Validate() runs), WorldInstaller (deployed
+        // .vrcw name, written into VRChat's live Worlds directory), and ResultWriter
+        // (result JSON name). Before this fix, only null/whitespace was rejected, so an
+        // embedded separator could steer any of those Path.Combine calls outside the
+        // intended directory once concatenated with a literal prefix such as
+        // "vrc-remote-" — e.g. buildId "x/../../evil" makes WorldInstaller's
+        // deployedFileName "vrc-remote-x/../../evil.vrcw", whose "vrc-remote-x" segment
+        // is a harmless literal name but whose "/../../evil.vrcw" tail escapes two
+        // directories above the Worlds directory (Codex code review, confidence 0.85).
+        // This test plants a real file at that escape target and asserts it is left
+        // completely untouched, which only holds if buildId is rejected before any of
+        // those Path.Combine results is ever used for filesystem I/O.
+        var watcher = CreateWatcher();
+        var incoming = Path.Combine(_stagingDir, "incoming");
+        Directory.CreateDirectory(incoming);
+
+        var victimPath = Path.Combine(_tempDir, "evil.vrcw");
+        var victimBytes = Encoding.UTF8.GetBytes("do-not-touch-me");
+        File.WriteAllBytes(victimPath, victimBytes);
+        var victimLastWrite = File.GetLastWriteTimeUtc(victimPath);
+
+        const string maliciousBuildId = "x/../../evil";
+        var artifactBytes = Encoding.UTF8.GetBytes("fake-world-bundle");
+        File.WriteAllBytes(Path.Combine(incoming, "quarantine.vrcw"), artifactBytes);
+
+        var manifest = new BuildManifest
+        {
+            ProtocolVersion = ProtocolConstants.CurrentProtocolVersion,
+            BuildId = maliciousBuildId,
+            FileName = "quarantine.vrcw",
+            Size = artifactBytes.Length,
+            Sha256 = Convert.ToHexString(SHA256.HashData(artifactBytes)).ToLowerInvariant(),
+            CreatedAtUtc = DateTimeOffset.UtcNow,
+        };
+        File.WriteAllText(Path.Combine(incoming, "quarantine.ready.json"), JsonSerializer.Serialize(manifest));
+
+        await watcher.RunOnceAsync(CancellationToken.None);
+
+        Directory.GetFiles(_worldsDir).Should().BeEmpty();
+        File.Exists(Path.Combine(_stagingDir, "failed", "quarantine.ready.json")).Should().BeTrue();
+        File.Exists(victimPath).Should().BeTrue("the traversal target must never be moved/consumed");
+        File.GetLastWriteTimeUtc(victimPath).Should().Be(victimLastWrite);
+        File.ReadAllBytes(victimPath).Should().Equal(victimBytes);
+    }
+
+    [Fact]
     public async Task Recovers_unfinished_build_left_in_processing_directory()
     {
         var watcher = CreateWatcher();

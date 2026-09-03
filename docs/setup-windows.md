@@ -61,9 +61,11 @@ New-Item -ItemType Directory -Path "$env:LOCALAPPDATA\VRCRemoteTest" -Force
 
 `New-SmbShare`は非管理者セッションでは `Windows System Error 5`（access denied）で失敗する。**管理者としてPowerShellを起動**すること。
 
+このツールはSMB共有への書き込み権限をそのままデプロイ権限として扱う（PackageValidatorがv1での唯一の認証境界）ため、共有作成の時点から`Everyone`ではなく特定のユーザー/グループに絞ること。
+
 ```powershell
-# SMB共有を作成
-New-SmbShare -Name "VRCRemoteTest" -Path "C:\VRCRemoteTest" -FullAccess "Everyone"
+# SMB共有を作成（Everyoneではなく、書き込みを許可したい特定のユーザー/グループのみを指定する）
+New-SmbShare -Name "VRCRemoteTest" -Path "C:\VRCRemoteTest" -FullAccess "<ユーザーまたはグループ名>"
 
 # ファイアウォール: 「ファイルとプリンター共有」規則を有効化
 # 注意: 日本語版WindowsではDisplayGroup名 "File and Printer Sharing" が
@@ -72,7 +74,7 @@ New-SmbShare -Name "VRCRemoteTest" -Path "C:\VRCRemoteTest" -FullAccess "Everyon
 Get-NetFirewallRule -Name "FPS-SMB-In-TCP" | Enable-NetFirewallRule
 ```
 
-SMB共有アクセス権限（`Grant-SmbShareAccess`）だけでなく、**NTFSレベルのアクセス権限も別途必要**（片方だけでは実際のファイル書き込みができない）:
+SMB共有アクセス権限（`Grant-SmbShareAccess`）だけでなく、**NTFSレベルのアクセス権限も別途必要**（片方だけでは実際のファイル書き込みができない）。上記コマンドと同じ`<ユーザーまたはグループ名>`を指定すること:
 
 ```powershell
 icacls "C:\VRCRemoteTest" /grant "<ユーザーまたはグループ名>:(OI)(CI)F" /T
@@ -200,7 +202,7 @@ VRChatのホーム画面到達を確認したら準備完了。以降はUnity側
 - **既に`--watch-worlds`無しでVRChatが起動中の場合、Bridgeは自動的に再起動・終了させない**（`VRCHAT_WATCH_WORLDS_MISSING`でビルド失敗となる）。この場合は手動でVRChatを終了させるか、手順8の通り`--watch-worlds`付きで起動し直す
 - **`VrchatStartupSettleDelaySeconds`（起動後の最低待機時間）は環境によって調整が必要**。デフォルト30秒でも短すぎる場合、ファイル配置は成功してもリロードされないことがある。VRChatが実際にホーム画面へ到達するまでの体感時間を確認し、それに応じて値を調整すること
 
-**Unity側のResult Timeout推奨値**: `AutoLaunchVrchat: true`の場合、Bridge側の起動待機（最短でも約15〜17秒、デフォルトタイムアウト60秒）が発生するため、Unity側の `VRC Remote Test` ウィンドウ設定foldoutにある `Result Timeout (s)` はデフォルトの60秒のままだとBridge側のタイムアウトと競合する可能性がある。**90秒以上に引き上げることを推奨**する。
+**Unity側のResult Timeout推奨値**: `AutoLaunchVrchat: true`の場合、Bridge側の起動待機（`VrchatStartupSettleDelaySeconds`のデフォルト30秒に加え、プロセス起動・安定化のポーリング分、デフォルトタイムアウト60秒）が発生するため、Unity側の `VRC Remote Test` ウィンドウ設定foldoutにある `Result Timeout (s)` はデフォルトの60秒のままだとBridge側のタイムアウトと競合する可能性がある。**90秒以上に引き上げることを推奨**する。
 
 ---
 

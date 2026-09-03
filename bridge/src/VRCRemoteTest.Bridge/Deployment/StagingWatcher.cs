@@ -172,6 +172,29 @@ public sealed class StagingWatcher : BackgroundService, IBridgeWatcher
             return;
         }
 
+        // manifest.BuildId must be validated BEFORE it is used in any Path.Combine
+        // below (the idempotency archive-path check immediately below this, plus
+        // WorldInstaller/ResultWriter further downstream): only null/whitespace was
+        // being rejected, so a buildId with an embedded path separator (e.g.
+        // "x\..\..\evil") could traverse outside the intended directory once
+        // combined with a literal prefix like "vrc-remote-" — most severely in
+        // WorldInstaller, which writes into VRChat's live Worlds directory
+        // (Codex code review, confidence 0.85).
+        var buildIdResult = PackageValidator.ValidateBuildId(manifest.BuildId);
+        if (buildIdResult is not null)
+        {
+            _logger.LogWarning(
+                "Build {BuildId} failed validation: {Code} {Message}",
+                manifest.BuildId, buildIdResult.ErrorCode, buildIdResult.ErrorMessage);
+            MoveToFailed(claimedManifestPath, artifactPath: null);
+            _resultWriter.WriteFailure(
+                buildIdGuess,
+                buildIdResult.ErrorCode ?? ErrorCode.UnknownError,
+                buildIdResult.ErrorMessage ?? "Validation failed.",
+                ResultsDir);
+            return;
+        }
+
         // Idempotency: never reprocess a build that already reached archive/.
         var archivedManifestPath = Path.Combine(ArchiveDir, $"{manifest.BuildId}{ProtocolConstants.ManifestExtension}");
         if (File.Exists(archivedManifestPath))
@@ -179,6 +202,28 @@ public sealed class StagingWatcher : BackgroundService, IBridgeWatcher
             _logger.LogInformation("Build {BuildId} was already processed, skipping.", manifest.BuildId);
             _resultWriter.WriteFailure(manifest.BuildId, ErrorCode.BuildAlreadyProcessed, "This build was already processed.", ResultsDir);
             SafeDelete(claimedManifestPath);
+            return;
+        }
+
+        // manifest.FileName must be validated BEFORE it is ever handed to
+        // Path.Combine below: Path.Combine silently discards its first argument
+        // if the second is a rooted/absolute path, so an unvalidated fileName
+        // could otherwise steer the subsequent File.Exists/File.Move entirely
+        // outside ProcessingDir/IncomingDir. PackageValidator.Validate() also
+        // checks this, but only after this Move-from-incoming step already ran
+        // (Codex code review, confidence 0.85).
+        var fileNameResult = PackageValidator.ValidateFileName(manifest.FileName);
+        if (fileNameResult is not null)
+        {
+            _logger.LogWarning(
+                "Build {BuildId} failed validation: {Code} {Message}",
+                manifest.BuildId, fileNameResult.ErrorCode, fileNameResult.ErrorMessage);
+            MoveToFailed(claimedManifestPath, artifactPath: null);
+            _resultWriter.WriteFailure(
+                manifest.BuildId,
+                fileNameResult.ErrorCode ?? ErrorCode.UnknownError,
+                fileNameResult.ErrorMessage ?? "Validation failed.",
+                ResultsDir);
             return;
         }
 
