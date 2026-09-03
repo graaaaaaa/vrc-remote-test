@@ -20,7 +20,14 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
+      # persist-credentials: false — this job runs `dotnet test` against
+      # PR-submitted code (untrusted for pull_request from forks); no step
+      # here needs to push or authenticate to GitHub, so don't leave a
+      # checkout token sitting in the workspace for that code to read
+      # (Codex code review, Round 1 v2, confidence 0.8).
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Setup .NET 10
         uses: actions/setup-dotnet@v4

@@ -4,6 +4,7 @@
   "version": "0.2.0",
   "unity": "2022.3",
   "description": "Remote VRChat world testing from macOS Unity to a Windows VRChat client.",
+  "license": "MIT",
   "author": {
     "name": "graaaaaaa",
     "email": "89264042+graaaaaaa@users.noreply.github.com",

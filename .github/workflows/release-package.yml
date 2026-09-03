@@ -98,6 +98,15 @@ jobs:
 
           echo "pkg_name=$PKG_NAME" >> "$GITHUB_OUTPUT"
 
+      # `git archive` builds the zip directly from git's object database
+      # (not the working tree), so it never embeds filesystem mtimes and is
+      # byte-for-byte reproducible for a given commit — required for the
+      # digest-verified idempotent recovery below to actually work. A plain
+      # `find | zip` of the checked-out working tree is NOT reproducible
+      # (mtimes vary per checkout) and was confirmed to produce a different
+      # SHA-256 for identical content on a second build (Codex code review,
+      # Round 1 v2, confidence 0.85). `<commit>:package` archives the
+      # CONTENTS of package/ at the zip root, with no wrapper folder.
       - name: Build zip from the tagged commit (package/ contents at the root, no wrapper folder)
         id: zip
         env:
@@ -105,7 +114,7 @@ jobs:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
           ASSET="${PKG_NAME}-${VERSION}.zip"
-          (cd package && find . -type f ! -name .DS_Store -print | sed 's#^./##' | LC_ALL=C sort | zip -X -q "../dist/$ASSET" -@)
+          git archive --format=zip --output "dist/$ASSET" "$GITHUB_SHA:package"
           echo "asset=$ASSET" >> "$GITHUB_OUTPUT"
 
       - name: Verify zip structure
@@ -161,13 +170,35 @@ jobs:
       # otherwise happily publish a release/asset built from the now-stale
       # commit A under the tag name that actually points at B (Codex code
       # review, Round 3, confidence 0.87).
+      #
+      # Tags in this repo are ANNOTATED (e.g. v0.2.0 — confirmed via `git
+      # cat-file -t v0.2.0` => "tag", not "commit"). For an annotated tag,
+      # `refs/tags/<tag>` in `git ls-remote` is the TAG OBJECT's own SHA, not
+      # the commit it points to — while `$GITHUB_SHA` is documented by
+      # GitHub Actions as the commit SHA. Comparing them directly would fail
+      # every single release (confirmed empirically against this repo's own
+      # v0.2.0 tag: `refs/tags/v0.2.0` and `refs/tags/v0.2.0^{}` resolve to
+      # two different SHAs — Codex code review, Round 1 v2, confidence
+      # 0.9+, independently found by 2 of 3 perspectives). Request the
+      # peeled ref explicitly and fall back to the direct SHA for the rare
+      # case of a lightweight tag.
       - name: Re-verify the tag has not moved since checkout
         env:
           TAG: ${{ steps.version.outputs.tag }}
         run: |
-          CURRENT_SHA=$(git ls-remote origin "refs/tags/$TAG" | cut -f1)
-          if [ "$CURRENT_SHA" != "$GITHUB_SHA" ]; then
-            echo "::error::Tag $TAG now points at $CURRENT_SHA, not the commit this run was triggered for ($GITHUB_SHA). The tag was moved after this run started; aborting rather than publishing a release built from a stale commit."
+          TRIGGERED_COMMIT=$(git rev-parse "$GITHUB_SHA^{commit}")
+          CURRENT_COMMIT=$(git ls-remote origin "refs/tags/$TAG" "refs/tags/$TAG^{}" | \
+            awk -v tag="refs/tags/$TAG" '
+              $2 == tag {direct=$1}
+              $2 == tag "^{}" {peeled=$1}
+              END {print (peeled != "") ? peeled : direct}
+            ')
+          if [ -z "$CURRENT_COMMIT" ]; then
+            echo "::error::Tag $TAG no longer exists on origin."
+            exit 1
+          fi
+          if [ "$CURRENT_COMMIT" != "$TRIGGERED_COMMIT" ]; then
+            echo "::error::Tag $TAG now resolves to commit $CURRENT_COMMIT, not the commit this run was triggered for ($TRIGGERED_COMMIT). The tag was moved after this run started; aborting rather than publishing a release built from a stale commit."
             exit 1
           fi
 
@@ -193,7 +224,18 @@ jobs:
               exit 1
             fi
 
-            EXISTING_DIGEST=$(jq -r --arg name "$ASSET" '.assets[] | select(.name == $name) | .digest' /tmp/existing-release.json)
+            # gh release create can create the Release object and then fail
+            # before the asset finishes uploading — that leaves a published
+            # release with the asset simply missing (distinct from a
+            # mismatched asset). Recover by uploading, rather than treating
+            # "no asset" the same as "wrong asset" (Codex code review,
+            # Round 1 v2, confidence 0.8).
+            EXISTING_DIGEST=$(jq -r --arg name "$ASSET" '.assets[] | select(.name == $name) | .digest // empty' /tmp/existing-release.json)
+            if [ -z "$EXISTING_DIGEST" ]; then
+              echo "Release $TAG exists but is missing the $ASSET asset; uploading it now."
+              gh release upload "$TAG" "dist/$ASSET"
+              EXISTING_DIGEST=$(gh release view "$TAG" --json assets | jq -r --arg name "$ASSET" '.assets[] | select(.name == $name) | .digest // empty')
+            fi
             if [ "$EXISTING_DIGEST" != "sha256:$SHA256" ]; then
               echo "::error::Release $TAG already exists but its asset digest ($EXISTING_DIGEST) does not match the zip just built from this tag (sha256:$SHA256). Refusing to overwrite index.json with mismatched metadata."
               exit 1
