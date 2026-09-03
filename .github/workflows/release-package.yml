@@ -1,0 +1,126 @@
+name: Release package
+
+# v0.2.0 is intentionally NOT covered by this workflow — it was released
+# manually before this file was added to main, so GitHub Actions never saw
+# that historical tag-push event (workflows only react to events that occur
+# after they exist on the default branch). This workflow mechanically
+# replicates the exact steps that were run by hand for v0.2.0.
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-package-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Derive tag/version
+        id: version
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          VERSION="${TAG#v}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Verify tag points at a commit already on main
+        run: |
+          git fetch origin main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::Tag $GITHUB_REF_NAME (commit $GITHUB_SHA) is not an ancestor of main. Refusing to release an unreviewed/un-merged commit."
+            exit 1
+          fi
+
+      - name: Verify package.json version matches tag
+        run: |
+          PKG_VERSION=$(jq -r '.version' package/package.json)
+          if [ "$PKG_VERSION" != "${{ steps.version.outputs.version }}" ]; then
+            echo "::error::package/package.json version ($PKG_VERSION) does not match tag version (${{ steps.version.outputs.version }})"
+            exit 1
+          fi
+
+      - name: Verify CHANGELOG has an entry for this version
+        run: |
+          if ! grep -q "^## \[${{ steps.version.outputs.version }}\]" package/CHANGELOG.md; then
+            echo "::error::package/CHANGELOG.md has no '## [${{ steps.version.outputs.version }}]' heading"
+            exit 1
+          fi
+
+      - name: Build zip (package/ contents at the root, no wrapper folder)
+        id: zip
+        run: |
+          PKG_NAME=$(jq -r '.name' package/package.json)
+          ASSET="${PKG_NAME}-${{ steps.version.outputs.version }}.zip"
+          mkdir -p dist
+          (cd package && find . -type f ! -name .DS_Store -print | sed 's#^./##' | LC_ALL=C sort | zip -X -q "../dist/$ASSET" -@)
+          echo "asset=$ASSET" >> "$GITHUB_OUTPUT"
+          echo "pkg_name=$PKG_NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Verify zip structure
+        run: |
+          unzip -Z1 "dist/${{ steps.zip.outputs.asset }}" | grep -qx "package.json"
+          if unzip -Z1 "dist/${{ steps.zip.outputs.asset }}" | grep -q "^package/"; then
+            echo "::error::zip contains a package/ wrapper directory; VPM/UPM expects package.json at the zip root"
+            exit 1
+          fi
+
+      - name: Compute SHA-256
+        id: hash
+        run: |
+          SHA=$(sha256sum "dist/${{ steps.zip.outputs.asset }}" | cut -d' ' -f1)
+          echo "sha256=$SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Extract release notes from CHANGELOG
+        run: |
+          awk '/^## \[${{ steps.version.outputs.version }}\]/{flag=1; next} /^## \[/{if(flag) exit} flag' \
+            package/CHANGELOG.md > release-notes.md
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "${{ steps.version.outputs.tag }}" >/dev/null 2>&1; then
+            echo "::error::Release ${{ steps.version.outputs.tag }} already exists. Aborting to avoid a partial re-run."
+            exit 1
+          fi
+          gh release create "${{ steps.version.outputs.tag }}" "dist/${{ steps.zip.outputs.asset }}" \
+            --verify-tag --title "${{ steps.version.outputs.tag }}" --notes-file release-notes.md
+
+      - name: Update index.json on main
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git fetch origin main
+          git checkout main
+
+          VERSION_ENTRY=$(jq \
+            --arg url "https://github.com/${{ github.repository }}/releases/download/${{ steps.version.outputs.tag }}/${{ steps.zip.outputs.asset }}" \
+            --arg sha "${{ steps.hash.outputs.sha256 }}" \
+            '. + {url: $url, zipSHA256: $sha}' package/package.json)
+
+          jq --argjson entry "$VERSION_ENTRY" \
+            --arg name "${{ steps.zip.outputs.pkg_name }}" \
+            --arg ver "${{ steps.version.outputs.version }}" \
+            '.packages[$name].versions[$ver] = $entry' index.json > index.json.tmp
+          mv index.json.tmp index.json
+
+          jq empty index.json
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add index.json
+          git commit -m "Add VPM listing for ${{ steps.version.outputs.tag }}"
+          git push origin HEAD:main
