@@ -1,11 +1,13 @@
 {
-  "name": "com.local.vrc-remote-test",
+  "name": "com.github.graaaaaaa.vrc-remote-test",
   "displayName": "VRC Remote Test",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "unity": "2022.3",
   "description": "Remote VRChat world testing from macOS Unity to a Windows VRChat client.",
   "author": {
-    "name": "VRC Remote Test"
+    "name": "graaaaaaa",
+    "email": "89264042+graaaaaaa@users.noreply.github.com",
+    "url": "https://github.com/graaaaaaa"
   },
   "dependencies": {
     "com.unity.nuget.newtonsoft-json": "3.2.2"

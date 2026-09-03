@@ -17,10 +17,20 @@ Mac / Unity
 
 ## 構成
 
-- `package/` — Unity Editor用VPMパッケージ (`com.local.vrc-remote-test`)
-- `bridge/` — Windows Bridge (.NET 8、Windows側で受信・検証・配置を行うコンソールアプリ)
+- `package/` — Unity Editor用VPMパッケージ (`com.github.graaaaaaa.vrc-remote-test`)
+- `bridge/` — Windows Bridge (.NET 10、Windows側で受信・検証・配置を行うコンソールアプリ)
 - `scripts/` — Windows側セットアップ/起動用PowerShellスクリプト
 - `docs/` — セットアップ手順・SDK API調査ノート
+
+## インストール
+
+ALCOMで以下のリポジトリリスティングURLを追加してください（`Settings > Packages > Add Repository`）:
+
+```
+https://raw.githubusercontent.com/graaaaaaa/vrc-remote-test/main/index.json
+```
+
+追加後、`VRC Remote Test`パッケージがVCC/ALCOMのパッケージ一覧に表示されます。Windows側の初期セットアップ（Bridgeの配置、SMB共有、VRChat起動設定）は `docs/setup-windows.md` を参照してください。
 
 ## ステータス
 

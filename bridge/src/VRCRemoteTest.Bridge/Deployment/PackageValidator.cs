@@ -7,10 +7,10 @@ namespace VRCRemoteTest.Bridge.Deployment;
 /// <summary>
 /// Validates a claimed manifest + artifact pair before it is allowed anywhere near
 /// VRChat's live Worlds directory. This is the single security choke point for v1
-/// (see [removed]/codex-plan-review-vrc-remote-test-hidden-plum.md):
-/// filename allow-listing, path containment (implied by rejecting any separator in
-/// fileName), size limits, and SHA-256 integrity. Authentication beyond SMB share
-/// ACLs (e.g. HMAC-signed manifests) is deferred to v1.1.
+/// (confirmed sufficient via Codex plan review): filename allow-listing, path
+/// containment (implied by rejecting any separator in fileName), size limits, and
+/// SHA-256 integrity. Authentication beyond SMB share ACLs (e.g. HMAC-signed
+/// manifests) is deferred to v1.1.
 /// </summary>
 public sealed partial class PackageValidator : IPackageValidator
 {

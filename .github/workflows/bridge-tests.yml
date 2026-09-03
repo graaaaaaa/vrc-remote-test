@@ -1,0 +1,32 @@
+name: Bridge tests
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "bridge/**"
+      - ".github/workflows/bridge-tests.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "bridge/**"
+      - ".github/workflows/bridge-tests.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET 10
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+
+      - name: dotnet test
+        working-directory: bridge
+        run: dotnet test VRCRemoteTest.Bridge.sln --configuration Release
