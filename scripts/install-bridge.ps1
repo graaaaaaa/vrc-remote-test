@@ -83,11 +83,34 @@ if ($SourcePath) {
     $destDir = Split-Path -Path $ExePath -Parent
     New-Item -ItemType Directory -Path $destDir -Force | Out-Null
 
-    Write-Host "Copying: $SourcePath -> $ExePath" -ForegroundColor Cyan
-    Copy-Item -LiteralPath $SourcePath -Destination $ExePath -Force
+    # 配置先が複写元と同一内容なら複写をスキップする。稼働中のBridgeは
+    # 自身の実行体ファイルをロックするため、無条件に複写しようとすると
+    # 冪等な再実行（内容に変更なし）でも "being used by another process"
+    # で失敗してしまう（実機検証で確認）。
+    $needsCopy = $true
+    if (Test-Path -LiteralPath $ExePath -PathType Leaf) {
+        $sourceHash = (Get-FileHash -LiteralPath $SourcePath -Algorithm SHA256).Hash
+        $destHash = (Get-FileHash -LiteralPath $ExePath -Algorithm SHA256).Hash
+        if ($sourceHash -eq $destHash) {
+            $needsCopy = $false
+            Write-Host "配置先は複写元と同一内容のため、複写をスキップします: $ExePath" -ForegroundColor Yellow
+        }
+    }
 
-    if (-not (Test-Path -LiteralPath $ExePath -PathType Leaf)) {
-        throw "複写後もファイルが見つかりません: $ExePath"
+    if ($needsCopy) {
+        Write-Host "Copying: $SourcePath -> $ExePath" -ForegroundColor Cyan
+        try {
+            Copy-Item -LiteralPath $SourcePath -Destination $ExePath -Force
+        }
+        catch {
+            throw "配置先への複写に失敗しました（稼働中のBridgeがファイルをロックしている可能性があります）: $ExePath`n" +
+                "先に稼働中のBridgeを停止してください（例: .\uninstall-bridge.ps1 -StopRunning）。`n" +
+                "元エラー: $($_.Exception.Message)"
+        }
+
+        if (-not (Test-Path -LiteralPath $ExePath -PathType Leaf)) {
+            throw "複写後もファイルが見つかりません: $ExePath"
+        }
     }
 }
 
