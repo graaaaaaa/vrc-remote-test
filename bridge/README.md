@@ -29,6 +29,7 @@ Codexレビューを経て、Bridgeは「フルオーケストレーションサ
 - **VRChatプロセス監視**: `VrchatMonitorService`が10秒間隔でVRChatプロセスと`--watch-worlds`引数の有無を`status/vrchat-status.json`へ書き出す（Phase 4a）。Unity側のpreflight表示専用で、ビルドの成否には一切影響しない
 - **VRChat自動起動（`AutoLaunchVrchat`、デフォルトOFF）**: 有効時、VRChat未起動ならBridgeが`--watch-worlds`付きで自動起動し、準備が整うまで待ってからdeployする（Phase 4.1）。既に`--watch-worlds`無しで起動中のVRChatは勝手に再起動しない。準備確認は仕様書§31の「新しいoutput_logファイル出現」ではなく、`VrchatMonitorService`と同じWMIベースのプロセス監視シグナルの安定確認＋起動時刻からの最低待機時間（`StartupSettleDelay`）を組み合わせた方式を採用している（意図的な仕様逸脱、詳細は`VrchatReadinessCoordinator.cs`のコメント参照）
 - **VRChatログ配信（`VrchatLogService`、Phase 5）**: 5秒間隔で`output_log_*.txt`の最新ファイル末尾を状態を持たずに再読み込みし、直近200行を`logs/vrchat-latest.log`へ書き出す。Unity側Log Viewer（表示専用）のためのもので、readiness判定には一切使用しない
+- **自動起動**: `scripts/install-bridge.ps1`でWindows Task Scheduler（Trigger: At log on、Principal: Interactive/Limitedで非elevated）へ登録できる（仕様書§21）。実行体はSMB共有の外側（既定`%LOCALAPPDATA%\Programs\VRCRemoteTest\Bridge\`）に配置する — SMB共有内に置くと、共有への書き込み権限を持つ者が実行体を差し替えることでログオン時に自動実行されるコードを乗っ取れてしまうため（Codexレビューで検出）。手順は`docs/setup-windows.md`、詳細は`scripts/install-bridge.ps1 -?`を参照
 - **認証はSMB ACLのみ**: HMAC署名はv1.1で追加予定
 
 ## ビルド・テスト方法
