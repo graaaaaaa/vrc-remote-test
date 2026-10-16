@@ -2,42 +2,187 @@
 
 VRC Remote Testを使うために、Windows実機（VRChatクライアントを動かすマシン）側で一度だけ行う設定をまとめる。
 
-**前提**: README記載のSetup Flow（仕様書§63）のうち、1〜4（Bridge install〜VRChat launch設定）がこのドキュメントの対象。5以降（ALCOMでのpackage追加、Unity側操作）はmacOS側の操作であり対象外。
+**前提**: README記載のSetup Flow（仕様書§63）のうち、Bridge install〜VRChat launch設定がこのドキュメントの対象。ALCOMでのpackage追加、Unity側操作はmacOS側の操作であり対象外。
+
+**v0.2 以前の構成から更新する場合**は、新規セットアップではなく[手順14（既存環境からの移行）](#14-既存環境からの移行)に従うこと。共有の権限と状態ファイルの置き場所が変わっている。
+
+> **注意**: このドキュメントの Windows 側のコマンドのうち、共有の権限（手順3）、移行（手順14）、OSC の遮断（手順12）は、まだ実機で通しの確認をしていない。実行したら、各手順の「確認」の結果が期待どおりかを必ず見ること。
+
+---
+
+## セキュリティの考え方（最初に読む）
+
+- **SMB 共有への書き込み権限 = ワールドを配置できる権限**。Bridge の認証は、SMB アカウントの資格情報と共有の ACL だけで成り立っている（仕様書§49）。
+- 共有の中で Mac が書き込めるのは `incoming\` と `_bridge-drop\` だけにする。`results\`、`status\`、`logs\` は読み取り専用にし、Bridge が処理中に信頼する状態（processing、archive、failed）は共有の外（`%LOCALAPPDATA%\VRCRemoteTest\state`）に置く。
+- Bridge の実行体はハッシュを照合してから登録する。共有に置いた exe は、共有に書ける人なら誰でも差し替えられるため。
+- これらは一人開発・家庭内 LAN を想定した設計。共有の資格情報が漏れれば、任意のワールドを配置される（Mac が侵害された場合も同じ）。
+- `vrcremote` には、シンボリックリンクを作成する特権を与えない（既定のまま）。Bridge は共有内のリンクを取り込まないが、検査と読み取りの間に差し替えられる余地までは塞いでいない。
+- 受け入れている残余リスク: 共有の資格情報を持つ人は、`incoming` へのアップロードでディスクを埋めたり、処理中のアップロードを同名のファイルで妨害したりできる。また、同じ buildId を再度アップロードすると、`results` の結果が `BUILD_ALREADY_PROCESSED` で上書きされる（Unity は buildId を使い回さないので、通常の利用では起きない）。いずれも配置されるワールドの中身には影響しない。
 
 ---
 
 ## 前提条件
 
-- [ ] Windows 11マシン（管理者権限を持つアカウントでログイン可能なこと）
-- [ ] Steam + VRChatがインストール済み
-- [ ] PowerShell 7（`pwsh`）がインストール済み — Windows標準のPowerShell 5.1では`start-vrchat-dev.ps1`等が動かない（`#Requires -Version 7.0`）
-- [ ] macOS開発機で `dotnet publish` によりBridgeのwin-x64単一ファイル実行体を発行済み（`bridge/README.md`参照）、またはWindows実機に.NET 10 SDKを入れて直接ビルド
+- [ ] Windows 11 マシン（管理者権限を持つアカウントでログイン可能なこと）
+- [ ] Steam + VRChat がインストール済み
+- [ ] PowerShell 7（`pwsh`）がインストール済み — Windows 標準の PowerShell 5.1 では各スクリプトが動かない（`#Requires -Version 7.0`）
+- [ ] macOS 開発機に .NET 10 SDK（Bridge を Mac で発行する場合）、または Windows 実機に .NET 10 SDK（Windows で直接ビルドする場合）
+
+以下、**U** は Bridge を動かす Windows の普段使いのユーザー、**vrcremote** は Mac からの SMB 接続専用のアカウントを指す。
 
 ---
 
-## 1. Bridge実行体の発行
+## 1. Bridge実行体の発行とハッシュの記録
 
-macOS開発機で発行:
+### 1-1. 依存パッケージの確認と発行
+
+発行の前に、既知の脆弱性がある依存パッケージがないか確認する:
 
 ```bash
-cd bridge
-dotnet publish src/VRCRemoteTest.Bridge/VRCRemoteTest.Bridge.csproj \
+dotnet list bridge/src/VRCRemoteTest.Bridge/VRCRemoteTest.Bridge.csproj package --vulnerable --include-transitive
+```
+
+macOS 開発機で、リポジトリのルートから発行（以降のコマンドもリポジトリのルートで実行する）:
+
+```bash
+dotnet publish bridge/src/VRCRemoteTest.Bridge/VRCRemoteTest.Bridge.csproj \
   -c Release -r win-x64 --self-contained -p:PublishSingleFile=true
 ```
 
 出力: `bridge/src/VRCRemoteTest.Bridge/bin/Release/net10.0/win-x64/publish/VRCRemoteTest.Bridge.exe`。
 
-Windows実機への実際の配置は、SMB共有が使えるようになった後の**手順6**で行う（この時点ではまだSMB共有が存在しないため）。
+### 1-2. SHA-256 の記録
+
+```bash
+shasum -a 256 bridge/src/VRCRemoteTest.Bridge/bin/Release/net10.0/win-x64/publish/VRCRemoteTest.Bridge.exe
+```
+
+表示された 64 桁のハッシュを、コミット（`git rev-parse HEAD`）と SDK のバージョン（`dotnet --version`）と一緒に控える。手順6でインストーラーに `-ExpectedSha256` として渡す。
+
+**ハッシュは SMB 共有以外の経路で Windows に渡すこと**（Mac の画面を見て入力する、信頼できるパスワードマネージャーのメモを使う、など）。共有に `.sha256` ファイルを置くと、exe と一緒に差し替えられてしまう。
+
+**限界**: この方法は「共有に書ける第三者による差し替え」を防ぐが、Mac 自体が侵害されている場合は、exe とハッシュの両方が偽物になり得るので防げない。より強くしたい場合は、Windows 実機に .NET 10 SDK を入れ、信頼できるチェックアウトから Windows 上で直接 `dotnet publish` し、その場で `Get-FileHash -Algorithm SHA256` を取る（この場合 exe を共有経由で運ぶ必要もない）。インストーラーのスクリプト（`scripts/install-bridge.ps1`）自体も、信頼できるチェックアウトのものを使うこと。
+
+Windows への exe の配置は、共有ができた後の**手順6**で行う。
 
 ---
 
-## 2. ステージングディレクトリとconfig.jsonの作成
+## 2. SMB 専用アカウント `vrcremote` の作成（管理者）
+
+Mac からの SMB 接続には、**普段使いのアカウント（U）ではなく専用のローカルアカウント**を使う。共有の権限を「Mac が書ける場所」と「Bridge だけが書ける場所」に分けるには、2 つのアカウントが別である必要がある。
+
+これは Windows Hello の PIN ログイン対策も兼ねる。PIN はローカル専用の認証情報で、SMB のネットワーク認証には使えない。
+
+**管理者として PowerShell 7 を起動**して実行:
 
 ```powershell
-New-Item -ItemType Directory -Path C:\VRCRemoteTest -Force
+$securePassword = Read-Host -AsSecureString "vrcremote アカウントのパスワードを入力"
+New-LocalUser -Name "vrcremote" -Password $securePassword -PasswordNeverExpires
 ```
 
-`%LOCALAPPDATA%\VRCRemoteTest\config.json` を作成する（**Bridgeは自動生成しない。手動作成が必須**）:
+- パスワードは長く推測されにくいものにする（Mac 側はキーチェーンに保存される）。
+- `vrcremote` を Administrators や Remote Desktop Users に**追加しない**。確認: `Get-LocalGroupMember Administrators`。
+- **ログオンの制限（推奨）**: `secpol.msc` →「ローカル ポリシー」→「ユーザー権利の割り当て」で、「ローカル ログオンを拒否」と「リモート デスクトップ サービスを使ったログオンを拒否」に `vrcremote` を追加する。SMB に必要なネットワークログオンは残る。Windows 11 Home には `secpol.msc` がないため、この手順は省略し、上のグループに入っていないことだけ確認する。
+
+---
+
+## 3. ステージングディレクトリと SMB 共有の作成（管理者）
+
+### 3-1. U のアカウント名を確認
+
+**U 本人の通常の（管理者ではない）PowerShell** で実行し、表示された名前を控える:
+
+```powershell
+whoami
+```
+
+Microsoft アカウントでサインインしている場合も、ここで表示される `コンピューター名\名前` の形を使う（メールアドレスやプロファイルのフォルダー名で代用しない）。
+
+### 3-2. ルートと ACL の作成
+
+**管理者 PowerShell 7** で実行する。`$U` は 3-1 で控えた名前に置き換える。権限は SID で指定するので、日本語版 Windows でもグループ名のローカライズに影響されない。
+
+```powershell
+$ErrorActionPreference = 'Stop'
+$U = 'コンピューター名\ユーザー名'   # 3-1 の whoami の結果
+$uSid = ([System.Security.Principal.NTAccount]::new($U)).Translate([System.Security.Principal.SecurityIdentifier]).Value
+$remoteSid = (Get-LocalUser -Name 'vrcremote').SID.Value
+if ($uSid -eq $remoteSid) { throw 'U と vrcremote は別のアカウントにしてください' }
+
+$root = 'C:\VRCRemoteTest'
+if (Test-Path -LiteralPath $root) { throw "$root が既に存在します。既存環境は手順14で移行してください" }
+
+function Invoke-Icacls { & icacls.exe @args; if ($LASTEXITCODE -ne 0) { throw "icacls が失敗しました ($LASTEXITCODE): $args" } }
+
+# ルート: U・SYSTEM・Administrators はフルコントロール、vrcremote は読み取りのみ。
+# 新しく作った空のディレクトリを /reset してから明示的に許可し、最後に継承を切るので、
+# C:\ から継承される Authenticated Users の変更権限などは残らない。
+New-Item -ItemType Directory -Path $root | Out-Null
+Invoke-Icacls $root /reset
+Invoke-Icacls $root /grant:r "*${uSid}:(OI)(CI)F" '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' "*${remoteSid}:(OI)(CI)RX"
+Invoke-Icacls $root /inheritance:r
+Invoke-Icacls $root /setowner "*$uSid"
+
+# Mac が書き込む場所だけ、vrcremote に書き込み権限を足す。
+# ディレクトリ自体には削除権限を与えない（消されると、Bridge が作り直したときに
+# この権限が失われて Mac から書けなくなる）。中に作るファイルには変更権限を継承させる。
+foreach ($name in 'incoming', '_bridge-drop') {
+    $path = Join-Path $root $name
+    New-Item -ItemType Directory -Path $path | Out-Null
+    Invoke-Icacls $path /grant:r "*${remoteSid}:(RX,W)"
+    Invoke-Icacls $path /grant "*${remoteSid}:(OI)(CI)(IO)M"
+}
+
+# Bridge が書き、Mac は読むだけの場所（ルートの読み取りを継承する）。
+foreach ($name in 'results', 'status', 'logs') {
+    New-Item -ItemType Directory -Path (Join-Path $root $name) | Out-Null
+}
+```
+
+**確認**:
+
+```powershell
+icacls C:\VRCRemoteTest
+icacls C:\VRCRemoteTest\incoming
+icacls C:\VRCRemoteTest\results
+```
+
+- ルート: U・`NT AUTHORITY\SYSTEM`・`BUILTIN\Administrators` が `(OI)(CI)(F)`、`vrcremote` が `(OI)(CI)(RX)` の **4 行だけ**で、`(I)`（継承）の付いた行が無いこと。
+- `incoming`: 上の 4 行が `(I)` 付きで並び、加えて `vrcremote` の `(RX,W)` と `(OI)(CI)(IO)(M)` があること（`(M)` が `(IO)` なしで付いていないこと）。
+- `results`: 上の 4 行が `(I)` 付きで並ぶだけで、`vrcremote` は `(RX)` のみであること。
+
+`incoming` は必ず Windows 側で作っておくこと。ルートが読み取り専用なので、Mac からは作れない（作れないと Unity 側の Preflight が `Not reachable` になる）。
+
+### 3-3. 共有の作成（暗号化つき）
+
+```powershell
+New-SmbShare -Name 'VRCRemoteTest' -Path 'C:\VRCRemoteTest' -ChangeAccess "$env:COMPUTERNAME\vrcremote" -EncryptData $true
+Set-SmbServerConfiguration -RejectUnencryptedAccess $true -Force
+
+# ファイアウォール: 「ファイルとプリンター共有」規則を有効化。
+# 日本語版 Windows では DisplayGroup 名がローカライズされているため、固定のルール名を使う。
+Get-NetFirewallRule -Name "FPS-SMB-In-TCP" | Enable-NetFirewallRule
+```
+
+- 共有の権限は **Change**（Full ではない）。Full は ACL や所有者の変更まで含むため与えない。実際に書ける範囲は 3-2 の NTFS の権限で決まる。
+- `-EncryptData $true` で、この共有への通信を SMB 3 で暗号化する。ログやワールドを LAN 上で平文で流さないため。
+- 任意: SMB のファイアウォール規則の接続元を絞る場合は `Set-NetFirewallRule -Name 'FPS-SMB-In-TCP' -RemoteAddress LocalSubnet`（または Mac の IP アドレス）。
+
+**確認**:
+
+```powershell
+Get-SmbShare -Name 'VRCRemoteTest' | Select-Object Name, Path, EncryptData
+Get-SmbShareAccess -Name 'VRCRemoteTest'
+Get-SmbServerConfiguration | Select-Object RejectUnencryptedAccess, RequireSecuritySignature
+```
+
+`EncryptData` が `True`、共有のアクセスが `vrcremote` の `Change` の 1 行だけであること。
+
+---
+
+## 4. config.json の作成
+
+U の通常の PowerShell で、`%LOCALAPPDATA%\VRCRemoteTest\config.json` を作成する（**Bridge は自動生成しない。手動作成が必須**）:
 
 ```powershell
 New-Item -ItemType Directory -Path "$env:LOCALAPPDATA\VRCRemoteTest" -Force
@@ -53,95 +198,71 @@ New-Item -ItemType Directory -Path "$env:LOCALAPPDATA\VRCRemoteTest" -Force
 '@ | Set-Content -Path "$env:LOCALAPPDATA\VRCRemoteTest\config.json" -Encoding utf8
 ```
 
-`<ユーザー名>`は実際のWindowsログインユーザー名に置き換える。`VrchatWorldsDirectory`が実在しない場合Bridgeは起動を拒否する（勝手な推測をしない設計）ので、VRChatを一度でも起動してWorldsディレクトリが生成済みであることを事前に確認しておく。
+- `<ユーザー名>` は実際の Windows ログインユーザー名に置き換える。`VrchatWorldsDirectory` が実在しない場合 Bridge は起動を拒否する（勝手な推測をしない設計）ので、VRChat を一度でも起動して Worlds ディレクトリが生成済みであることを事前に確認しておく。
+- Bridge の状態ディレクトリ（processing、archive、failed）は `%LOCALAPPDATA%\VRCRemoteTest\state` に**固定**で、config.json では変更できない。ユーザープロファイルの中は通常 U・SYSTEM・Administrators しかアクセスできないことを前提にしている（プロファイル全体をネットワーク上に置く構成などは対象外）。
 
 ---
 
-## 3. SMB共有の作成（管理者権限必須）
+## 5. macOS側: SMB共有のマウントと権限の確認
 
-`New-SmbShare`は非管理者セッションでは `Windows System Error 5`（access denied）で失敗する。**管理者としてPowerShellを起動**すること。
-
-このツールはSMB共有への書き込み権限をそのままデプロイ権限として扱う（PackageValidatorがv1での唯一の認証境界）ため、共有作成の時点から`Everyone`ではなく特定のユーザー/グループに絞ること。
-
-```powershell
-# SMB共有を作成（Everyoneではなく、書き込みを許可したい特定のユーザー/グループのみを指定する）
-New-SmbShare -Name "VRCRemoteTest" -Path "C:\VRCRemoteTest" -FullAccess "<ユーザーまたはグループ名>"
-
-# ファイアウォール: 「ファイルとプリンター共有」規則を有効化
-# 注意: 日本語版WindowsではDisplayGroup名 "File and Printer Sharing" が
-# ローカライズされているため、-DisplayGroup 指定は失敗する。
-# ロケール非依存の固定ルール名を使うこと。
-Get-NetFirewallRule -Name "FPS-SMB-In-TCP" | Enable-NetFirewallRule
-```
-
-SMB共有アクセス権限（`Grant-SmbShareAccess`）だけでなく、**NTFSレベルのアクセス権限も別途必要**（片方だけでは実際のファイル書き込みができない）。上記コマンドと同じ`<ユーザーまたはグループ名>`を指定すること:
-
-```powershell
-icacls "C:\VRCRemoteTest" /grant "<ユーザーまたはグループ名>:(OI)(CI)F" /T
-```
-
----
-
-## 4. SMB認証 — PINログイン環境での注意
-
-**Windows Helloの PIN ログインはSMBネットワーク認証には使えない。** SMBはWindowsアカウントの実パスワードを要求するが、PINはローカルデバイス限定の認証情報であり、ネットワーク越しの認証には使われない。
-
-ログイン用アカウントに実パスワードを設定していない・思い出せない場合、**SMB専用のローカルアカウントを新規作成**するのが最も簡単:
-
-```powershell
-$securePassword = Read-Host -AsSecureString "vrcremote アカウントのパスワードを入力"
-New-LocalUser -Name "vrcremote" -Password $securePassword -PasswordNeverExpires
-
-# 作成したアカウントに共有アクセス権限を付与
-Grant-SmbShareAccess -Name "VRCRemoteTest" -AccountName "vrcremote" -AccessRight Full -Force
-icacls "C:\VRCRemoteTest" /grant "vrcremote:(OI)(CI)F" /T
-```
-
-Mac側からのマウント時は、Windowsのメインアカウントではなく `vrcremote` のユーザー名・パスワードで認証する。
-
----
-
-## 5. macOS側: SMB共有のマウント
-
-Finderの「サーバへ接続」（`Cmd+K`）で以下を入力:
+Finder の「サーバへ接続」（`Cmd+K`）で以下を入力:
 
 ```
 smb://vrcremote@<Windowsマシンのホスト名またはIPアドレス>/VRCRemoteTest
 ```
 
-パスワード入力を求められたら、手順4で設定した`vrcremote`アカウントのパスワードを入力する。マウント後、`/Volumes/VRCRemoteTest`として書き込み可能であることを確認する:
+パスワード入力を求められたら、手順2で設定した `vrcremote` のパスワードを入力する。マウント後、`/Volumes/VRCRemoteTest` で**書ける場所と書けない場所**を確認する:
 
 ```bash
-touch /Volumes/VRCRemoteTest/test.txt && rm /Volumes/VRCRemoteTest/test.txt && echo OK
+touch /Volumes/VRCRemoteTest/incoming/.probe && rm /Volumes/VRCRemoteTest/incoming/.probe && echo "incoming: 書き込みOK"
+ls /Volumes/VRCRemoteTest/results > /dev/null && echo "results: 読み取りOK"
+touch /Volumes/VRCRemoteTest/results/.probe 2>/dev/null && echo "NG: results に書き込めてしまう" || echo "results: 書き込み拒否OK"
+touch /Volumes/VRCRemoteTest/.probe 2>/dev/null && echo "NG: ルートに書き込めてしまう" || echo "ルート: 書き込み拒否OK"
 ```
+
+暗号化されているかを確認する:
+
+```bash
+smbutil statshares -m /Volumes/VRCRemoteTest
+```
+
+`SMB_VERSION` が `SMB_3.x`、`ENCRYPTION_REQUIRED` が `TRUE` であること。macOS のバージョンによっては出ないフィールドがある。出なかったフィールドは「未確認」として扱い、Windows 側の `Get-SmbShare` の `EncryptData` と、`RejectUnencryptedAccess` が `True` のまま接続できていることで判断する。
 
 ---
 
 ## 6. Bridge実行体の配置とTask Schedulerへの自動起動登録
 
-手順1で発行したexeを、マウント済みのSMB共有経由で一時drop位置へコピーする（macOS側）:
+手順1で発行した exe を、マウント済みの共有の `_bridge-drop` へコピーする（macOS側）:
 
 ```bash
-mkdir -p /Volumes/VRCRemoteTest/_bridge-drop
 cp bridge/src/VRCRemoteTest.Bridge/bin/Release/net10.0/win-x64/publish/VRCRemoteTest.Bridge.exe \
   /Volumes/VRCRemoteTest/_bridge-drop/
 ```
 
-Windows側で`scripts/install-bridge.ps1`を実行する（管理者権限は不要 — Bridgeはインタラクティブユーザーセッションで非elevated実行する設計、仕様書§20）:
+Windows 側で、**U の通常の PowerShell 7**（管理者権限は不要 — Bridge は対話ユーザーセッションで非 elevated 実行する設計、仕様書§20）から `scripts/install-bridge.ps1` を実行する。`-ExpectedSha256` には、手順1で控えたハッシュを**共有以外の経路で**持ってきて指定する:
 
 ```powershell
-.\scripts\install-bridge.ps1 -SourcePath C:\VRCRemoteTest\_bridge-drop\VRCRemoteTest.Bridge.exe -StartNow
+.\scripts\install-bridge.ps1 -ExpectedSha256 <手順1の64桁のハッシュ> -SourcePath C:\VRCRemoteTest\_bridge-drop\VRCRemoteTest.Bridge.exe -StartNow
 ```
 
 これにより:
 
-- 実行体が`%LOCALAPPDATA%\Programs\VRCRemoteTest\Bridge\VRCRemoteTest.Bridge.exe`へ複写される（SMB共有の外側 — 共有への書き込み権限を持つ第三者が実行体を差し替えてログオン時の自動実行を乗っ取れないようにするため、意図的にSMB共有の外に配置する）
-- Windows Task Schedulerへ「At log on」トリガー・非elevatedでタスクが登録される
-- `-StartNow`により登録直後にBridgeが起動する
+- 配置先（既定 `%LOCALAPPDATA%\Programs\VRCRemoteTest\Bridge\`）が `%LOCALAPPDATA%` の下にあり、U・SYSTEM・Administrators 以外が書き込めず、シンボリックリンクやジャンクションを含まないことを確認する。
+- 共有の exe をいったん配置先の中の候補ファイルにコピーし、**その候補の SHA-256** を照合してから、同じディレクトリ内の rename で実行体として配置する。照合後にコピー元を読み直すことはない。ハッシュが一致しなければ、配置済みの実行体とタスクは変更せずに中断する。
+- Windows Task Scheduler へ「At log on」トリガー・非 elevated でタスクが登録される。
+- `-StartNow` により登録直後に Bridge が起動する。
 
-再実行しても安全（冪等）。アンインストールする場合は`scripts/uninstall-bridge.ps1`を実行する。詳細は各スクリプトの`-?`ヘルプ、または`bridge/README.md`を参照。
+配置が済んだら、共有の drop は消しておく:
 
-**手動起動のみで運用したい場合**（自動起動を使わない場合）は、このステップを省略して次のステップ7の手動起動をそのまま使い続けてよい。
+```powershell
+Remove-Item C:\VRCRemoteTest\_bridge-drop\VRCRemoteTest.Bridge.exe
+```
+
+再実行しても安全（冪等）。配置済みの実行体が期待するハッシュと一致していれば、`-SourcePath` は読まずに置き換えを省略する。アンインストールする場合は `scripts/uninstall-bridge.ps1` を実行する。詳細は各スクリプトの `-?` ヘルプ、または `bridge/README.md` を参照。
+
+**Bridge を更新するとき**: インストーラーは稼働中の Bridge を自動では止めない。先に `Stop-ScheduledTask -TaskName 'VRCRemoteTestBridge'` で停止してから、新しい exe とハッシュで同じコマンドを実行する。
+
+**手動起動のみで運用したい場合**（自動起動を使わない場合）でも、実行体は上記のインストーラーで配置し、タスクを使わずに手順7の手動起動を使うこと。
 
 ---
 
@@ -153,7 +274,7 @@ Windows側で`scripts/install-bridge.ps1`を実行する（管理者権限は不
 & "$env:LOCALAPPDATA\Programs\VRCRemoteTest\Bridge\VRCRemoteTest.Bridge.exe"
 ```
 
-起動ログ（`%LOCALAPPDATA%\VRCRemoteTest\logs\bridge-*.log`、およびコンソール）に `VRC Remote Test Bridge starting.` が出力され、設定エラーで即終了しないことを確認する。設定エラーの場合は`Configuration error: ...`が出力されるので、`config.json`の`VrchatWorldsDirectory`のパスを再確認する。
+起動ログ（`%LOCALAPPDATA%\VRCRemoteTest\logs\bridge-*.log`、およびコンソール）に `VRC Remote Test Bridge starting.` が出力され、設定エラーで即終了しないことを確認する。設定エラーの場合は `Configuration error: ...` が出力されるので、`config.json` の `VrchatWorldsDirectory` のパスを再確認する。
 
 ---
 
@@ -219,6 +340,162 @@ Moonlight（NVIDIA GameStream/Sunshine互換のリモートデスクトップク
 
 `RemoteBuildCommand`が使う同じSMB共有経由で、BridgeがVRChatの`output_log_*.txt`（最新200行、直近ウィンドウのスナップショット）を5秒間隔で配信する。Windows側の追加設定は不要 — `VrchatWorldsDirectory`が正しく設定済みであれば自動的に有効になる。Unity側の `VRC Remote Test` ウィンドウの `VRChat Log` foldoutから、カテゴリフィルタ（All/Error/Exception/Udon/Shader/Warning）付きで閲覧できる。表示専用で、readiness判定やビルドの成否には一切影響しない。
 
+VRChat のログには、自分の表示名やユーザー ID、訪れたワールドの情報、同じインスタンスにいた他プレイヤーの表示名が含まれる。共有に読み取り権限を持つ人はこれを読めるので、共有の資格情報は他人に渡さないこと。
+
+---
+
+## 12. （推奨）VRChat の OSC が LAN から届かないことの確認
+
+VRChat の OSC（UDP 9000）には認証がない。LAN から届く状態だと、同じネットワークの誰でも VRChat を操作できる。VRC Remote Test 自体は OSC を使わないが、テスト用マシンとして一度確認しておく。**OSC を使わないなら、VRChat の Action Menu → Options → OSC で無効にしておくのが最も簡単**。
+
+**待ち受けアドレスの確認**（VRChat の OSC を有効にした状態で）:
+
+```powershell
+Get-NetUDPEndpoint -LocalPort 9000 | ForEach-Object {
+    $p = Get-Process -Id $_.OwningProcess
+    [pscustomobject]@{ LocalAddress = $_.LocalAddress; PID = $_.OwningProcess; Process = $p.ProcessName }
+}
+```
+
+`LocalAddress` が `127.0.0.1` / `::1` だけならループバック専用。`0.0.0.0` / `::` なら全インターフェースで待ち受けている。
+
+**ループバック以外からの OSC を遮断**（管理者 PowerShell 7）。Block 規則は、VRChat のインストール時にできた通常の Allow 規則より優先される:
+
+```powershell
+$ranges = @('0.0.0.0-126.255.255.255', '128.0.0.0-255.255.255.255', '::/128', '::2-ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff')
+New-NetFirewallRule -Name 'VRCRemoteTest-OSC-Block-NonLoopback' -DisplayName 'VRCRemoteTest OSC block non-loopback' `
+    -Direction Inbound -Action Block -Enabled True -Profile Any -Protocol UDP -LocalPort 9000 -RemoteAddress $ranges
+Get-NetFirewallRule -Name 'VRCRemoteTest-OSC-Block-NonLoopback' | Get-NetFirewallAddressFilter
+```
+
+**確認**: VRChat の OSC Debug 表示を開いた状態で、
+
+1. Windows 上（ループバック）から送ったメッセージが表示されること:
+
+    ```powershell
+    $packet = [System.Text.Encoding]::ASCII.GetBytes("/input/Jump`0,i`0`0") + [byte[]]@(0, 0, 0, 0)
+    $client = [System.Net.Sockets.UdpClient]::new()
+    [void]$client.Send($packet, $packet.Length, '127.0.0.1', 9000)
+    $client.Dispose()
+    ```
+
+2. Mac から Windows の LAN アドレスへ送ったメッセージが**表示されない**こと（`192.168.x.x` は Windows の IP に置き換える。値 0 の Jump なので、届いても何も起きない）:
+
+    ```bash
+    python3 -c 'import socket,struct; m=b"/input/Jump\0,i\0\0"+struct.pack(">i",0); s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.sendto(m,("192.168.x.x",9000)); print("sent")'
+    ```
+
+IPv6 の経路がある環境では、IPv6 アドレスでも同様に確認する（確認できなければ「IPv6 は未確認」と記録しておく）。
+
+---
+
+## 13. ディスク使用量の確認と掃除
+
+Bridge は、成功したビルドの artifact を Worlds に `RetainBuilds` 件だけ残し、状態ディレクトリには manifest だけを残す。失敗したビルドの artifact も、新しいものから `RetainBuilds` 件だけ `state\failed` に残す。
+
+一方、**共有へのアップロードの総量には強制的な上限がない**（`vrcremote` の資格情報があればディスクを埋められる）。一人開発の構成では受け入れた残余リスクとし、ときどき次で確認する:
+
+```powershell
+$state = "$env:LOCALAPPDATA\VRCRemoteTest\state"
+'C:\VRCRemoteTest\incoming', "$state\processing", "$state\failed", "$state\archive" | ForEach-Object {
+    $bytes = (Get-ChildItem -LiteralPath $_ -File -Recurse -ErrorAction SilentlyContinue | Measure-Object Length -Sum).Sum
+    '{0,-70} {1,10:N1} MB' -f $_, ($bytes / 1MB)
+}
+Get-PSDrive C | Select-Object Used, Free
+```
+
+- `incoming` に manifest の無い `.vrcw` や `.part` が残っている場合は、アップロードが途中で止まったもの。Bridge と Unity のビルドが動いていないときに削除してよい。
+- `state\failed` の manifest、`state\archive` の古い manifest は削除してよい（archive の manifest は同じ buildId の再配置を防ぐためのもので、Unity は buildId を使い回さない）。
+- `state\processing` に何か残っている場合は、Bridge のクラッシュの跡。Bridge の次回起動時に回復・掃除される。
+
+---
+
+## 14. 既存環境からの移行
+
+v0.2 以前の手順で作った環境（共有ルートに Full 権限、`processing`・`archive`・`failed` が共有内）から移行する。**既存のツリーの ACL は修復せず、新しいルートを作り直す**。古い ACE や所有者を確実に消すため。
+
+U の通常のセッションを「U」、管理者 PowerShell 7 を「管理者」と書く。作業中は Mac からのビルドを止めておく。
+
+### 14-1. バックアップ（U）
+
+```powershell
+$ErrorActionPreference = 'Stop'
+$backup = Join-Path $env:LOCALAPPDATA ("VRCRemoteTest\migration-" + (Get-Date -Format 'yyyyMMdd-HHmmss'))
+New-Item -ItemType Directory -Path $backup | Out-Null
+$task = Get-ScheduledTask -TaskName 'VRCRemoteTestBridge' -TaskPath '\'
+Export-ScheduledTask -TaskName 'VRCRemoteTestBridge' -TaskPath '\' | Set-Content -LiteralPath "$backup\task.xml" -Encoding Unicode
+Copy-Item -LiteralPath $task.Actions[0].Execute -Destination "$backup\VRCRemoteTest.Bridge.exe"
+Copy-Item -LiteralPath "$env:LOCALAPPDATA\VRCRemoteTest\config.json" -Destination "$backup\config.json"
+$backup   # 表示されたパスを控える
+```
+
+管理者で、共有の設定も保存する（`$backup` は上で控えたパス）:
+
+```powershell
+Get-SmbShare -Name 'VRCRemoteTest' | Select-Object Name, Path, SecurityDescriptor, EncryptData | Export-Clixml -LiteralPath "<控えたパス>\share.xml"
+```
+
+### 14-2. Bridge の停止（U → 管理者）
+
+U で、タスクを**無効化してから**停止する（移行中に自動起動させないため）:
+
+```powershell
+Disable-ScheduledTask -TaskName 'VRCRemoteTestBridge' -TaskPath '\'
+Stop-ScheduledTask -TaskName 'VRCRemoteTestBridge' -TaskPath '\'
+```
+
+管理者で、別のパスから手動起動された Bridge も残っていないことを確認する。何か表示されたら、パスを確認して `Stop-Process -Id <PID>` で止め、表示されなくなるまで先へ進まない:
+
+```powershell
+Get-CimInstance Win32_Process -Filter "Name = 'VRCRemoteTest.Bridge.exe'" | Select-Object ProcessId, ExecutablePath
+```
+
+### 14-3. 旧共有の削除と新しいルートの作成（Mac → 管理者）
+
+Mac で共有をアンマウントしてから、管理者で:
+
+```powershell
+Remove-SmbShare -Name 'VRCRemoteTest' -Force
+Rename-Item -LiteralPath 'C:\VRCRemoteTest' -NewName ('VRCRemoteTest.old-' + (Get-Date -Format 'yyyyMMdd'))
+```
+
+旧ルートはもう共有されない。この後、**手順2の vrcremote のグループ確認、手順3-1〜3-3** を新規セットアップと同じように行う（`vrcremote` は既存のものを使う）。旧ルートから processing などを取り込んではいけない。
+
+### 14-4. 新しい Bridge の配置と有効化（Mac → U）
+
+1. Mac で再マウントし、手順5の権限確認を行う。
+2. 手順1で発行した新しい exe を `_bridge-drop` にコピーし、U で手順6のインストーラーを実行する。**`-StartNow` は付けない**。タスクは無効のまま再登録される。
+3. 確認ができたら、タスクを有効化して起動する:
+
+    ```powershell
+    Enable-ScheduledTask -TaskName 'VRCRemoteTestBridge' -TaskPath '\'
+    Start-ScheduledTask -TaskName 'VRCRemoteTestBridge' -TaskPath '\'
+    ```
+
+4. Unity から `Remote Build & Test` を 1 回実行し、配置されることを確認する。
+5. 問題がなければ、旧ルート（`C:\VRCRemoteTest.old-*`）とバックアップを削除してよい。Bridge のログに `Ignoring legacy ... inside the share` が出る場合は、共有内に旧 `processing`・`archive`・`failed` が残っているので削除する。
+
+### 14-5. うまくいかなかったときの戻し方
+
+1. U: `Disable-ScheduledTask` と `Stop-ScheduledTask` で Bridge を止める。
+2. 管理者: 新しい共有を `Remove-SmbShare` で削除し、新しいルートを別名に退避して、旧ルートの名前を `C:\VRCRemoteTest` に戻す。保存した設定で共有を作り直す:
+
+    ```powershell
+    $s = Import-Clixml -LiteralPath "<控えたパス>\share.xml"
+    New-SmbShare -Name $s.Name -Path $s.Path -SecurityDescriptor $s.SecurityDescriptor -EncryptData $s.EncryptData
+    ```
+
+3. U: バックアップの exe と config.json を元の場所に戻し、タスクを登録し直して有効化する:
+
+    ```powershell
+    Copy-Item -LiteralPath "<控えたパス>\VRCRemoteTest.Bridge.exe" -Destination "$env:LOCALAPPDATA\Programs\VRCRemoteTest\Bridge\VRCRemoteTest.Bridge.exe" -Force
+    Copy-Item -LiteralPath "<控えたパス>\config.json" -Destination "$env:LOCALAPPDATA\VRCRemoteTest\config.json" -Force
+    Register-ScheduledTask -TaskName 'VRCRemoteTestBridge' -TaskPath '\' -Xml (Get-Content -LiteralPath "<控えたパス>\task.xml" -Raw) -Force
+    Enable-ScheduledTask -TaskName 'VRCRemoteTestBridge' -TaskPath '\'
+    ```
+
+戻した状態は、ハードニング前の構成（共有に Full 権限）であることに注意する。
+
 ---
 
 ## トラブルシューティング
@@ -227,13 +504,19 @@ Moonlight（NVIDIA GameStream/Sunshine互換のリモートデスクトップク
 |------|------|------|
 | `New-SmbShare`が`Windows System Error 5`で失敗 | 非管理者PowerShellで実行している | PowerShellを「管理者として実行」し直す |
 | `Enable-NetFirewallRule -DisplayGroup "File and Printer Sharing"`が規則を見つけられない | 日本語版Windowsでは`DisplayGroup`名がローカライズされている | `Get-NetFirewallRule -Name "FPS-SMB-In-TCP"`という固定名で指定する |
-| SMB共有はマウントできるが、ファイル作成/更新が失敗する（読み取りは可能） | `Grant-SmbShareAccess`（SMB層）のみで、NTFS層のACLが未設定 | `icacls`で該当ユーザーに`(OI)(CI)F`権限を追加する |
-| SMBマウント時のパスワード認証が繰り返し失敗する | PINでログインしているアカウントには、SMBが要求する実パスワードが設定されていない/不明 | SMB専用のローカルアカウント（例: `vrcremote`）を新規作成し、そちらの資格情報でマウントする |
+| Unity の Preflight が `Remote Share: Not reachable` のまま（共有はマウントできている） | `incoming` が無い、または `vrcremote` に `incoming` への書き込み権限が無い。ルートは読み取り専用なので Mac からは `incoming` を作れない | Windows 側で手順3-2のとおり `incoming` を作り、`icacls C:\VRCRemoteTest\incoming` で `vrcremote` の `(RX,W)` と `(OI)(CI)(IO)(M)` を確認する |
+| `results` やルートに Mac から書き込めない | 想定どおりの動作（読み取り専用） | 書き込みが必要なのは `incoming` と `_bridge-drop` だけ |
+| `incoming` へのファイル作成/更新が失敗する（読み取りは可能） | 共有の権限（SMB層）だけで、NTFS層のACLが未設定 | 手順3-2の `incoming` への `(RX,W)` と `(OI)(CI)(IO)(M)` を確認する |
+| SMBマウント時のパスワード認証が繰り返し失敗する | PINでログインしているアカウントには、SMBが要求する実パスワードが設定されていない/不明 | 手順2の専用アカウント `vrcremote` の資格情報でマウントする |
 | `.ps1`スクリプトの実行が"このシステムではスクリプトの実行が無効になっているため"のエラーで拒否される | 実行ポリシー、またはダウンロード/コピーされたファイルの「ブロック」属性 | `Unblock-File`を実行。それでも失敗する場合は`Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned` |
 | `start-vrchat-dev.ps1`が構文エラー等で動かない | Windows標準のPowerShell 5.1で実行している（スクリプトは7.0以降が必要） | `pwsh`（PowerShell 7）から実行する |
 | Bridgeが起動直後に`Configuration error`で終了する | `config.json`の`VrchatWorldsDirectory`が存在しない、またはパスが誤っている | VRChatを一度起動してWorldsディレクトリを生成させてから、正確なパスを`config.json`に設定する |
-| `install-bridge.ps1`登録後、ログオンしてもBridgeが起動していない | Task Schedulerの実行結果を確認していない、または`config.json`が無効 | `Get-ScheduledTaskInfo -TaskName 'VRCRemoteTestBridge' -TaskPath '\' \| Select-Object LastRunTime, LastTaskResult`で終了コードを確認し、`%LOCALAPPDATA%\VRCRemoteTest\logs\bridge-*.log`の最新ログを確認する |
+| `install-bridge.ps1`が「SHA-256 が一致しません」で失敗する | コピー元の exe が手順1で発行したものと違う（差し替え・別ビルド・コピー途中） | 手順1をやり直してハッシュを取り直す。配置済みの実行体とタスクは変更されていない |
+| `install-bridge.ps1`が「配置先に…書き込み権限があります」「%LOCALAPPDATA% の下に配置してください」で失敗する | `-ExePath` に、他のユーザーが書き込める場所やプロファイル外を指定している | `-ExePath` を省略して既定の配置先を使う |
+| `install-bridge.ps1`が「稼働中の Bridge…を先に停止してください」で失敗する | 置き換えには実行中の exe の停止が必要（自動停止はしない） | `Stop-ScheduledTask -TaskName 'VRCRemoteTestBridge'` で停止してから再実行する |
+| `install-bridge.ps1`登録後、ログオンしてもBridgeが起動していない | タスクが無効化されたまま、または`config.json`が無効 | `Get-ScheduledTask -TaskName 'VRCRemoteTestBridge'` の `State` を確認し、`Disabled` なら `Enable-ScheduledTask`。`Get-ScheduledTaskInfo -TaskName 'VRCRemoteTestBridge' -TaskPath '\' \| Select-Object LastRunTime, LastTaskResult`で終了コードを確認し、`%LOCALAPPDATA%\VRCRemoteTest\logs\bridge-*.log`の最新ログを確認する |
 | `install-bridge.ps1`が「本スクリプトが管理するタスクとは判別できません」で失敗する | 同名の無関係なタスクが既に存在する | `Get-ScheduledTask -TaskName 'VRCRemoteTestBridge' -TaskPath '\'`で内容を確認し、無関係であれば`-TaskName`で別名を指定するか、手動で削除してから再実行する |
+| Bridge のログに `Ignoring legacy ... inside the share` が出る | 共有内に旧構成の `processing`・`archive`・`failed` が残っている | 手順14に従って移行し、旧ディレクトリを削除する |
 
 ---
 
@@ -245,4 +528,4 @@ Moonlight（NVIDIA GameStream/Sunshine互換のリモートデスクトップク
 
 - `docs/validation/watch-worlds-spike.md` — `--watch-worlds`挙動の実機検証記録
 - `docs/sdk-api-notes.md` — Unity側SDK APIの調査ノート
-- `VRC Remote Test — 実装仕様書.md` §16（Windows Share）、§44（Windows config）、§63（Setup Flow）
+- `VRC Remote Test — 実装仕様書.md` §16（Windows Share）、§44（Windows config）、§49（Security）、§63（Setup Flow）

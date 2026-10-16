@@ -8,6 +8,21 @@ using VRCRemoteTest.Bridge.Deployment;
 using VRCRemoteTest.Bridge.VRChat;
 
 var localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+
+// GetFolderPath returns "" when the folder cannot be resolved, and Bridge-private
+// state (BridgeOptions.StateDirectory) must never fall back to a relative or
+// network location, so refuse to start before anything is created.
+if (string.IsNullOrWhiteSpace(localAppData)
+    || !Path.IsPathFullyQualified(localAppData)
+    || localAppData.StartsWith(@"\\", StringComparison.Ordinal)
+    || localAppData.StartsWith("//", StringComparison.Ordinal))
+{
+    Console.Error.WriteLine(
+        $"Cannot resolve a local %LOCALAPPDATA% directory ('{localAppData}'); refusing to start.");
+    Environment.ExitCode = 1;
+    return;
+}
+
 var configDir = Path.Combine(localAppData, "VRCRemoteTest");
 var logDir = Path.Combine(configDir, "logs");
 Directory.CreateDirectory(configDir);
@@ -47,6 +62,9 @@ try
             {
                 options.StagingDirectory = @"C:\VRCRemoteTest";
             }
+
+            // Fixed rather than configurable: see BridgeOptions.StateDirectory.
+            options.StateDirectory = Path.Combine(configDir, "state");
         });
 
     builder.Services.AddSingleton<IValidateOptions<BridgeOptions>, BridgeOptionsValidator>();

@@ -9,12 +9,23 @@ public sealed class BridgeOptions
     public const string SectionName = "Bridge";
 
     /// <summary>
-    /// Root of the staging area (incoming/processing/archive/failed/results).
+    /// Root of the SMB-shared staging area (incoming/results/status/logs).
     /// Deliberately separate from <see cref="VrchatWorldsDirectory"/> so a
     /// malformed or partial upload can never land directly in VRChat's live
     /// watched directory.
     /// </summary>
     public string StagingDirectory { get; set; } = string.Empty;
+
+    /// <summary>
+    /// Bridge-private state (processing/archive/failed). Never inside
+    /// <see cref="StagingDirectory"/>: the SMB account can write the share, so
+    /// nothing the Bridge later trusts (claimed manifests, validated artifact
+    /// snapshots, idempotency records) may live there. Program.cs always sets
+    /// this to %LOCALAPPDATA%\VRCRemoteTest\state, overriding config.json, so the
+    /// directory inherits the user profile's private ACL instead of needing a
+    /// runtime DACL check; the setter exists for test injection.
+    /// </summary>
+    public string StateDirectory { get; set; } = string.Empty;
 
     /// <summary>
     /// VRChat's local Worlds directory that --watch-worlds observes. Must already

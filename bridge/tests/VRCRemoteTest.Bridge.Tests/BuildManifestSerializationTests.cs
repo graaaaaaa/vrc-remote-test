@@ -32,6 +32,18 @@ public class BuildManifestSerializationTests
     }
 
     [Fact]
+    public void Golden_fixture_manifest_passes_the_watchers_strict_options()
+    {
+        // StagingWatcher rejects unknown members; the Unity sender's manifest must
+        // still deserialize with those exact options.
+        var manifest = JsonSerializer.Deserialize<BuildManifest>(
+            ReadFixture("sample-manifest.json"), Deployment.StagingWatcher.DeserializeOptions);
+
+        manifest.Should().NotBeNull();
+        manifest!.BuildId.Should().Be("20260901T112522481Z-a91f02cc");
+    }
+
+    [Fact]
     public void Roundtrips_manifest_through_serialize_and_deserialize()
     {
         var manifest = JsonSerializer.Deserialize<BuildManifest>(ReadFixture("sample-manifest.json"), Options)!;

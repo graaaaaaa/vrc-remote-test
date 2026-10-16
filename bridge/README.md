@@ -26,10 +26,11 @@ bridge/
 Bridgeは「フルオーケストレーションサービス」ではなく「ファイル検証・配置に特化したプロモーター」として設計しています。
 
 - **heartbeatなし**: ビルドごとに1つの結果ファイル (`results/{buildId}.json`) のみ
+- **共有の内容は信用しない**: SMB アカウントは共有内をいつでも書き換えられるため、Bridge は共有のファイルを自分の状態へ Move しない（同じボリューム内の Move はアップロード元の ACL を引き継ぐ）。manifest（64 KiB まで）と artifact（`MaxArtifactSizeBytes` まで、実際に読んだバイト数で判定）を共有外の状態ディレクトリへコピーし、そのコピーを検証して、同じコピーから配置する。検証後に共有のファイルを開き直すことはない
 - **VRChatプロセス監視**: `VrchatMonitorService`が10秒間隔でVRChatプロセスと`--watch-worlds`引数の有無を`status/vrchat-status.json`へ書き出す。Unity側のpreflight表示専用で、ビルドの成否には一切影響しない
 - **VRChat自動起動（`AutoLaunchVrchat`、デフォルトOFF）**: 有効時、VRChat未起動ならBridgeが`--watch-worlds`付きで自動起動し、準備が整うまで待ってからdeployする。既に`--watch-worlds`無しで起動中のVRChatは勝手に再起動しない。準備確認はWMIベースのプロセス監視シグナルの安定確認＋起動時刻からの最低待機時間（`StartupSettleDelay`）を組み合わせた方式（詳細は`VrchatReadinessCoordinator.cs`のコメント参照）
 - **VRChatログ配信（`VrchatLogService`）**: 5秒間隔で`output_log_*.txt`の最新ファイル末尾を状態を持たずに再読み込みし、直近200行を`logs/vrchat-latest.log`へ書き出す。Unity側Log Viewer（表示専用）のためのもので、readiness判定には一切使用しない
-- **自動起動**: `scripts/install-bridge.ps1`でWindows Task Scheduler（Trigger: At log on、Principal: Interactive/Limitedで非elevated）へ登録できる。実行体はSMB共有の外側（既定`%LOCALAPPDATA%\Programs\VRCRemoteTest\Bridge\`）に配置する — 共有への書き込み権限を持つ者が実行体を差し替えてログオン時の自動実行を乗っ取れないようにするため、意図的にSMB共有の外に配置する。手順は`docs/setup-windows.md`、詳細は`scripts/install-bridge.ps1 -?`を参照
+- **自動起動**: `scripts/install-bridge.ps1`でWindows Task Scheduler（Trigger: At log on、Principal: Interactive/Limitedで非elevated）へ登録できる。実行体はSMB共有の外側（既定`%LOCALAPPDATA%\Programs\VRCRemoteTest\Bridge\`）に配置する — 共有への書き込み権限を持つ者が実行体を差し替えてログオン時の自動実行を乗っ取れないようにするため、意図的にSMB共有の外に配置する。共有の drop から配置するときは、配置先の中に作った候補ファイルの SHA-256 を、共有以外の経路で用意した `-ExpectedSha256` と照合してから置き換える。手順は`docs/setup-windows.md`、詳細は`scripts/install-bridge.ps1 -?`を参照
 - **認証はSMB ACLのみ**: HMAC署名は将来検討事項
 
 ## ビルド・テスト方法
@@ -70,24 +71,29 @@ dotnet publish src/VRCRemoteTest.Bridge/VRCRemoteTest.Bridge.csproj -c Release -
 }
 ```
 
-`VrchatWorldsDirectory`が実在しない場合、Bridgeは起動を拒否します（勝手に別の場所を推測しません）。`VrchatExecutable`/`VrchatMode`/`AutoLaunchVrchat`/`VrchatStartupTimeoutSeconds`/`VrchatStartupSettleDelaySeconds`はVRChat自動起動用の設定で、`AutoLaunchVrchat: true`の場合のみ`VrchatExecutable`が検証される（絶対パス・非UNC・`.exe`拡張子・ファイル名が`VRChat.exe`と完全一致・実在、の全てを満たす必要がある）。
+`VrchatWorldsDirectory`が実在しない場合、Bridgeは起動を拒否します（勝手に別の場所を推測しません）。状態ディレクトリは `%LOCALAPPDATA%\VRCRemoteTest\state` に固定で、config.json では変更できません（`StagingDirectory` と重なる設定は起動時に拒否します）。`VrchatExecutable`/`VrchatMode`/`AutoLaunchVrchat`/`VrchatStartupTimeoutSeconds`/`VrchatStartupSettleDelaySeconds`はVRChat自動起動用の設定で、`AutoLaunchVrchat: true`の場合のみ`VrchatExecutable`が検証される（絶対パス・非UNC・`.exe`拡張子・ファイル名が`VRChat.exe`と完全一致・実在、の全てを満たす必要がある）。
 
 `VrchatStartupSettleDelaySeconds`（デフォルト30秒）は、VRChatプロセス起動後、実際にWorldsディレクトリの監視が有効になる（と推定される）まで待つ最低時間。WMIでの`--watch-worlds`引数検出はプロセス起動直後にほぼ即座に可能になるが、それは「VRChatが実際にファイル配置を検知できる状態」を意味しない（VRChatがホーム画面に到達するまで体感15〜30秒程度）。マシンやVRChatのバージョンによって実際の起動時間は変動するため、必要に応じて値を調整すること。`VrchatStartupTimeoutSeconds`は`VrchatStartupSettleDelaySeconds + 30秒`未満に設定できない。
 
 ## ステージングディレクトリ構造
 
-`StagingDirectory`配下に以下が自動生成されます:
+SMB 共有（`StagingDirectory`）と、Bridge 専用の状態ディレクトリに分かれます。無ければ Bridge が作成しますが、共有側は権限を付けるため `docs/setup-windows.md` の手順3で事前に作成してください:
 
 ```
-{StagingDirectory}/
-├── incoming/     — Unity側からのアップロード先 (.vrcw + .ready.json)
-├── processing/   — 処理中（claim済み）
-├── archive/      — 処理完了（冪等性判定に使用）
-├── failed/       — 検証失敗・quarantine
+{StagingDirectory}/          — SMB 共有（Mac が書けるのは incoming と _bridge-drop だけ）
+├── incoming/     — Unity側からのアップロード先 (.vrcw + .ready.json)。取り込み後に消費される
+├── _bridge-drop/ — Bridge 実行体の受け渡し用（install-bridge.ps1 がハッシュを照合して取り込む）
 ├── results/      — ビルドごとの結果ファイル (Unity側がポーリング)
 ├── status/       — VrchatMonitorServiceが10秒間隔で上書きするvrchat-status.json
 └── logs/         — VrchatLogServiceが5秒間隔で上書きするvrchat-latest.log（表示専用）
+
+%LOCALAPPDATA%\VRCRemoteTest\state/   — Bridge 専用（共有しない）
+├── processing/   — claim 済みの manifest と artifact の private コピー。.part は書き込み途中で、起動時に削除される
+├── archive/      — 処理完了した manifest（冪等性判定に使用）。artifact は Worlds にあるので残さない
+└── failed/       — 検証失敗・quarantine。artifact は新しいものから RetainBuilds 件だけ残す
 ```
+
+旧構成（共有内に `processing`・`archive`・`failed` があった構成）から更新した場合、共有内に残った旧ディレクトリは読み込まず、起動時に警告を出すだけです。移行手順は `docs/setup-windows.md` の手順14を参照してください。
 
 ## 手動テスト（Unity不要）
 

@@ -29,6 +29,8 @@ public sealed class BridgeOptionsValidator : IValidateOptions<BridgeOptions>
             failures.Add("StagingDirectory must be configured.");
         }
 
+        ValidateStateDirectory(options, failures);
+
         if (string.IsNullOrWhiteSpace(options.VrchatWorldsDirectory))
         {
             failures.Add("VrchatWorldsDirectory must be configured.");
@@ -96,13 +98,7 @@ public sealed class BridgeOptionsValidator : IValidateOptions<BridgeOptions>
             return;
         }
 
-        // Checked before IsPathFullyQualified: that check's UNC handling differs
-        // across platforms (true on Windows, false on macOS/Linux for a
-        // backslash-prefixed string), but this plain string-prefix check behaves
-        // identically everywhere, keeping validation deterministic regardless of
-        // which OS the Bridge is built/tested on.
-        if (vrchatExecutable.StartsWith(@"\\", StringComparison.Ordinal)
-            || vrchatExecutable.StartsWith("//", StringComparison.Ordinal))
+        if (IsUncPath(vrchatExecutable))
         {
             failures.Add($"VrchatExecutable '{vrchatExecutable}' must not be a UNC/network path.");
             return;
@@ -132,5 +128,96 @@ public sealed class BridgeOptionsValidator : IValidateOptions<BridgeOptions>
                 $"VrchatExecutable '{vrchatExecutable}' does not exist. " +
                 "Refusing to guess an alternate location; fix config.json.");
         }
+    }
+
+    /// <summary>
+    /// StateDirectory holds everything the Bridge trusts after ingestion, so it
+    /// must never be reachable through the SMB share. Both paths are
+    /// canonicalized first: a lexical comparison alone would accept
+    /// "C:\VRCRemoteTest2\..\VRCRemoteTest\state" as outside the staging root.
+    /// </summary>
+    private static void ValidateStateDirectory(BridgeOptions options, List<string> failures)
+    {
+        var stateDirectory = options.StateDirectory;
+
+        if (string.IsNullOrWhiteSpace(stateDirectory))
+        {
+            failures.Add("StateDirectory must be configured.");
+            return;
+        }
+
+        if (IsUncPath(stateDirectory))
+        {
+            failures.Add($"StateDirectory '{stateDirectory}' must not be a UNC/network path.");
+            return;
+        }
+
+        if (!Path.IsPathFullyQualified(stateDirectory))
+        {
+            failures.Add($"StateDirectory '{stateDirectory}' must be an absolute path.");
+            return;
+        }
+
+        if (string.IsNullOrWhiteSpace(options.StagingDirectory))
+        {
+            // Already reported above; nothing to compare against.
+            return;
+        }
+
+        string state;
+        string staging;
+        try
+        {
+            state = NormalizeDirectory(stateDirectory);
+            staging = NormalizeDirectory(options.StagingDirectory);
+        }
+        catch (Exception ex) when (ex is ArgumentException or NotSupportedException or PathTooLongException)
+        {
+            failures.Add($"StateDirectory or StagingDirectory is not a valid path: {ex.Message}");
+            return;
+        }
+
+        if (IsSameOrInside(state, staging) || IsSameOrInside(staging, state))
+        {
+            failures.Add(
+                $"StateDirectory '{stateDirectory}' must not overlap StagingDirectory '{options.StagingDirectory}': " +
+                "Bridge state must stay outside the SMB share.");
+            return;
+        }
+
+        if (Directory.Exists(state)
+            && new DirectoryInfo(state).Attributes.HasFlag(FileAttributes.ReparsePoint))
+        {
+            failures.Add($"StateDirectory '{stateDirectory}' must not be a symbolic link or junction.");
+        }
+    }
+
+    /// <summary>
+    /// Plain string-prefix check rather than relying on IsPathFullyQualified:
+    /// that check's UNC handling differs across platforms (true on Windows,
+    /// false on macOS/Linux for a backslash-prefixed string), but this behaves
+    /// identically everywhere, keeping validation deterministic regardless of
+    /// which OS the Bridge is built/tested on.
+    /// </summary>
+    private static bool IsUncPath(string path) =>
+        path.StartsWith(@"\\", StringComparison.Ordinal)
+        || path.StartsWith("//", StringComparison.Ordinal);
+
+    private static string NormalizeDirectory(string path) =>
+        Path.TrimEndingDirectorySeparator(Path.GetFullPath(path));
+
+    /// <summary>
+    /// Case-insensitive because the Bridge targets NTFS; on a case-sensitive
+    /// filesystem this can only reject more, never less.
+    /// </summary>
+    private static bool IsSameOrInside(string candidate, string root)
+    {
+        if (string.Equals(candidate, root, StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        var prefix = Path.EndsInDirectorySeparator(root) ? root : root + Path.DirectorySeparatorChar;
+        return candidate.StartsWith(prefix, StringComparison.OrdinalIgnoreCase);
     }
 }

@@ -73,4 +73,21 @@ public class CleanupServiceTests : IDisposable
 
         act.Should().NotThrow();
     }
+
+    [Fact]
+    public void Failed_artifact_cleanup_retains_the_newest_N_artifacts_of_any_name_and_keeps_manifests()
+    {
+        var baseTime = new DateTime(2026, 10, 1, 0, 0, 0, DateTimeKind.Utc);
+        for (var i = 0; i < 4; i++)
+        {
+            CreateFile($"build-{i}.vrcw", baseTime.AddMinutes(i));
+            CreateFile($"build-{i}.ready.json", baseTime.AddMinutes(i));
+        }
+
+        _cleanup.CleanupFailedArtifacts(_tempDir, retainBuilds: 2);
+
+        Directory.GetFiles(_tempDir, "*.vrcw").Select(Path.GetFileName)
+            .Should().BeEquivalentTo("build-2.vrcw", "build-3.vrcw");
+        Directory.GetFiles(_tempDir, "*.ready.json").Should().HaveCount(4);
+    }
 }

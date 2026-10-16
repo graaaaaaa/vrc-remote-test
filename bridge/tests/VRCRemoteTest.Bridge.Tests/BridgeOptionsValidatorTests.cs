@@ -25,6 +25,7 @@ public class BridgeOptionsValidatorTests : IDisposable
         var options = new BridgeOptions
         {
             StagingDirectory = Path.Combine(_tempDir, "staging"),
+            StateDirectory = Path.Combine(_tempDir, "state"),
             VrchatWorldsDirectory = _tempDir,
             MaxArtifactSizeBytes = 1024,
             RetainBuilds = 10,
@@ -41,6 +42,7 @@ public class BridgeOptionsValidatorTests : IDisposable
         var options = new BridgeOptions
         {
             StagingDirectory = Path.Combine(_tempDir, "staging"),
+            StateDirectory = Path.Combine(_tempDir, "state"),
             VrchatWorldsDirectory = Path.Combine(_tempDir, "does-not-exist"),
             MaxArtifactSizeBytes = 1024,
             RetainBuilds = 10,
@@ -77,6 +79,7 @@ public class BridgeOptionsValidatorTests : IDisposable
         var options = new BridgeOptions
         {
             StagingDirectory = Path.Combine(_tempDir, "staging"),
+            StateDirectory = Path.Combine(_tempDir, "state"),
             VrchatWorldsDirectory = _tempDir,
             MaxArtifactSizeBytes = maxSize,
             RetainBuilds = 10,
@@ -91,6 +94,7 @@ public class BridgeOptionsValidatorTests : IDisposable
     private BridgeOptions ValidBaseOptions() => new()
     {
         StagingDirectory = Path.Combine(_tempDir, "staging"),
+        StateDirectory = Path.Combine(_tempDir, "state"),
         VrchatWorldsDirectory = _tempDir,
         MaxArtifactSizeBytes = 1024,
         RetainBuilds = 10,
@@ -284,5 +288,123 @@ public class BridgeOptionsValidatorTests : IDisposable
         options.VrchatStartupTimeoutSeconds = 75; // 45 + 30
         result = _validator.Validate(name: null, options);
         result.Succeeded.Should().BeTrue();
+    }
+
+    [Theory]
+    [InlineData("")]
+    [InlineData("   ")]
+    public void Fails_when_StateDirectory_is_blank(string stateDirectory)
+    {
+        var options = ValidBaseOptions();
+        options.StateDirectory = stateDirectory;
+
+        var result = _validator.Validate(name: null, options);
+
+        result.Failed.Should().BeTrue();
+        result.Failures.Should().Contain(f => f.Contains("StateDirectory"));
+    }
+
+    [Fact]
+    public void Fails_when_StateDirectory_is_relative()
+    {
+        var options = ValidBaseOptions();
+        options.StateDirectory = Path.Combine("relative", "state");
+
+        var result = _validator.Validate(name: null, options);
+
+        result.Failed.Should().BeTrue();
+        result.Failures.Should().Contain(f => f.Contains("absolute"));
+    }
+
+    [Theory]
+    [InlineData(@"\\server\share\state")]
+    [InlineData("//server/share/state")]
+    public void Fails_when_StateDirectory_is_a_UNC_path(string stateDirectory)
+    {
+        var options = ValidBaseOptions();
+        options.StateDirectory = stateDirectory;
+
+        var result = _validator.Validate(name: null, options);
+
+        result.Failed.Should().BeTrue();
+        result.Failures.Should().Contain(f => f.Contains("UNC"));
+    }
+
+    [Fact]
+    public void Fails_when_StateDirectory_equals_StagingDirectory()
+    {
+        var options = ValidBaseOptions();
+        options.StateDirectory = options.StagingDirectory + Path.DirectorySeparatorChar;
+
+        var result = _validator.Validate(name: null, options);
+
+        result.Failed.Should().BeTrue();
+        result.Failures.Should().Contain(f => f.Contains("must not overlap"));
+    }
+
+    [Fact]
+    public void Fails_when_StateDirectory_is_inside_StagingDirectory()
+    {
+        var options = ValidBaseOptions();
+        options.StateDirectory = Path.Combine(options.StagingDirectory, "state");
+
+        var result = _validator.Validate(name: null, options);
+
+        result.Failed.Should().BeTrue();
+        result.Failures.Should().Contain(f => f.Contains("must not overlap"));
+    }
+
+    [Fact]
+    public void Fails_when_StagingDirectory_is_inside_StateDirectory()
+    {
+        var options = ValidBaseOptions();
+        options.StagingDirectory = Path.Combine(options.StateDirectory, "share");
+
+        var result = _validator.Validate(name: null, options);
+
+        result.Failed.Should().BeTrue();
+        result.Failures.Should().Contain(f => f.Contains("must not overlap"));
+    }
+
+    [Fact]
+    public void Overlap_check_canonicalizes_dot_segments_before_comparing()
+    {
+        // Lexically "staging2/../staging/state" does not start with "staging/", but it
+        // resolves inside it.
+        var options = ValidBaseOptions();
+        options.StateDirectory = Path.Combine(_tempDir, "staging2", "..", "staging", "state");
+
+        var result = _validator.Validate(name: null, options);
+
+        result.Failed.Should().BeTrue();
+        result.Failures.Should().Contain(f => f.Contains("must not overlap"));
+    }
+
+    [Fact]
+    public void A_sibling_whose_name_extends_StagingDirectory_is_not_treated_as_inside_it()
+    {
+        var options = ValidBaseOptions();
+        options.StateDirectory = options.StagingDirectory + "-state";
+
+        var result = _validator.Validate(name: null, options);
+
+        result.Succeeded.Should().BeTrue();
+    }
+
+    [Fact]
+    public void Fails_when_StateDirectory_is_a_symbolic_link()
+    {
+        var target = Path.Combine(_tempDir, "real-state");
+        Directory.CreateDirectory(target);
+        var link = Path.Combine(_tempDir, "linked-state");
+        Directory.CreateSymbolicLink(link, target);
+
+        var options = ValidBaseOptions();
+        options.StateDirectory = link;
+
+        var result = _validator.Validate(name: null, options);
+
+        result.Failed.Should().BeTrue();
+        result.Failures.Should().Contain(f => f.Contains("symbolic link"));
     }
 }

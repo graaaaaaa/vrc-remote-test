@@ -643,15 +643,24 @@ C:\VRCRemoteTest
 構造：
 
 ```text
-C:\VRCRemoteTest
+C:\VRCRemoteTest              （SMB共有）
 │
-├─ incoming
+├─ incoming                   （Mac が書き込む）
+├─ _bridge-drop               （Bridge 実行体の受け渡し。Mac が書き込む）
+├─ results                    （Bridge が書き込み、Mac は読み取りのみ）
+├─ status                     （同上）
+└─ logs                       （同上）
+
+%LOCALAPPDATA%\VRCRemoteTest\state   （Bridge 専用。共有しない）
+│
 ├─ processing
 ├─ archive
-├─ failed
-├─ status
-└─ logs
+└─ failed
 ```
+
+processing・archive・failed は共有に置かない。SMB アカウントは共有内をいつでも書き換えられるため、Bridge が信頼する状態（claim 済み manifest、検証済み artifact、冪等性の記録）はその外に置く（2026-10 セキュリティレビュー S7/S15）。
+
+共有の権限は Change、NTFS は SMB 専用アカウントに対して、ルートとその下を読み取り、`incoming`・`_bridge-drop` だけを変更可とする。手順は `docs/setup-windows.md`。
 
 SMB share名：
 
@@ -856,13 +865,15 @@ Bridgeは`.ready.json`を検出したら、
 
 ```text
 incoming
-   ↓ atomic move
-processing
+   ↓ 上限付きで読み取り（64 KiB）
+state/processing/<name>.part
+   ↓ 上書きしない rename
+state/processing/<name>
 ```
 
-へmanifestをmoveする。
+とする。この rename をclaim operationとする。共有のファイルは Move しない（同じボリューム内の Move はアップロード元の ACL を引き継ぐため）。claim 後、共有の manifest は削除する。
 
-これをclaim operationとする。
+artifact も同様に、`MaxArtifactSizeBytes` を実際に読んだバイト数で判定しながら `state/processing` へコピーし、そのコピーを検証して、同じコピーから deploy する。manifest だけで判定できる項目（protocolVersion、size、sha256 の書式）は、コピーの前に確認する。
 
 その後、
 
@@ -888,10 +899,10 @@ Bridgeはprocessed build IDを記録する。
 最低限、
 
 ```text
-archive/<buildId>.ready.json
+state/archive/<buildId>.ready.json
 ```
 
-の存在で判定可能。
+の存在で判定可能。archive には manifest だけを残し、artifact は残さない（deploy 済みのものが Worlds にあるため）。重複と判定したアップロードは、共有から消費する。
 
 duplicateの場合：
 
@@ -1557,6 +1568,18 @@ deploy前に必ずSHA-256確認。
 
 Windows SMB shareはLAN全体へのanonymous writeを許可しない。
 
+SMB には Bridge を動かすユーザーとは別の専用アカウントを使う。共有の権限は Change とし、NTFS で書き込み可能な場所を `incoming`・`_bridge-drop` に限る。Bridge の出力（results・status・logs）は SMB アカウントから読み取り専用とする。
+
+共有は `EncryptData` を有効にして作成する。
+
+### Bridge state
+
+Bridge が信頼する状態（processing・archive・failed）は共有外の `%LOCALAPPDATA%\VRCRemoteTest\state` に置き、config.json では変更できない。検証から deploy までは、共有外の同じコピーを使う。
+
+### Bridge installer
+
+`install-bridge.ps1` は `-ExpectedSha256` を必須とし、配置先の中に作った候補ファイルのハッシュを照合してから実行体を置き換える。期待するハッシュは共有以外の経路で用意する。配置先は `%LOCALAPPDATA%` の下で、本人・SYSTEM・Administrators 以外が書き込めない場所に限る。
+
 ### Secrets
 
 password/tokenをGit repositoryへ保存しない。
@@ -1574,15 +1597,14 @@ manifestからcommandを受け取って実行する仕様にはしない。
 Bridge起動時、
 
 ```text
-incoming
-processing
+state/processing
 ```
 
-をscanする。
+をscanする。書き込み途中の `.part` は削除し、claim 済みの manifest を再評価する。完成した private の artifact があれば再検証して使い、無ければ `incoming` から改めてコピーする。
 
-未完了buildが存在する場合はrecoveryする。
+その後、通常のスキャンで `incoming` を処理する。通常のスキャンでも、claim が残っている名前の manifest が再度届き、共有側を消費できた場合は、残っていた private の claim を再開する（共有側の内容は使わない）。claim ごとの処理で想定外の例外が起きた場合は、その claim を failed に移して `UNKNOWN_ERROR` を書き、ほかのビルドの処理を続ける。
 
-processingに残ったmanifestも再評価する。
+共有内に旧構成の processing・archive・failed が残っていても読み込まない（警告のみ）。
 
 ただし既にarchive済みのbuildIdは再deployしない。
 

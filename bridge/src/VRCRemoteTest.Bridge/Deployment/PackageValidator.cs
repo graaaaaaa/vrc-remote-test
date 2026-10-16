@@ -46,40 +46,13 @@ public sealed partial class PackageValidator : IPackageValidator
 
     public ValidationResult Validate(BuildManifest manifest, string artifactPath, long maxArtifactSizeBytes)
     {
-        if (manifest.ProtocolVersion != ProtocolConstants.CurrentProtocolVersion)
+        var manifestResult = ValidateProtocolVersion(manifest)
+            ?? ValidateBuildId(manifest.BuildId)
+            ?? ValidateFileName(manifest.FileName)
+            ?? ValidateDeclaredArtifact(manifest, maxArtifactSizeBytes);
+        if (manifestResult is not null)
         {
-            return ValidationResult.Failure(
-                ErrorCode.ProtocolVersionMismatch,
-                $"Unsupported protocol version {manifest.ProtocolVersion}, expected {ProtocolConstants.CurrentProtocolVersion}.");
-        }
-
-        var buildIdResult = ValidateBuildId(manifest.BuildId);
-        if (buildIdResult is not null)
-        {
-            return buildIdResult;
-        }
-
-        var fileNameResult = ValidateFileName(manifest.FileName);
-        if (fileNameResult is not null)
-        {
-            return fileNameResult;
-        }
-
-        if (manifest.Size <= 0)
-        {
-            return ValidationResult.Failure(ErrorCode.ManifestInvalid, "size must be positive.");
-        }
-
-        if (manifest.Size > maxArtifactSizeBytes)
-        {
-            return ValidationResult.Failure(
-                ErrorCode.SizeExceeded,
-                $"Artifact size {manifest.Size} exceeds maximum {maxArtifactSizeBytes} bytes.");
-        }
-
-        if (string.IsNullOrEmpty(manifest.Sha256) || manifest.Sha256.Length != 64 || !IsHex(manifest.Sha256))
-        {
-            return ValidationResult.Failure(ErrorCode.ManifestInvalid, "sha256 must be a 64-character hex string.");
+            return manifestResult;
         }
 
         if (!File.Exists(artifactPath))
@@ -104,6 +77,46 @@ public sealed partial class PackageValidator : IPackageValidator
         }
 
         return ValidationResult.Success();
+    }
+
+    internal static ValidationResult? ValidateProtocolVersion(BuildManifest manifest)
+    {
+        if (manifest.ProtocolVersion != ProtocolConstants.CurrentProtocolVersion)
+        {
+            return ValidationResult.Failure(
+                ErrorCode.ProtocolVersionMismatch,
+                $"Unsupported protocol version {manifest.ProtocolVersion}, expected {ProtocolConstants.CurrentProtocolVersion}.");
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// The checks that need only the manifest, exposed so <see cref="StagingWatcher"/>
+    /// can reject an obviously invalid submission before copying a possibly large
+    /// artifact into private state. <see cref="Validate"/> still re-runs them, and
+    /// the declared size is only a claim: the copy itself enforces the real limit.
+    /// </summary>
+    internal static ValidationResult? ValidateDeclaredArtifact(BuildManifest manifest, long maxArtifactSizeBytes)
+    {
+        if (manifest.Size <= 0)
+        {
+            return ValidationResult.Failure(ErrorCode.ManifestInvalid, "size must be positive.");
+        }
+
+        if (manifest.Size > maxArtifactSizeBytes)
+        {
+            return ValidationResult.Failure(
+                ErrorCode.SizeExceeded,
+                $"Artifact size {manifest.Size} exceeds maximum {maxArtifactSizeBytes} bytes.");
+        }
+
+        if (string.IsNullOrEmpty(manifest.Sha256) || manifest.Sha256.Length != 64 || !IsHex(manifest.Sha256))
+        {
+            return ValidationResult.Failure(ErrorCode.ManifestInvalid, "sha256 must be a 64-character hex string.");
+        }
+
+        return null;
     }
 
     /// <summary>
