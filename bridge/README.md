@@ -31,6 +31,7 @@ Bridgeは「フルオーケストレーションサービス」ではなく「�
 - **VRChat自動起動（`AutoLaunchVrchat`、デフォルトOFF）**: 有効時、VRChat未起動ならBridgeが`--watch-worlds`付きで自動起動し、準備が整うまで待ってからdeployする。既に`--watch-worlds`無しで起動中のVRChatは勝手に再起動しない。準備確認はWMIベースのプロセス監視シグナルの安定確認＋起動時刻からの最低待機時間（`StartupSettleDelay`）を組み合わせた方式（詳細は`VrchatReadinessCoordinator.cs`のコメント参照）
 - **VRChatログ配信（`VrchatLogService`）**: 5秒間隔で`output_log_*.txt`の最新ファイル末尾を状態を持たずに再読み込みし、直近200行を`logs/vrchat-latest.log`へ書き出す。Unity側Log Viewer（表示専用）のためのもので、readiness判定には一切使用しない
 - **自動起動**: `scripts/install-bridge.ps1`でWindows Task Scheduler（Trigger: At log on、Principal: Interactive/Limitedで非elevated）へ登録できる。実行体はSMB共有の外側（既定`%LOCALAPPDATA%\Programs\VRCRemoteTest\Bridge\`）に配置する — 共有への書き込み権限を持つ者が実行体を差し替えてログオン時の自動実行を乗っ取れないようにするため、意図的にSMB共有の外に配置する。共有の drop から配置するときは、配置先の中に作った候補ファイルの SHA-256 を、共有以外の経路で用意した `-ExpectedSha256` と照合してから置き換える。手順は`docs/setup-windows.md`、詳細は`scripts/install-bridge.ps1 -?`を参照
+- **配布**: `v*.*.*` タグのリリースでは、GitHub Actions（`.github/workflows/release-package.yml` の `bridge` ジョブ）がタグ付きコミットから win-x64 の単一ファイル exe をビルドし、テストを通したうえで、ビルドの来歴（artifact attestation）を署名して Release に添付する。SHA-256 はリリースノートに載る。Windows では `gh attestation verify` で来歴を確認してから `install-bridge.ps1 -ExpectedSha256` に渡す（`docs/setup-windows.md` の手順1-A）。ビルドは再現可能ではないので、同じタグを全体再実行して exe を作り直しても、公開済みの exe は置き換えない
 - **認証はSMB ACLのみ**: HMAC署名は将来検討事項
 
 ## ビルド・テスト方法

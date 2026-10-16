@@ -5,6 +5,11 @@ name: Release package
 # that historical tag-push event (workflows only react to events that occur
 # after they exist on the default branch). This workflow mechanically
 # replicates the exact steps that were run by hand for v0.2.0.
+#
+# Each release also carries the Windows Bridge executable, built and attested
+# by the `bridge` job below, so the installer's -ExpectedSha256 can come from
+# GitHub instead of the developer's Mac (security review S8). Releases made
+# before that job existed (v0.2.0) are not backfilled.
 on:
   push:
     tags:
@@ -18,7 +23,125 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # Restores, tests, publishes and attests the Bridge. Kept apart from
+  # `release` so the code that runs during restore/build/test never holds
+  # contents: write, and the publisher never holds OIDC/attestation
+  # authority. Actions in this job are pinned to commit SHAs because it can
+  # mint signing identities (Codex plan review, Bridge CI release, Round 1).
+  bridge:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    outputs:
+      sha256: ${{ steps.hash.outputs.sha256 }}
+    steps:
+      - name: Validate tag format strictly
+        env:
+          RAW_TAG: ${{ github.ref_name }}
+        run: |
+          if [[ ! "$RAW_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Tag '$RAW_TAG' does not match strict vMAJOR.MINOR.PATCH format"
+            exit 1
+          fi
+
+      # No credentials are persisted: nothing in this job pushes, and the
+      # fetch/ls-remote calls below work anonymously against this public repo.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Derive version and check it against the tagged package.json
+        id: version
+        env:
+          RAW_TAG: ${{ github.ref_name }}
+        run: |
+          VERSION="${RAW_TAG#v}"
+          PKG_VERSION=$(git show "$GITHUB_SHA:package/package.json" | jq -r '.version')
+          if [ "$PKG_VERSION" != "$VERSION" ]; then
+            echo "::error::package/package.json version ($PKG_VERSION) at the tagged commit does not match tag version ($VERSION)"
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      # Both checks run before anything is built or attested, so this
+      # workflow never signs provenance for a commit that is not on main or
+      # that the tag no longer points at. Same logic as the release job.
+      - name: Verify tag points at a commit already on main
+        run: |
+          git fetch origin +refs/heads/main:refs/remotes/origin/main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::Tag is not an ancestor of main. Refusing to build and attest an un-merged commit."
+            exit 1
+          fi
+
+      - name: Verify the tag has not moved since the run started
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          TRIGGERED_COMMIT=$(git rev-parse "$GITHUB_SHA^{commit}")
+          CURRENT_COMMIT=$(git ls-remote origin "refs/tags/$TAG" "refs/tags/$TAG^{}" | \
+            awk -v tag="refs/tags/$TAG" '
+              $2 == tag {direct=$1}
+              $2 == tag "^{}" {peeled=$1}
+              END {print (peeled != "") ? peeled : direct}
+            ')
+          if [ "$CURRENT_COMMIT" != "$TRIGGERED_COMMIT" ]; then
+            echo "::error::Tag $TAG now resolves to '$CURRENT_COMMIT', not $TRIGGERED_COMMIT. Refusing to attest a build for a moved tag."
+            exit 1
+          fi
+
+      - uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4.3.1
+        with:
+          dotnet-version: "10.0.x"
+
+      - name: dotnet test
+        run: dotnet test bridge/VRCRemoteTest.Bridge.sln --configuration Release
+
+      # Not reproducible byte-for-byte (the SDK patch and restored packages
+      # can change between runs), which is why the release job never accepts
+      # a rebuilt executable in place of an already published one.
+      - name: Publish the win-x64 single-file executable
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          dotnet publish bridge/src/VRCRemoteTest.Bridge/VRCRemoteTest.Bridge.csproj \
+            -c Release -r win-x64 --self-contained \
+            -p:PublishSingleFile=true -p:ContinuousIntegrationBuild=true \
+            -p:Version="$VERSION" -o dist/bridge
+
+      - name: Compute SHA-256
+        id: hash
+        run: |
+          EXE=dist/bridge/VRCRemoteTest.Bridge.exe
+          test -f "$EXE"
+          SHA256=$(sha256sum "$EXE" | cut -d' ' -f1)
+          if [[ ! "$SHA256" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "::error::Unexpected SHA-256 output: '$SHA256'"
+            exit 1
+          fi
+          echo "sha256=$SHA256" >> "$GITHUB_OUTPUT"
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/bridge/VRCRemoteTest.Bridge.exe
+
+      # Only the executable, never the workspace. Kept for 7 days so that
+      # "Re-run failed jobs" can retry publishing these exact bytes.
+      - name: Upload the executable for the release job
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: bridge-exe
+          path: dist/bridge/VRCRemoteTest.Bridge.exe
+          if-no-files-found: error
+          retention-days: 7
+
   release:
+    needs: bridge
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -42,7 +165,9 @@ jobs:
             exit 1
           fi
 
-      - uses: actions/checkout@v4
+      # Pinned like the bridge job's actions: this job publishes the
+      # executable with contents: write.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
 
@@ -145,6 +270,38 @@ jobs:
         run: |
           echo "sha256=$(sha256sum "dist/$ASSET" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
 
+      # Into its own directory, so nothing else in dist/ can be mistaken for
+      # the artifact. download-artifact only warns on an archive digest
+      # mismatch, so the raw executable is compared with the hash the bridge
+      # job attested, and anything else fails the run.
+      - name: Download the Bridge executable built by this run
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: bridge-exe
+          path: dist/bridge-artifact
+
+      - name: Verify the Bridge executable matches the attested hash
+        id: bridge
+        env:
+          EXPECTED: ${{ needs.bridge.outputs.sha256 }}
+        run: |
+          if [[ ! "$EXPECTED" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "::error::bridge job output is not a SHA-256: '$EXPECTED'"
+            exit 1
+          fi
+          if [ "$(find dist/bridge-artifact -type f | wc -l)" -ne 1 ] || \
+             [ ! -f dist/bridge-artifact/VRCRemoteTest.Bridge.exe ]; then
+            echo "::error::The bridge-exe artifact must contain exactly VRCRemoteTest.Bridge.exe"
+            exit 1
+          fi
+          ACTUAL=$(sha256sum dist/bridge-artifact/VRCRemoteTest.Bridge.exe | cut -d' ' -f1)
+          if [ "$ACTUAL" != "$EXPECTED" ]; then
+            echo "::error::Downloaded Bridge executable ($ACTUAL) does not match the attested build ($EXPECTED)"
+            exit 1
+          fi
+          cp dist/bridge-artifact/VRCRemoteTest.Bridge.exe dist/VRCRemoteTest.Bridge.exe
+          echo "sha256=$ACTUAL" >> "$GITHUB_OUTPUT"
+
       - name: Extract release notes from CHANGELOG (tagged commit)
         env:
           VERSION: ${{ steps.version.outputs.version }}
@@ -161,6 +318,31 @@ jobs:
               /^## \[/{if(flag) exit}
               flag
             ' > dist/release-notes.md
+
+      # The hash a Windows user passes to install-bridge.ps1 -ExpectedSha256,
+      # and the exact verification policy for the attestation. Notes are only
+      # set when the release is created; recovery never rewrites them.
+      - name: Append the Windows Bridge section to the release notes
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+          REPO: ${{ github.repository }}
+          BRIDGE_SHA256: ${{ steps.bridge.outputs.sha256 }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          {
+            echo
+            echo "## Windows Bridge"
+            echo
+            echo "- \`VRCRemoteTest.Bridge.exe\` SHA-256: \`$BRIDGE_SHA256\`"
+            echo "- Source commit: \`$GITHUB_SHA\`"
+            echo "- Built and attested by: $RUN_URL"
+            echo
+            echo "Verify on Windows with GitHub CLI 2.102.0 or later before installing (see docs/setup-windows.md):"
+            echo
+            echo '```powershell'
+            echo "gh attestation verify .\\VRCRemoteTest.Bridge.exe --repo $REPO --signer-workflow $REPO/.github/workflows/release-package.yml --source-ref refs/tags/$TAG --source-digest $GITHUB_SHA --deny-self-hosted-runners"
+            echo '```'
+          } >> dist/release-notes.md
 
       - name: Build the version entry JSON (fixed snapshot, reused for the release and index.json)
         env:
@@ -213,49 +395,110 @@ jobs:
             exit 1
           fi
 
-      # Idempotent: if the release already exists (a previous run created it
-      # but failed before updating index.json, or this run is a retry), we
-      # do not blindly skip — it must be published (not a leftover draft)
-      # and its asset digest must match what we just built from the tagged
-      # commit, otherwise something is inconsistent and we fail hard rather
-      # than publish a listing entry that doesn't match the real asset
-      # (Codex code review, Round 2 confidence 0.85, Round 3 confidence 0.87
-      # for the draft-detection gap).
+      # Idempotent and fail-closed for both assets (the VPM zip and the Bridge
+      # executable). If the release already exists — a previous run created
+      # it but failed before updating index.json, or this run is a retry — it
+      # must be published (not a leftover draft), and every asset already on
+      # it must be fully uploaded with exactly the digest this run expects.
+      # Only genuinely absent assets are uploaded; an incomplete or different
+      # asset stops the run instead of being overwritten (zip-only history:
+      # Codex code review, Round 1 v2 confidence 0.8, Round 2 0.85, Round 3
+      # 0.87).
+      #
+      # A full re-run rebuilds the Bridge executable, which is not
+      # reproducible, so its digest can legitimately differ from the one
+      # already published. Recover with "Re-run failed jobs" (it reuses the
+      # bridge job's 7-day artifact). If the published executable differs,
+      # release a new version: the notes already carry the published hash,
+      # and immutable releases cannot change anyway. index.json is only
+      # updated after the complete set has been verified (Codex plan review,
+      # Bridge CI release, Rounds 1-2).
       - name: Create GitHub Release (idempotent, verified)
         env:
           GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
           TAG: ${{ steps.version.outputs.tag }}
           ASSET: ${{ steps.zip.outputs.asset }}
           SHA256: ${{ steps.hash.outputs.sha256 }}
+          BRIDGE_SHA256: ${{ steps.bridge.outputs.sha256 }}
         run: |
-          if gh release view "$TAG" --json assets,isDraft,publishedAt >/tmp/existing-release.json 2>/dev/null; then
-            IS_DRAFT=$(jq -r '.isDraft' /tmp/existing-release.json)
-            if [ "$IS_DRAFT" = "true" ]; then
+          declare -A EXPECTED=(
+            ["$ASSET"]="sha256:$SHA256"
+            ["VRCRemoteTest.Bridge.exe"]="sha256:$BRIDGE_SHA256"
+          )
+
+          if gh release view "$TAG" --json isDraft >/tmp/existing-release.json 2>/dev/null; then
+            if [ "$(jq -r '.isDraft' /tmp/existing-release.json)" = "true" ]; then
               echo "::error::Release $TAG exists as an unpublished draft (a previous run's gh release create likely failed partway through). Delete the draft manually and re-run, rather than risk publishing an incomplete release automatically."
               exit 1
             fi
 
-            # gh release create can create the Release object and then fail
-            # before the asset finishes uploading — that leaves a published
-            # release with the asset simply missing (distinct from a
-            # mismatched asset). Recover by uploading, rather than treating
-            # "no asset" the same as "wrong asset" (Codex code review,
-            # Round 1 v2, confidence 0.8).
-            EXISTING_DIGEST=$(jq -r --arg name "$ASSET" '.assets[] | select(.name == $name) | .digest // empty' /tmp/existing-release.json)
-            if [ -z "$EXISTING_DIGEST" ]; then
-              echo "Release $TAG exists but is missing the $ASSET asset; uploading it now."
-              gh release upload "$TAG" "dist/$ASSET"
-              EXISTING_DIGEST=$(gh release view "$TAG" --json assets | jq -r --arg name "$ASSET" '.assets[] | select(.name == $name) | .digest // empty')
-            fi
-            if [ "$EXISTING_DIGEST" != "sha256:$SHA256" ]; then
-              echo "::error::Release $TAG already exists but its asset digest ($EXISTING_DIGEST) does not match the zip just built from this tag (sha256:$SHA256). Refusing to overwrite index.json with mismatched metadata."
-              exit 1
-            fi
-            echo "Release $TAG already exists, published, with a matching asset; skipping creation (recovering from a previous partial run)."
+            # The REST endpoint reports each asset's upload state as well as
+            # its digest; it only returns published releases, and drafts were
+            # rejected above.
+            gh api "repos/$REPO/releases/tags/$TAG" > /tmp/existing-release.json
+
+            # Classify every asset before changing anything.
+            MISSING=()
+            for NAME in "${!EXPECTED[@]}"; do
+              MATCHES=$(jq --arg n "$NAME" '[.assets[] | select(.name == $n)] | length' /tmp/existing-release.json)
+              if [ "$MATCHES" -eq 0 ]; then
+                MISSING+=("$NAME")
+                continue
+              fi
+
+              STATE=$(jq -r --arg n "$NAME" '.assets[] | select(.name == $n) | .state' /tmp/existing-release.json)
+              DIGEST=$(jq -r --arg n "$NAME" '.assets[] | select(.name == $n) | .digest // empty' /tmp/existing-release.json)
+              if [ "$STATE" != "uploaded" ] || [ -z "$DIGEST" ]; then
+                echo "::error::Release $TAG has an incomplete $NAME asset (state '$STATE', digest '$DIGEST'). Delete that asset manually and use 'Re-run failed jobs' (which re-publishes the same attested bytes); if the release is immutable, release a new version instead."
+                exit 1
+              fi
+              if [ "$DIGEST" != "${EXPECTED[$NAME]}" ]; then
+                echo "::error::Release $TAG already has $NAME with digest $DIGEST, but this run produced ${EXPECTED[$NAME]}. Refusing to overwrite a published asset. A full re-run rebuilds the Bridge executable and is not reproducible; release a new version instead (the published notes carry the published hash)."
+                exit 1
+              fi
+            done
+
+            for NAME in "${MISSING[@]}"; do
+              echo "Release $TAG is missing $NAME; uploading it now."
+              if ! gh release upload "$TAG" "dist/$NAME"; then
+                echo "::error::Could not upload $NAME to the existing release $TAG. If immutable releases are enabled, assets cannot be added after publication; release a new version instead."
+                exit 1
+              fi
+            done
           else
-            gh release create "$TAG" "dist/$ASSET" \
+            gh release create "$TAG" "dist/$ASSET" dist/VRCRemoteTest.Bridge.exe \
               --verify-tag --title "$TAG" --notes-file dist/release-notes.md
           fi
+
+          # Verify the complete published set before index.json points at it.
+          # Retried briefly in case asset metadata lags right after upload.
+          for ATTEMPT in 1 2 3 4 5; do
+            ALL_MATCH=true
+            # A transient API failure is retried like lagging metadata rather
+            # than aborting under bash -e (Codex code review, Bridge CI
+            # release, Round 2).
+            if ! gh api "repos/$REPO/releases/tags/$TAG" > /tmp/final-release.json; then
+              echo "Attempt $ATTEMPT: could not read release $TAG."
+              echo '{"assets":[]}' > /tmp/final-release.json
+            fi
+            for NAME in "${!EXPECTED[@]}"; do
+              DIGEST=$(jq -r --arg n "$NAME" '[.assets[] | select(.name == $n and .state == "uploaded") | .digest] | first // empty' /tmp/final-release.json)
+              if [ "$DIGEST" != "${EXPECTED[$NAME]}" ]; then
+                ALL_MATCH=false
+                echo "Attempt $ATTEMPT: $NAME on $TAG has digest '$DIGEST', expected ${EXPECTED[$NAME]}."
+              fi
+            done
+            if [ "$ALL_MATCH" = true ]; then
+              echo "Release $TAG carries both assets with the expected digests."
+              break
+            fi
+            if [ "$ATTEMPT" -eq 5 ]; then
+              echo "::error::Release $TAG does not carry the expected assets after publication."
+              exit 1
+            fi
+            sleep $((ATTEMPT * 3))
+          done
 
       # Idempotent (git diff --quiet short-circuits a no-op) and retried on
       # a push race against another concurrent run (moot under the

@@ -14,7 +14,8 @@ VRC Remote Testを使うために、Windows実機（VRChatクライアントを�
 
 - **SMB 共有への書き込み権限 = ワールドを配置できる権限**。Bridge の認証は、SMB アカウントの資格情報と共有の ACL だけで成り立っている（仕様書§49）。
 - 共有の中で Mac が書き込めるのは `incoming\` と `_bridge-drop\` だけにする。`results\`、`status\`、`logs\` は読み取り専用にし、Bridge が処理中に信頼する状態（processing、archive、failed）は共有の外（`%LOCALAPPDATA%\VRCRemoteTest\state`）に置く。
-- Bridge の実行体はハッシュを照合してから登録する。共有に置いた exe は、共有に書ける人なら誰でも差し替えられるため。
+- Bridge の実行体はハッシュを照合してから登録する。共有に置いた exe は、共有に書ける人なら誰でも差し替えられるため。リリース済みの版は、GitHub Actions がビルドして来歴を署名した exe を、Windows 上で直接ダウンロードして検証する（手順1-A）。
+- Windows で実行するスクリプトは、Windows のローカルにあるものだけを使う。Mac の共有上のスクリプトを実行すると、Mac が侵害されたときに Windows でコードを実行されてしまう。
 - これらは一人開発・家庭内 LAN を想定した設計。共有の資格情報が漏れれば、任意のワールドを配置される（Mac が侵害された場合も同じ）。
 - `vrcremote` には、シンボリックリンクを作成する特権を与えない（既定のまま）。Bridge は共有内のリンクを取り込まないが、検査と読み取りの間に差し替えられる余地までは塞いでいない。
 - 受け入れている残余リスク: 共有の資格情報を持つ人は、`incoming` へのアップロードでディスクを埋めたり、処理中のアップロードを同名のファイルで妨害したりできる。また、同じ buildId を再度アップロードすると、`results` の結果が `BUILD_ALREADY_PROCESSED` で上書きされる（Unity は buildId を使い回さないので、通常の利用では起きない）。いずれも配置されるワールドの中身には影響しない。
@@ -26,15 +27,69 @@ VRC Remote Testを使うために、Windows実機（VRChatクライアントを�
 - [ ] Windows 11 マシン（管理者権限を持つアカウントでログイン可能なこと）
 - [ ] Steam + VRChat がインストール済み
 - [ ] PowerShell 7（`pwsh`）がインストール済み — Windows 標準の PowerShell 5.1 では各スクリプトが動かない（`#Requires -Version 7.0`）
-- [ ] macOS 開発機に .NET 10 SDK（Bridge を Mac で発行する場合）、または Windows 実機に .NET 10 SDK（Windows で直接ビルドする場合）
+- [ ] 手順1-A（推奨）を使う場合: Windows に GitHub CLI（`gh`）**2.102.0 以上**。`gh --version` で確認し、`gh auth login` を済ませておく。2.101.0 以前は、来歴の検証で `--signer-workflow` が前方一致で比較される不具合がある（[GHSA-wjmr-j3rp-mh2g](https://github.com/cli/cli/security/advisories/GHSA-wjmr-j3rp-mh2g)）
+- [ ] 手順1-B を使う場合: macOS 開発機（または Windows 実機）に .NET 10 SDK
 
 以下、**U** は Bridge を動かす Windows の普段使いのユーザー、**vrcremote** は Mac からの SMB 接続専用のアカウントを指す。
 
 ---
 
-## 1. Bridge実行体の発行とハッシュの記録
+## 1. Bridge実行体とスクリプトの入手
 
-### 1-1. 依存パッケージの確認と発行
+どちらかを選ぶ。
+
+- **1-A（推奨）GitHub Release から取得**: リリース済みの版を使う場合。
+- **1-B 自分でビルド**: まだリリースしていないコミットを試す場合。
+
+### 1-A. GitHub Release から取得（推奨）
+
+GitHub Actions がタグの付いたコミットからビルドし、ビルドの来歴（どのワークフローが、どのコミットから、GitHub のどのランナーでビルドしたか）を署名付きで記録した exe を使う。**ダウンロードと検証は Windows 上で行い、Mac や SMB 共有を経由させない。** スクリプトも同じコミットのものを Windows に直接取得する。
+
+U の通常の PowerShell 7 で実行する（`$tag` は [Releases](https://github.com/graaaaaaa/vrc-remote-test/releases) で確認した使う版に置き換える）:
+
+```powershell
+$ErrorActionPreference = 'Stop'
+$repo = 'graaaaaaa/vrc-remote-test'
+$tag  = 'vX.Y.Z'
+$dir  = Join-Path $env:LOCALAPPDATA "VRCRemoteTest\release\$tag"   # 共有の外
+New-Item -ItemType Directory -Path $dir -Force | Out-Null
+
+# タグが指すコミット
+$commit = gh api "repos/$repo/commits/$tag" --jq .sha
+if ($LASTEXITCODE -ne 0 -or $commit -notmatch '^[0-9a-f]{40}$') { throw "タグ $tag のコミットを取得できませんでした" }
+
+# 実行体
+gh release download $tag --repo $repo --pattern VRCRemoteTest.Bridge.exe --dir $dir --clobber
+if ($LASTEXITCODE -ne 0) { throw 'ダウンロードに失敗しました' }
+$exe = Join-Path $dir 'VRCRemoteTest.Bridge.exe'
+
+# 来歴の検証: このリポジトリの release-package.yml が、このタグとコミットから、
+# GitHub ホストのランナーでビルドしたものか。失敗したらインストールしない。
+gh attestation verify $exe --repo $repo `
+    --signer-workflow "$repo/.github/workflows/release-package.yml" `
+    --source-ref "refs/tags/$tag" --source-digest $commit --deny-self-hosted-runners
+if ($LASTEXITCODE -ne 0) { throw '来歴の検証に失敗しました。このファイルはインストールしないでください' }
+
+# 同じコミットのスクリプト（install-bridge.ps1 など）
+Invoke-WebRequest "https://github.com/$repo/archive/$commit.zip" -OutFile (Join-Path $dir 'source.zip')
+Expand-Archive (Join-Path $dir 'source.zip') -DestinationPath (Join-Path $dir 'source') -Force
+$scripts = Join-Path $dir "source\vrc-remote-test-$commit\scripts"
+Get-ChildItem $scripts -Filter *.ps1 | Unblock-File
+
+# インストーラーに渡すハッシュ
+(Get-FileHash $exe -Algorithm SHA256).Hash
+```
+
+表示されたハッシュが、Release ページの「Windows Bridge」の節に書かれた SHA-256 と一致することを確認する（大文字小文字は区別しない）。一致したら、この値を手順6の `-ExpectedSha256` に使う。`$exe`、`$scripts` は手順6と手順8でも使うので、同じ PowerShell のウィンドウで続けるか、パスを控えておく。
+
+**この方法で防げること・防げないこと**:
+
+- 防げる: Mac や SMB 共有での exe の差し替え、Mac でのローカルビルドの改ざん。exe もハッシュも、Mac を経由しない。
+- 防げない: GitHub アカウントやリポジトリが侵害されて、悪意のあるコミットが main とタグに入った場合（そのコミットからのビルドとして正しく署名される）。Mac に保存された GitHub の認証情報が盗まれた場合もこれに当たる。依存パッケージ（NuGet）の侵害も防げない。来歴は「どこで何からビルドされたか」の証明であって、コードが安全であることの証明ではない。リリースする前に、main に入っているコミットを自分で確認すること。
+
+### 1-B. 自分でビルドする（リリース前のコミットを試す場合）
+
+#### 1-B-1. 依存パッケージの確認と発行
 
 発行の前に、既知の脆弱性がある依存パッケージがないか確認する:
 
@@ -51,7 +106,7 @@ dotnet publish bridge/src/VRCRemoteTest.Bridge/VRCRemoteTest.Bridge.csproj \
 
 出力: `bridge/src/VRCRemoteTest.Bridge/bin/Release/net10.0/win-x64/publish/VRCRemoteTest.Bridge.exe`。
 
-### 1-2. SHA-256 の記録
+#### 1-B-2. SHA-256 の記録
 
 ```bash
 shasum -a 256 bridge/src/VRCRemoteTest.Bridge/bin/Release/net10.0/win-x64/publish/VRCRemoteTest.Bridge.exe
@@ -61,7 +116,7 @@ shasum -a 256 bridge/src/VRCRemoteTest.Bridge/bin/Release/net10.0/win-x64/publis
 
 **ハッシュは SMB 共有以外の経路で Windows に渡すこと**（Mac の画面を見て入力する、信頼できるパスワードマネージャーのメモを使う、など）。共有に `.sha256` ファイルを置くと、exe と一緒に差し替えられてしまう。
 
-**限界**: この方法は「共有に書ける第三者による差し替え」を防ぐが、Mac 自体が侵害されている場合は、exe とハッシュの両方が偽物になり得るので防げない。より強くしたい場合は、Windows 実機に .NET 10 SDK を入れ、信頼できるチェックアウトから Windows 上で直接 `dotnet publish` し、その場で `Get-FileHash -Algorithm SHA256` を取る（この場合 exe を共有経由で運ぶ必要もない）。インストーラーのスクリプト（`scripts/install-bridge.ps1`）自体も、信頼できるチェックアウトのものを使うこと。
+**限界**: この方法は「共有に書ける第三者による差し替え」を防ぐが、Mac 自体が侵害されている場合は、exe とハッシュの両方が偽物になり得るので防げない。リリース済みの版でよければ 1-A を使う。リリース前のコミットでより強くしたい場合は、Windows 実機に .NET 10 SDK を入れ、信頼できるチェックアウトから Windows 上で直接 `dotnet publish` し、その場で `Get-FileHash -Algorithm SHA256` を取る（この場合 exe を共有経由で運ぶ必要もない）。インストーラーなどのスクリプトも、Windows のローカルにある信頼できるチェックアウトのものを使い、Mac の共有上のスクリプトを実行しないこと。
 
 Windows への exe の配置は、共有ができた後の**手順6**で行う。
 
@@ -232,27 +287,35 @@ smbutil statshares -m /Volumes/VRCRemoteTest
 
 ## 6. Bridge実行体の配置とTask Schedulerへの自動起動登録
 
-手順1で発行した exe を、マウント済みの共有の `_bridge-drop` へコピーする（macOS側）:
+**U の通常の PowerShell 7**（管理者権限は不要 — Bridge は対話ユーザーセッションで非 elevated 実行する設計、仕様書§20）から `install-bridge.ps1` を実行する。
+
+**手順1-A の場合**（共有も Mac も経由しない）。`$exe`、`$scripts` は手順1-A で設定したもの:
+
+```powershell
+& (Join-Path $scripts 'install-bridge.ps1') -ExpectedSha256 <手順1-Aで確認したハッシュ> -SourcePath $exe -StartNow
+```
+
+**手順1-B の場合**。Mac で発行した exe を、マウント済みの共有の `_bridge-drop` へコピーする（macOS側）:
 
 ```bash
 cp bridge/src/VRCRemoteTest.Bridge/bin/Release/net10.0/win-x64/publish/VRCRemoteTest.Bridge.exe \
   /Volumes/VRCRemoteTest/_bridge-drop/
 ```
 
-Windows 側で、**U の通常の PowerShell 7**（管理者権限は不要 — Bridge は対話ユーザーセッションで非 elevated 実行する設計、仕様書§20）から `scripts/install-bridge.ps1` を実行する。`-ExpectedSha256` には、手順1で控えたハッシュを**共有以外の経路で**持ってきて指定する:
+Windows 側で、Windows のローカルにある信頼できるチェックアウトの `scripts\install-bridge.ps1` を実行する。`-ExpectedSha256` には、手順1-B で控えたハッシュを**共有以外の経路で**持ってきて指定する:
 
 ```powershell
-.\scripts\install-bridge.ps1 -ExpectedSha256 <手順1の64桁のハッシュ> -SourcePath C:\VRCRemoteTest\_bridge-drop\VRCRemoteTest.Bridge.exe -StartNow
+.\scripts\install-bridge.ps1 -ExpectedSha256 <手順1-Bの64桁のハッシュ> -SourcePath C:\VRCRemoteTest\_bridge-drop\VRCRemoteTest.Bridge.exe -StartNow
 ```
 
 これにより:
 
 - 配置先（既定 `%LOCALAPPDATA%\Programs\VRCRemoteTest\Bridge\`）が `%LOCALAPPDATA%` の下にあり、U・SYSTEM・Administrators 以外が書き込めず、シンボリックリンクやジャンクションを含まないことを確認する。
-- 共有の exe をいったん配置先の中の候補ファイルにコピーし、**その候補の SHA-256** を照合してから、同じディレクトリ内の rename で実行体として配置する。照合後にコピー元を読み直すことはない。ハッシュが一致しなければ、配置済みの実行体とタスクは変更せずに中断する。
+- `-SourcePath` の exe をいったん配置先の中の候補ファイルにコピーし、**その候補の SHA-256** を照合してから、同じディレクトリ内の rename で実行体として配置する。照合後にコピー元を読み直すことはない。ハッシュが一致しなければ、配置済みの実行体とタスクは変更せずに中断する。
 - Windows Task Scheduler へ「At log on」トリガー・非 elevated でタスクが登録される。
 - `-StartNow` により登録直後に Bridge が起動する。
 
-配置が済んだら、共有の drop は消しておく:
+1-B の場合は、配置が済んだら共有の drop を消しておく:
 
 ```powershell
 Remove-Item C:\VRCRemoteTest\_bridge-drop\VRCRemoteTest.Bridge.exe
@@ -260,7 +323,7 @@ Remove-Item C:\VRCRemoteTest\_bridge-drop\VRCRemoteTest.Bridge.exe
 
 再実行しても安全（冪等）。配置済みの実行体が期待するハッシュと一致していれば、`-SourcePath` は読まずに置き換えを省略する。アンインストールする場合は `scripts/uninstall-bridge.ps1` を実行する。詳細は各スクリプトの `-?` ヘルプ、または `bridge/README.md` を参照。
 
-**Bridge を更新するとき**: インストーラーは稼働中の Bridge を自動では止めない。先に `Stop-ScheduledTask -TaskName 'VRCRemoteTestBridge'` で停止してから、新しい exe とハッシュで同じコマンドを実行する。
+**Bridge を更新するとき**: 新しい版で手順1（1-A なら新しい `$tag`）からやり直す。インストーラーは稼働中の Bridge を自動では止めないので、先に `Stop-ScheduledTask -TaskName 'VRCRemoteTestBridge'` で停止してから、新しい exe とハッシュで同じコマンドを実行する。
 
 **手動起動のみで運用したい場合**（自動起動を使わない場合）でも、実行体は上記のインストーラーで配置し、タスクを使わずに手順7の手動起動を使うこと。
 
@@ -280,13 +343,15 @@ Remove-Item C:\VRCRemoteTest\_bridge-drop\VRCRemoteTest.Bridge.exe
 
 ## 8. VRChatの起動（`--watch-worlds`付き）
 
-PowerShell 7（`pwsh`）で:
+U の PowerShell 7（`pwsh`）で、**Windows のローカルにあるスクリプト**を実行する。手順1-A の場合は `$scripts` のもの:
 
 ```powershell
-& "\\<Macのホスト名>\...\scripts\start-vrchat-dev.ps1" -Mode Desktop
+& (Join-Path $scripts 'start-vrchat-dev.ps1') -Mode Desktop
 ```
 
-またはリポジトリをWindows側にもコピーしてある場合はローカルパスから直接実行する。初回実行時、スクリプトファイルが「ブロック」されている場合は事前に以下を実行:
+手順1-B の場合は、Windows のローカルにある信頼できるチェックアウトの `scripts\start-vrchat-dev.ps1` を使う。**Mac の共有（`\\<Macのホスト名>\...`）上のスクリプトを直接実行しないこと。** Bridge の exe を検証していても、Mac が侵害されていれば、そのスクリプトで Windows 上の任意のコードを実行されてしまう。
+
+初回実行時、スクリプトファイルが「ブロック」されている場合は事前に以下を実行（手順1-A の手順では済んでいる）:
 
 ```powershell
 Unblock-File -Path .\start-vrchat-dev.ps1
@@ -464,7 +529,7 @@ Rename-Item -LiteralPath 'C:\VRCRemoteTest' -NewName ('VRCRemoteTest.old-' + (Ge
 ### 14-4. 新しい Bridge の配置と有効化（Mac → U）
 
 1. Mac で再マウントし、手順5の権限確認を行う。
-2. 手順1で発行した新しい exe を `_bridge-drop` にコピーし、U で手順6のインストーラーを実行する。**`-StartNow` は付けない**。タスクは無効のまま再登録される。
+2. 手順1（1-A 推奨、または 1-B）で新しい exe を用意し、U で手順6のインストーラーを実行する。**`-StartNow` は付けない**。タスクは無効のまま再登録される。
 3. 確認ができたら、タスクを有効化して起動する:
 
     ```powershell
@@ -511,7 +576,8 @@ Rename-Item -LiteralPath 'C:\VRCRemoteTest' -NewName ('VRCRemoteTest.old-' + (Ge
 | `.ps1`スクリプトの実行が"このシステムではスクリプトの実行が無効になっているため"のエラーで拒否される | 実行ポリシー、またはダウンロード/コピーされたファイルの「ブロック」属性 | `Unblock-File`を実行。それでも失敗する場合は`Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned` |
 | `start-vrchat-dev.ps1`が構文エラー等で動かない | Windows標準のPowerShell 5.1で実行している（スクリプトは7.0以降が必要） | `pwsh`（PowerShell 7）から実行する |
 | Bridgeが起動直後に`Configuration error`で終了する | `config.json`の`VrchatWorldsDirectory`が存在しない、またはパスが誤っている | VRChatを一度起動してWorldsディレクトリを生成させてから、正確なパスを`config.json`に設定する |
-| `install-bridge.ps1`が「SHA-256 が一致しません」で失敗する | コピー元の exe が手順1で発行したものと違う（差し替え・別ビルド・コピー途中） | 手順1をやり直してハッシュを取り直す。配置済みの実行体とタスクは変更されていない |
+| `install-bridge.ps1`が「SHA-256 が一致しません」で失敗する | コピー元の exe が、ハッシュを取ったものと違う（差し替え・別ビルド・コピー途中） | 1-A の場合: ダウンロードからやり直し、来歴の検証とハッシュの確認を通す。**拒否されたファイルから計算したハッシュを期待値に使ってはいけない。** 1-B の場合: 手順1-B をやり直す。どちらの場合も、配置済みの実行体とタスクは変更されていない |
+| `gh attestation verify` が失敗する | `gh` が古い（2.102.0 未満）、`gh auth login` をしていない、`$tag` と `$commit` が合っていない、またはファイルが Release のビルドと違う | `gh --version` と `gh auth status` を確認し、手順1-A をやり直す。それでも失敗するファイルはインストールしない |
 | `install-bridge.ps1`が「配置先に…書き込み権限があります」「%LOCALAPPDATA% の下に配置してください」で失敗する | `-ExePath` に、他のユーザーが書き込める場所やプロファイル外を指定している | `-ExePath` を省略して既定の配置先を使う |
 | `install-bridge.ps1`が「稼働中の Bridge…を先に停止してください」で失敗する | 置き換えには実行中の exe の停止が必要（自動停止はしない） | `Stop-ScheduledTask -TaskName 'VRCRemoteTestBridge'` で停止してから再実行する |
 | `install-bridge.ps1`登録後、ログオンしてもBridgeが起動していない | タスクが無効化されたまま、または`config.json`が無効 | `Get-ScheduledTask -TaskName 'VRCRemoteTestBridge'` の `State` を確認し、`Disabled` なら `Enable-ScheduledTask`。`Get-ScheduledTaskInfo -TaskName 'VRCRemoteTestBridge' -TaskPath '\' \| Select-Object LastRunTime, LastTaskResult`で終了コードを確認し、`%LOCALAPPDATA%\VRCRemoteTest\logs\bridge-*.log`の最新ログを確認する |

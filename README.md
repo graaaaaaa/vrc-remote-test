@@ -25,6 +25,8 @@ https://raw.githubusercontent.com/graaaaaaa/vrc-remote-test/main/index.json
 
 追加後、`VRC Remote Test`パッケージがVCC/ALCOMのパッケージ一覧に表示されます。Windows側の初期セットアップ（Bridgeの配置、SMB共有、VRChat起動設定）は [`docs/setup-windows.md`](./docs/setup-windows.md) を参照してください。
 
+Windows Bridge の実行体（`VRCRemoteTest.Bridge.exe`）は、[Releases](https://github.com/graaaaaaa/vrc-remote-test/releases) に GitHub Actions でビルドされたものが、SHA-256 とビルドの来歴（artifact attestation）付きで添付されています。Windows 上で直接ダウンロードし、来歴を確認してからインストールしてください（[`docs/setup-windows.md`](./docs/setup-windows.md) の手順1-A）。
+
 ## 使い方
 
 セットアップ完了後、Unity上で `VRChat SDK > VRC Remote Test` からウィンドウを開きます。

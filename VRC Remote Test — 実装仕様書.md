@@ -1580,6 +1580,8 @@ Bridge が信頼する状態（processing・archive・failed）は共有外の `
 
 `install-bridge.ps1` は `-ExpectedSha256` を必須とし、配置先の中に作った候補ファイルのハッシュを照合してから実行体を置き換える。期待するハッシュは共有以外の経路で用意する。配置先は `%LOCALAPPDATA%` の下で、本人・SYSTEM・Administrators 以外が書き込めない場所に限る。
 
+リリース済みの版の実行体とハッシュの出所は、GitHub Actions がタグ付きコミットからビルドし、ビルドの来歴（artifact attestation）を署名して Release に添付したものとする。Windows 上で直接ダウンロードし、ワークフロー・タグ・コミット・GitHub ホストのランナーを指定した `gh attestation verify` を通してからインストールする。これは Mac や共有での差し替えを防ぐが、GitHub アカウントやリポジトリの侵害、依存パッケージの侵害までは防がない。
+
 ### Secrets
 
 password/tokenをGit repositoryへ保存しない。
