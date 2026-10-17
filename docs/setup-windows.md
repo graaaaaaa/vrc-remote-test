@@ -311,7 +311,7 @@ Windows 側で、Windows のローカルにある信頼できるチェックア�
 これにより:
 
 - 配置先（既定 `%LOCALAPPDATA%\Programs\VRCRemoteTest\Bridge\`）が `%LOCALAPPDATA%` の下にあり、U・SYSTEM・Administrators 以外が書き込めず、シンボリックリンクやジャンクションを含まないことを確認する。
-- `-SourcePath` の exe をいったん配置先の中の候補ファイルにコピーし、**その候補の SHA-256** を照合してから、同じディレクトリ内の rename で実行体として配置する。照合後にコピー元を読み直すことはない。ハッシュが一致しなければ、配置済みの実行体とタスクは変更せずに中断する。
+- `-SourcePath` の exe をいったん配置先の中の候補ファイルにコピーし、**その候補の SHA-256** を照合してから、同じディレクトリ内の rename で実行体として配置する。照合後にコピー元を読み直すことはない。ハッシュが一致しなければ、配置済みの実行体とタスクは変更せずに中断する。Bridge を止めた直後などで rename が一時的に拒否された（アクセス拒否・共有違反）ときは、照合済みの同じ候補で 0.5 秒おきに最大10回まで入れ直し、何回目で配置できたかを表示する（10回とも拒否されれば、何も変えずに中断する）。
 - Windows Task Scheduler へ「At log on」トリガー・非 elevated でタスクが登録される。
 - `-StartNow` により登録直後に Bridge が起動する。
 
@@ -724,6 +724,7 @@ Rename-Item -LiteralPath 'C:\VRCRemoteTest' -NewName ('VRCRemoteTest.old-' + (Ge
 | `gh attestation verify` が失敗する | `gh` が古い（2.102.0 未満）、`gh auth login` をしていない、`$tag` と `$commit` が合っていない、またはファイルが Release のビルドと違う | `gh --version` と `gh auth status` を確認し、手順1-A をやり直す。それでも失敗するファイルはインストールしない |
 | `install-bridge.ps1`が「配置先に…書き込み権限があります」「%LOCALAPPDATA% の下に配置してください」で失敗する | `-ExePath` に、他のユーザーが書き込める場所やプロファイル外を指定している | `-ExePath` を省略して既定の配置先を使う |
 | `install-bridge.ps1`が「稼働中の Bridge…を先に停止してください」で失敗する | 置き換えには実行中の exe の停止が必要（自動停止はしない） | `Stop-ScheduledTask -TaskName 'VRCRemoteTestBridge'` で停止してから再実行する |
+| `install-bridge.ps1`が「実行体の置き換えが 10 回とも拒否されました」で失敗する | 照合のあとに Bridge がまた起動した、または Windows やウイルス対策ソフトが exe をまだ開いている（手順6の入れ直しの合計 4.5 秒を過ぎても） | `Get-Process -Name VRCRemoteTest.Bridge` で止まっていることを確かめ、動いていれば `Stop-ScheduledTask -TaskName 'VRCRemoteTestBridge'` で止めてから、少し待って再実行する。配置済みの実行体とタスクは変更されていない |
 | `install-bridge.ps1`登録後、ログオンしてもBridgeが起動していない | タスクが無効化されたまま、または`config.json`が無効 | `Get-ScheduledTask -TaskName 'VRCRemoteTestBridge'` の `State` を確認し、`Disabled` なら `Enable-ScheduledTask`。`Get-ScheduledTaskInfo -TaskName 'VRCRemoteTestBridge' -TaskPath '\' \| Select-Object LastRunTime, LastTaskResult`で終了コードを確認し、`%LOCALAPPDATA%\VRCRemoteTest\logs\bridge-*.log`の最新ログを確認する |
 | `install-bridge.ps1`が「本スクリプトが管理するタスクとは判別できません」で失敗する | 同名の無関係なタスクが既に存在する | `Get-ScheduledTask -TaskName 'VRCRemoteTestBridge' -TaskPath '\'`で内容を確認し、無関係であれば`-TaskName`で別名を指定するか、手動で削除してから再実行する |
 | Bridge が `Another VRC Remote Test Bridge is already running` と出して終了する（このメッセージは `logs\bridge-<日付>_001.log` など、末尾に番号の付いた別名のログファイルにある） | 別の Bridge がすでに動いている（手動で起動したものと Task Scheduler のものが重なった、など） | `Get-Process VRCRemoteTest.Bridge` で確認し、1つだけにする。動いている Bridge が無いのにこのメッセージが出るなら、`%LOCALAPPDATA%\VRCRemoteTest\state\bridge.lock` を開いているプロセスを確かめる |
