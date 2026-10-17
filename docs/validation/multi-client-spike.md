@@ -653,6 +653,8 @@ S4 の準備: `state\managed-clients.json` に、前の節の Unity の確認（
    - 01:17:39.508 に、結果ファイルを `{"status":"failed","errorCode":"MANIFEST_INVALID","errorMessage":"Manifest could not be parsed."}` で上書きした
 
    正しい manifest（274 バイト）は `state\archive` にあり、配置したワールドと起動し直した2台はそのまま。Unity は先に `deployed` を読んで `[Succeeded]` を出していたので、Unity では気づけない。今日の `ready.json` で空のものはこの1件だけ。Unity のパッケージは `<buildId>.ready.json.part` に書いて1回 rename するだけで、そのあと同じ名前には触らない。なので Mac は、macOS の SMB クライアントがファイルを閉じるのを遅らせていて、Bridge が取り込んで消したあとに空のファイルを作り直した、と見ている。v0.5.0 で変わった部分ではないので、別に調べる。Bridge の側にも、すでに `archive` にある buildId の manifest を受け取ると結果ファイルを上書きする、という点がある。この結果ファイルと空のファイルは調べるために残してある。
+
+   追記（2026-10-18）: 調べた結果と Bridge の修正は `smb-late-empty-manifest.md`。Mac の SMB クライアントが拡張属性を名前付きストリームとして書き、Bridge が消したあとならファイルごと作り直す、という見立て（close を遅らせる仕組みは rename の前に閉じるので関わらない）。また、この節の「manifest が届いた」は、Bridge が manifest を新しいファイルにコピーするので、`state` の写しの時刻、つまり Bridge が取り込んだ時刻とみられる（同じ文書の「時刻の注」）。空のファイルが現れたのは 01:17:29.9〜39.49 のどこかで、39.493 は Bridge が拾った時刻。
 2. Unity の VRChat SDK のメニューから送ったビルドは、VRC Remote Test ウィンドウの Last Deployment に反映されず、エラーの案内文（ErrorGuidance）も出ない（どちらもウィンドウのボタンから送ったときだけ）。結果は Unity のコンソールで見た。
 3. `VRCHAT_UNMANAGED_RUNNING` の案内文（v0.4.0 で足したもの）は「Bridge が確かめられない VRChat」の書き方で、Relaunch で「Bridge が起動していない VRChat」が動いている場合とは少しずれる。すべきこと（その VRChat を手で閉じて送り直す）は同じなので、困りはしない。
 4. 記録が空のコールドスタート（S1、S3 の1回目、S4 の1回目）では、1台目の起動の 0.33・0.11・0.14 秒後に写しが `has not created ...` になった。前のセッションのログが写しに残ったのはその間だけ。
