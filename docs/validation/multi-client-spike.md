@@ -444,6 +444,51 @@ Mac の Unity（Vrc-remote-test プロジェクト、パッケージ v0.3.0）�
 | 1. `-Clients 2`（`--watch-worlds` 付き、`--url` なし、3秒間隔） | 1台目 PID 25568（19:25:30.244）、2台目 PID 29292（19:25:33.271）。19:25:35.700 に `Showing ...output_log_2026-10-17_19-25-30.txt as the log of VRChat client 25568.` | Preflight は「VRChat: Running」（緑）。Log Viewer に 19:25:55 の `[AssetBundleDownloadManager] [100] Unpacking World (local:error_7484453976886834)` が出た | 合格。2台は `--url` が無いので別々の Error World に入り、1台目のログは `local:error_7484453976886834`、2台目のログは `local:error_2111340501460972` だった。Log Viewer は1台目のログを表示していた |
 | 2. `-Clients 2 -LaunchIntervalSeconds 0`（13ms 差） | 1台目 PID 13976（19:27:03.460）、2台目 PID 2300（19:27:03.473）。ログは `19-27-03` と `19-27-04` の2つ。19:27:16.744（1台目の起動から 13.3 秒後）に `VRChat log not published: Could not match an output_log_*.txt file to the first VRChat client (PID 13976, ...)` | Log Viewer に同じ診断の1行が出た | 合格。それまでの約13秒は、手順1の1台目（閉じた台）のログが共有の写しに残っていた（上の「`a9292a1` の再確認」で書いた件） |
 
+### PR #3 の実機確認（2026-10-17 19:49〜20:09）
+
+PR #1〜#3 を main にマージしたあと（#1 `687a8b0`、#2 `77f746a`、#3 `d8b57c0`）、main の `d8b57c0` を Windows で確かめた。PR #3 は「1台目の output_log ができるまで Log Viewer に前のセッションのログを残さない」（`8b3ab2d`）と「コールドスタートで、前の台の output_log ができてから次の台を起動する（合計60秒まで）」（`43bc8eb`）。
+
+**準備**: Windows の `dotnet test` は 325 件中 322 件成功（落ちたのはシンボリックリンクの3件だけ）。手順1-B と同じ `dotnet publish` で作った exe（SHA-256 `01A2D8BA631D5EE576557E076692DFEB8A5EA5E525CE9576ECA39B0213396182`）を `install-bridge.ps1` で入れ替えた（それまでの `50ad181` の exe は `%LOCALAPPDATA%\VRCRemoteTest\pr2-test-backup-20261017-175136\VRCRemoteTest.Bridge.50ad181.exe` に退避）。`config.json` は `AutoLaunchVrchat: true`、`VrchatClientCount: 4`、settle 30 秒、timeout 60 秒。Logging は「完全」。ビルドは PR #2 の確認と同じ模擬のアップロードで送った。写し（`C:\VRCRemoteTest\logs\vrchat-latest.log`）は1秒ごとに読み、どのログのものかを、写しの最後の時刻付きの行を含むファイルで判定した。
+
+負荷は2通りかけた。「Start-Job」は `Start-Job { while ($true) {} }` を論理 CPU の数（16）だけ、「pwsh ループ」は PR #2 の項目12と同じく `pwsh` で浮動小数点の計算を回すプロセスを16個。どちらも CPU 使用率は約100%。
+
+#### 結果
+
+| 確認 | 結果 | 記録 |
+|------|------|------|
+| A. 負荷なし・4台 | 合格 | `Launched` の間隔は 3.00 / 3.01 / 3.02 秒。`New output_log` が3行で、それぞれ起動の 0.8 / 0.7 / 0.8 秒後。`Waiting for` は出ない。写しは、1台目の起動の 0.2 秒後（19:50:45.851）に `The first VRChat client (PID 9960, ...) has not created its output_log_*.txt file yet. ...` の1行に置き換わり（それまでは起動前に書かれた前のセッションのログ）、5.2 秒後に `Showing ...output_log_2026-10-17_19-50-46.txt as the log of VRChat client 9960`。送信から `deployed` まで 12.2 秒（4台を起動し終えるまでの約9秒を含む。PR #2 項目1の2台では 7.4 秒）。4つのログは別々で、各ファイルの `User Authenticated` と `Arg: --watch-worlds` は1件ずつ。4台とも `local:dab8e4…:1`、`OnPlayerJoined` は4件ずつ |
+| B. 負荷あり・4台（Start-Job で3回、pwsh ループで1回） | 4回とも1台目のログが60秒以内にできず、C の動きになった | 下の表。前の台のログを待ってから次を起動する流れ（`Waiting for` → `New output_log` → `Launched`）は、ログが60秒以内にできる負荷を作れず、確かめられなかった。Start-Job を8個（CPU 約93%）にすると、ログは 0.8〜1.0 秒でできて A と同じになった（B4）。送信から `deployed` までは 84〜96 秒（120 秒以内） |
+| C. 60秒の上限 | 合格 | B の4回とも、`Waiting for VRChat client 1/4 to create its output_log file before launching the next client (up to 50〜56s more)` のあと、`[WRN] VRChat client 1/4 has not created an output_log file within 60s of the first launch; launching the remaining clients 3s apart. ...` が1回だけ出て、残りの3台が起動した（負荷で `Start-Process` が遅く、間隔は 3.1〜7.5 秒）。写しは `has not created ... yet` から `Could not match ...` に変わり、混ざったログや別の台のログを1台目のものとして出すことは一度もなかった（`Showing` は出なかった） |
+| D. 負荷を止めてから1台目を閉じる | 合格 | B4 の4台（ログは別々）で、1台目（PID 11300）を閉じた3秒後に `Showing ...output_log_2026-10-17_20-03-31.txt as the log of VRChat client 8728`（2台目）。閉じた台のログも混ざったログも出なかった |
+| E. 負荷ありで次のビルドを送る | 合格 | B4 の状態（Start-Job 8個）で、最後の台の起動から 30.4 秒後に送った。5.5 秒で配置し、4台ともそろって `local:ce318f…:1` へリロードした（`OnPlayerJoined` 4件ずつ）。準備待ち（settle）が効く送り方にはならなかった |
+| F. `start-vrchat-dev.ps1 -Clients 4` を負荷ありで | 未実施 | 任意の項目 |
+| G. どの PID がどのログを開いているか | 下の「G」 | リソースモニターは管理者権限で動くため使わず、非昇格の PowerShell から Restart Manager（`RmGetList`）で調べた |
+
+B の各回（ログの作成時刻は `CreationTime`、ファイルを開いている PID は Restart Manager の結果）:
+
+| 回 | 負荷 | 1台目の起動 → ログの作成 | 2〜4台目のログ | 写しに前のセッションのログが残った時間（起動から） | `deployed` |
+|------|------|------|------|------|------|
+| B1 | Start-Job 16 | 19:52:25.844 → `19-53-40`（作成は 19:54:13.848。名前と作成の差が 33 秒） | 別々（`19-54-27`・`19-54-36`・`19-54-38`、それぞれ PID 1つ） | 約15秒（19:52:41 まで） | 86.9 秒 |
+| B2 | Start-Job 16 | 19:55:31.245 → `19-56-26`（19:56:48.317） | **3台で1ファイル**（`19-57-33` を PID 14080・21416・26276 が開いていた） | 約10秒（19:55:41 まで） | 84.2 秒 |
+| B3 | Start-Job 16 | 19:59:36.402 → `20-00-48`（20:01:19.098） | 2台目は `20-01-33`、**3台目と4台目で1ファイル**（`20-01-41` を PID 18644・18068） | 約17秒（19:59:53 まで） | 96.3 秒 |
+| B5 | pwsh ループ 16 | 20:06:07.829 → `20-08-05`（20:08:06.530、負荷が終わるころ） | **3台で1ファイル**（`20-08-06` を PID 24340・26920・4208） | 約12秒（20:06:19 まで） | 93.0 秒 |
+
+どの回も、4台の行き先はすべて `local:dab8e4…:1` だった。
+
+- 今日のこのマシンでは、CPU 使用率が約100%だと、1台目のログの作成は起動から 60 秒を超えた（4回中4回、最長で約2分）。PR #2 の項目12（同じ pwsh ループで 11〜22 秒）より重い。60 秒の上限のあとは、残りの台のログが混ざることが多かった（4回中3回）。
+- 負荷が高いと、写しの更新（5秒ごと）も間があき（例: 19:52:16 の次が 19:52:41）、コールドスタートのあと 10〜17 秒は、起動前に書かれた前のセッションのログが写しに残っていた。Bridge が起動後に前のセッションのログを書いたのではない。負荷なしでは、起動の 0.2 秒後に置き換わった。
+- 負荷が高いと、送信から結果まで 84〜96 秒かかった。Unity の Result Timeout が 60 秒のままだと RESULT_TIMEOUT になる。
+
+#### G: ログを開いている PID（Restart Manager）
+
+- 負荷なしの4台（A）では、4つのログをそれぞれ1つの VRChat が開いたままにしていて、`RmGetList` は起動順どおりの PID を1つずつ返した（`19-50-46` → 9960、`19-50-49` → 22156、`19-50-52` → 14800、`19-50-55` → 25348）。閉じたセッションのログ（`19-27-03`）を開いているプロセスは無かった。
+- 混ざったファイルは、複数の PID が開いていた（B2・B5 は3つ、B3 は2つ）。
+- B の4回とも、1台目は自分だけのファイルを持っていた（PID 1つ）。名前の時刻で対応付けられなかった（B1 は名前と作成の差が 33 秒、ほかは名前が1台目の範囲の外）回でも、Restart Manager なら1台目のログを特定できた。PID とログを直接結ぶ改善の材料になる。
+
+#### PR #1 の確認（あとで見ること）
+
+main のビルドを入れてから 20:09 まで、Bridge のログに `held open … replacing it with POSIX semantics` は出なかった。`[ERR]` と `Failed to query VRChat command lines via WMI` も0件。
+
 ---
 
 ## Go/No-Go 判定テーブル
