@@ -126,7 +126,8 @@ public class RestartManagerFileOwnersTests : IDisposable
         var reader = new VrchatLogReader(
             Options.Create(new BridgeOptions { VrchatWorldsDirectory = worldsDir }),
             monitor,
-            NullLogger<VrchatLogReader>.Instance);
+            NullLogger<VrchatLogReader>.Instance,
+            new FakeManagedClientStore());
 
         using (HoldOpen(path))
         {

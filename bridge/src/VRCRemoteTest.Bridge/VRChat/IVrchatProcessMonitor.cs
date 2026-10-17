@@ -19,4 +19,10 @@ public interface IVrchatProcessMonitor
     /// shape Unity already reads. Throws when the process list cannot be read.
     /// </summary>
     VrchatStatus GetStatus();
+
+    /// <summary>
+    /// Relaunch mode: enumerates once and opens a handle to every same-session VRChat,
+    /// without asking WMI. Never throws; the caller disposes the snapshot.
+    /// </summary>
+    VrchatProcessHandleSnapshot OpenClients();
 }

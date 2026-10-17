@@ -84,10 +84,19 @@ try
     builder.Services.AddHostedService<VrchatMonitorService>();
 
     // Phase 4.1 / multi-client: reuses IVrchatProcessMonitor above; only invoked by StagingWatcher when AutoLaunchVrchat is true.
+    // VrchatClientMode picks the flow: Reload (same account, --watch-worlds) or Relaunch
+    // (separate accounts, the Bridge closes and relaunches the clients it recorded).
     builder.Services.AddSingleton<IVrchatLauncher, VrchatLauncher>();
-    builder.Services.AddSingleton<IVrchatClientCoordinator, VrchatClientCoordinator>();
+    builder.Services.AddSingleton<IManagedClientStore, ManagedClientStore>();
+    builder.Services.AddSingleton<VrchatClientCoordinator>();
+    builder.Services.AddSingleton<VrchatRelaunchCoordinator>();
+    builder.Services.AddSingleton<IVrchatClientCoordinator>(sp =>
+        sp.GetRequiredService<IOptions<BridgeOptions>>().Value.IsRelaunchMode
+            ? sp.GetRequiredService<VrchatRelaunchCoordinator>()
+            : sp.GetRequiredService<VrchatClientCoordinator>());
 
-    // Phase 5: snapshot reader (kept on the first VRChat client's log) + its own polling BackgroundService.
+    // Phase 5: snapshot reader (kept on the first VRChat client's log; in Relaunch mode the
+    // first one the record lists) + its own polling BackgroundService.
     builder.Services.AddSingleton<IVrchatLogReader, VrchatLogReader>();
     builder.Services.AddHostedService<VrchatLogService>();
 

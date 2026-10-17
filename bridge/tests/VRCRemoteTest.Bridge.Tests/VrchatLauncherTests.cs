@@ -44,9 +44,41 @@ public class VrchatLauncherTests
     }
 
     [Fact]
-    public void Never_passes_a_profile()
+    public void Never_passes_a_profile_without_one()
     {
         VrchatLauncher.BuildArguments(Request()).Should().NotContain(a => a.StartsWith("--profile", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void A_relaunch_client_gets_its_profile_last_and_no_watch_worlds()
+    {
+        var arguments = VrchatLauncher.BuildArguments(Request() with { WatchWorlds = false, Profile = 7 });
+
+        arguments.Should().Equal(
+            "--url=create?roomId=0123456789&hidden=true&name=BuildAndRun&url=file:///C%3A%5CWorlds%5Cvrc-remote-b1.vrcw",
+            "--no-vr",
+            "--enable-debug-gui",
+            "--enable-sdk-log-levels",
+            "--enable-udon-debug-logging",
+            "--profile=7");
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(99)]
+    public void Accepts_profiles_from_0_to_99(int profile)
+    {
+        VrchatLauncher.BuildArguments(Request() with { Profile = profile }).Should().Contain($"--profile={profile}");
+    }
+
+    [Theory]
+    [InlineData(-1)]
+    [InlineData(100)]
+    public void Rejects_a_profile_outside_0_to_99(int profile)
+    {
+        var act = () => VrchatLauncher.BuildArguments(Request() with { Profile = profile });
+
+        act.Should().Throw<ArgumentException>();
     }
 
     [Theory]

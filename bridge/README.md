@@ -32,6 +32,13 @@ Bridgeは「フルオーケストレーションサービス」ではなく「�
   - **コールドスタート**（同じセッションの VRChat が1台も無い）: 先に`.vrcw`を Worlds へ配置し、archive（処理済みの記録）の成功を確かめてから、配置したファイルを`--url`に渡して`VrchatClientCount`台（1〜4、省略時1）を3秒以上の間隔で起動し、結果を書く。2台目以降は、前の台の`output_log`ができてから起動する（待つのは合わせて60秒まで）。`--url`で起動した台はそのワールドに直接入るので、起動の準備は待たない。全台が同じアカウント（`--profile`なし）で、同じインスタンスに入る。VR モードでは HMD を使うのは1台目だけ
   - **起動済みの台への配置**（`--watch-worlds`付きが1台以上）: 全台について、（PID、作成時刻）の集合が2回続けて同じで、全台が作成時刻から`VrchatStartupSettleDelaySeconds`以上たつのを待ってから配置する。全台がリロードする。台数が足りなくても足さない（足した台は別のインスタンスに入るため）。台数の違いや`--watch-worlds`無しの台が混ざっていることは、変わったときに1度だけログで警告する
   - 既に`--watch-worlds`無しだけで起動中のVRChatは勝手に再起動しない（`VRCHAT_WATCH_WORLDS_MISSING`）。状態を確かめられない VRChat（一覧が取れない、セッションを読めない）があれば何も起動せず`VRCHAT_UNMANAGED_RUNNING`
+  - 以上は `VrchatClientMode: Reload`（既定）の流れ。別アカウントの台を使う `Relaunch` は次の項目
+- **別アカウントの台の起動し直し（`VrchatClientMode: Relaunch`、明示的な opt-in）**: 別アカウントの台は `--watch-worlds` のリロードでアカウントごとに別のインスタンスへ分かれる（VRChat の不具合）ので、配置のたびに Bridge が起動した台を終了させ、配置してから `VrchatProfiles` の profile ごとに `--url` と `--profile=<n>` で起動し直す（`--watch-worlds` は付けない）。流れは`VrchatRelaunchCoordinator`のコメントのとおり
+  - 起動した台は1台ごとに`state\managed-clients.json`へ記録する（PID、作成時刻を100ナノ秒の精度の UTC 文字列で、セッション、profile、起動の順番）。一時ファイルに書いて`Flush(true)`してから置き換える。書けなければ次の台を起動しない
+  - 終了させるのは、PID・作成時刻・セッション・名前`VRChat`がすべて記録と一致する台だけ。照合の前にプロセスのハンドル（終了・待機・情報の読み取りの権限だけ）を開き、照合から`CloseMainWindow`・強制終了・終了の確認まで同じハンドルで行う（ハンドルを開いている間、Windows は PID を使い回さない）。名前やログで代用しない
+  - 終了のさせ方: 全台に`CloseMainWindow`を送り、ウィンドウがまだ無い台には0.5秒ごとに送り直す。全体で10秒たって残っている台だけを強制終了し、最初から20秒までに全台の終了を確かめる。確かめられない台があれば配置せず`VRCHAT_START_FAILED`。例外が出たときは同じハンドルで終了済みかを確かめる。停止要求が来たらそれ以上強制終了せず、配置もしない
+  - 管理下でない VRChat（手で起動した台、記録の無い台、状態を確かめられない台）があれば、何も終了させずに`VRCHAT_UNMANAGED_RUNNING`。終了のあとと、2台目以降の起動の前にも調べ直す。記録が壊れていればどの台も管理下とみなさず、読めなければ何もせず`UNKNOWN_ERROR`
+  - 準備待ち（`VrchatStartupSettleDelaySeconds`）は使わない。Log Viewer の1台目は、記録の中で最も早く起動した、まだ動いている台
   - 数える VRChat は Bridge と同じ対話セッションのものだけで、`--watch-worlds`はコマンドラインを引数に分けて完全一致で判定する（`VrchatProcessMonitor`）。コマンドラインは観測ごとに1回の WMI の問い合わせでまとめて読み、行の作成時刻をプロセスの起動時刻と照合する。WMI が答えない・時間内に返らない台は「確かめられない台」として扱う
 - **VRChatログ配信（`VrchatLogService`）**: 5秒間隔で`output_log_*.txt`の末尾を再読み込みし、直近200行を`logs/vrchat-latest.log`へ書き出す。VRChat が動いている間は、最新のファイルではなく1台目（`--watch-worlds`付きで作成時刻が最も古い台）のファイルを使い、その台が終了するかファイルが消えるまで使い続ける。どのファイルかは、まず Windows の Restart Manager で各ファイルを開いているプロセスを調べ、VRChat のうち1台目（PID と作成時刻が一致）だけが開いているファイルに決める（`VrchatLogOwners`、P/Invoke は `RestartManagerFileOwners`）。決まらなければ、ファイル名の時刻と作成時刻で対応付ける（`VrchatLogMatcher`）。ほかの VRChat も開いている（混ざった）ファイルは使わない。対応付けられなければ、ログの代わりに診断の1行を書く。VRChat がログファイルを作るのは、負荷が無いときは起動の約0.8秒後、CPU の負荷が高いと20秒〜2分ほど後になる（実測）ので、Bridge が起動する台は前の台のファイルができてから起動し、ファイルどうしが混ざらないようにしている。VRChat が動いていないときだけ最新のファイルを使う。Unity側Log Viewer（表示専用）のためのもので、readiness判定には一切使用しない
 - **二重起動の防止**: 起動時に`%LOCALAPPDATA%\VRCRemoteTest\state\bridge.lock`を`FileShare.None`で開き、終了まで持ち続ける。開けなければ起動を拒否する（Task Scheduler の設定だけに頼らない）。ロックは Windows アカウントごとなので、共有と Worlds は Bridge 用のアカウント1つで使う
@@ -71,6 +78,7 @@ dotnet publish src/VRCRemoteTest.Bridge/VRCRemoteTest.Bridge.csproj -c Release -
     "VrchatExecutable": "C:\\Program Files (x86)\\Steam\\steamapps\\common\\VRChat\\VRChat.exe",
     "VrchatMode": "Desktop",
     "AutoLaunchVrchat": false,
+    "VrchatClientMode": "Reload",
     "VrchatClientCount": 1,
     "VrchatStartupTimeoutSeconds": 60,
     "VrchatStartupSettleDelaySeconds": 30
@@ -78,7 +86,15 @@ dotnet publish src/VRCRemoteTest.Bridge/VRCRemoteTest.Bridge.csproj -c Release -
 }
 ```
 
-`VrchatWorldsDirectory`が実在しない場合、Bridgeは起動を拒否します（勝手に別の場所を推測しません）。状態ディレクトリは `%LOCALAPPDATA%\VRCRemoteTest\state` に固定で、config.json では変更できません（`StagingDirectory` と重なる設定は起動時に拒否します）。`VrchatExecutable`/`VrchatMode`/`AutoLaunchVrchat`/`VrchatClientCount`/`VrchatStartupTimeoutSeconds`/`VrchatStartupSettleDelaySeconds`はVRChat自動起動用の設定で、`VrchatClientCount`は省略時1、指定するなら1〜4（`AutoLaunchVrchat: false`でも範囲は検証する）。`AutoLaunchVrchat: true`の場合のみ`VrchatExecutable`が検証される（絶対パス・非UNC・`.exe`拡張子・ファイル名が`VRChat.exe`と完全一致・実在、の全てを満たす必要がある）。
+別アカウントの台を使う（`Relaunch`）ときは、`VrchatClientCount` を消して次のようにする（`VrchatStartupTimeoutSeconds`・`VrchatStartupSettleDelaySeconds` は使われない）:
+
+```json
+    "AutoLaunchVrchat": true,
+    "VrchatClientMode": "Relaunch",
+    "VrchatProfiles": [0, 1]
+```
+
+`VrchatWorldsDirectory`が実在しない場合、Bridgeは起動を拒否します（勝手に別の場所を推測しません）。状態ディレクトリは `%LOCALAPPDATA%\VRCRemoteTest\state` に固定で、config.json では変更できません（`StagingDirectory` と重なる設定は起動時に拒否します）。`VrchatExecutable`/`VrchatMode`/`AutoLaunchVrchat`/`VrchatClientCount`/`VrchatStartupTimeoutSeconds`/`VrchatStartupSettleDelaySeconds`はVRChat自動起動用の設定で、`VrchatClientCount`は省略時1、指定するなら1〜4（`AutoLaunchVrchat: false`でも範囲は検証する）。`VrchatClientMode`は`Reload`（既定、同じアカウント）か`Relaunch`（別アカウント、大文字小文字は不問）。`Relaunch`では`AutoLaunchVrchat: true`と`VrchatProfiles`（1〜4件、0〜99、重複なし）が必須で、`VrchatClientCount`を書くとエラー。`Reload`で`VrchatProfiles`を書いてもエラー。準備待ちの設定どうしの検証（下の settle と timeout）は`Reload`のときだけ行う。`AutoLaunchVrchat: true`の場合のみ`VrchatExecutable`が検証される（絶対パス・非UNC・`.exe`拡張子・ファイル名が`VRChat.exe`と完全一致・実在、の全てを満たす必要がある）。
 
 `VrchatStartupSettleDelaySeconds`（デフォルト30秒）は、起動済みの台へ配置する前に、各台のプロセス起動から待つ最低時間（実際にWorldsディレクトリの監視が有効になる、と推定されるまで）。コールドスタートでは使わない。WMIでの`--watch-worlds`引数検出はプロセス起動直後にほぼ即座に可能になるが、それは「VRChatが実際にファイル配置を検知できる状態」を意味しない（VRChatがホーム画面に到達するまで体感15〜30秒程度）。マシンやVRChatのバージョンによって実際の起動時間は変動するため、必要に応じて値を調整すること。`VrchatStartupTimeoutSeconds`は`VrchatStartupSettleDelaySeconds + 30秒`未満に設定できない。
 
@@ -96,6 +112,7 @@ SMB 共有（`StagingDirectory`）と、Bridge 専用の状態ディレクトリ
 
 %LOCALAPPDATA%\VRCRemoteTest\state/   — Bridge 専用（共有しない）
 ├── bridge.lock   — 二重起動の防止用。Bridge が動いている間、開いたままにする
+├── managed-clients.json — Relaunch で Bridge が起動した VRChat の記録。.tmp は書き込み途中のもの（次の書き込みで上書きされる）
 ├── processing/   — claim 済みの manifest と artifact の private コピー。.part は書き込み途中で、起動時に削除される
 ├── archive/      — 処理完了した manifest（冪等性判定に使用）。artifact は Worlds にあるので残さない
 └── failed/       — 検証失敗・quarantine。artifact は新しいものから RetainBuilds 件だけ残す

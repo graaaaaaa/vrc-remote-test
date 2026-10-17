@@ -593,7 +593,8 @@ public sealed class StagingWatcher : BackgroundService, IBridgeWatcher
         }
         else
         {
-            _resultWriter.WriteFailure(manifest.BuildId, ErrorCode.VrchatStartFailed, outcome.ErrorMessage!, ResultsDir);
+            _resultWriter.WriteFailure(
+                manifest.BuildId, outcome.ErrorCode ?? ErrorCode.VrchatStartFailed, outcome.ErrorMessage!, ResultsDir);
         }
 
         _cleanupService.Cleanup(_options.VrchatWorldsDirectory, _options.RetainBuilds, deployedFileName);

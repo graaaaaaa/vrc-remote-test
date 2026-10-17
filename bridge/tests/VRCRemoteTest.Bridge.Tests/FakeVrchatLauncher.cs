@@ -18,6 +18,12 @@ internal sealed class FakeVrchatLauncher : IVrchatLauncher
     /// <summary>Source of the creation time reported for each started process.</summary>
     public Func<DateTime> Clock { get; set; } = () => DateTime.UtcNow;
 
+    /// <summary>The session reported for each started process; null as if it could not be read.</summary>
+    public int? SessionId { get; set; } = 1;
+
+    /// <summary>When true, started processes report no creation time, as if it could not be read.</summary>
+    public bool ReportsNoCreationTime { get; set; }
+
     /// <summary>The processes that started, in launch order.</summary>
     public List<(int ProcessId, DateTime CreationTimeUtc)> Launched { get; } = [];
 
@@ -49,6 +55,7 @@ internal sealed class FakeVrchatLauncher : IVrchatLauncher
         var creationTimeUtc = Clock();
         Launched.Add((processId, creationTimeUtc));
         OnLaunch?.Invoke(processId);
-        return Task.FromResult(LaunchResult.Success(processId, creationTimeUtc));
+        return Task.FromResult(
+            LaunchResult.Success(processId, ReportsNoCreationTime ? null : creationTimeUtc, SessionId));
     }
 }

@@ -13,6 +13,18 @@ public sealed class BridgeOptions
     /// <summary>The largest client count verified on real hardware (docs/validation/multi-client-spike.md, case 7).</summary>
     public const int MaxVrchatClientCount = 4;
 
+    /// <summary>Same-account clients that reload every deploy through --watch-worlds (multi-client plan, option B).</summary>
+    public const string ReloadClientMode = "Reload";
+
+    /// <summary>
+    /// Clients on separate profiles (accounts) that the Bridge closes and relaunches with
+    /// --url on every deploy (multi-client plan, option C, sections 12 and 13.3).
+    /// </summary>
+    public const string RelaunchClientMode = "Relaunch";
+
+    /// <summary>VRChat's --profile accepts 0-99, as scripts/start-vrchat-dev.ps1 does.</summary>
+    public const int MaxVrchatProfile = 99;
+
     /// <summary>
     /// Root of the SMB-shared staging area (incoming/results/status/logs).
     /// Deliberately separate from <see cref="VrchatWorldsDirectory"/> so a
@@ -59,22 +71,44 @@ public sealed class BridgeOptions
     /// <summary>
     /// Default false: never launches VRChat on its own unless explicitly opted in.
     /// An already-running VRChat lacking --watch-worlds is never auto-restarted
-    /// regardless of this setting (spec section 32).
+    /// regardless of this setting (spec section 32); in <see cref="RelaunchClientMode"/>
+    /// (which requires this to be true) the Bridge only closes clients it has confirmed
+    /// it launched itself.
     /// </summary>
     public bool AutoLaunchVrchat { get; set; } = false;
 
     /// <summary>
     /// How many VRChat clients a cold start launches (all on the same account, like the
     /// SDK's Number of Clients). Nullable so validation can tell an explicit value from
-    /// an omitted one; read it through <see cref="ResolvedVrchatClientCount"/>.
+    /// an omitted one; read it through <see cref="ResolvedVrchatClientCount"/>. Reload
+    /// mode only: in Relaunch mode <see cref="VrchatProfiles"/> sets the count.
     /// </summary>
     public int? VrchatClientCount { get; set; }
 
     public int ResolvedVrchatClientCount => VrchatClientCount ?? DefaultVrchatClientCount;
 
     /// <summary>
+    /// <see cref="ReloadClientMode"/> (default) or <see cref="RelaunchClientMode"/>,
+    /// case-insensitive. The Bridge cannot tell which account a profile is logged in to,
+    /// and clients on different accounts split into separate instances when they reload
+    /// (spike cases 4 and 5), so the mode is chosen explicitly rather than inferred.
+    /// </summary>
+    public string VrchatClientMode { get; set; } = ReloadClientMode;
+
+    /// <summary>
+    /// Relaunch only, and required there: one VRChat profile per client, in launch order
+    /// (e.g. [0, 1]). Each profile must already be logged in; the Bridge never handles
+    /// credentials. The number of entries is the client count.
+    /// </summary>
+    public int[]? VrchatProfiles { get; set; }
+
+    public bool IsRelaunchMode =>
+        string.Equals(VrchatClientMode, RelaunchClientMode, StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>
     /// Upper bound on the wait before deploying to already-running clients. Must leave
-    /// real margin beyond VrchatStartupSettleDelaySeconds + stability polling.
+    /// real margin beyond VrchatStartupSettleDelaySeconds + stability polling. Reload
+    /// mode only, like the settle delay.
     /// </summary>
     public int VrchatStartupTimeoutSeconds { get; set; } = 60;
 
@@ -87,7 +121,8 @@ public sealed class BridgeOptions
     /// machine (real-hardware testing on 2026-09-02 observed ~15-30s to the home
     /// screen, and the original 15s default proved too short -- a build deployed at
     /// that point did not trigger a reload). A cold start does not wait for it: the
-    /// clients load the deployed world through --url.
+    /// clients load the deployed world through --url. Neither does Relaunch mode, whose
+    /// clients run without --watch-worlds and are always relaunched with --url.
     /// </summary>
     public int VrchatStartupSettleDelaySeconds { get; set; } = 30;
 }

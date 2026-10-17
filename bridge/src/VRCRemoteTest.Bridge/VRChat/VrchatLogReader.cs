@@ -18,7 +18,8 @@ namespace VRCRemoteTest.Bridge.VRChat;
 /// shaped like "YYYY.MM.DD HH:MM:SS Level    - Message".
 ///
 /// With VRChat running, the log shown is the first client's (the representative
-/// client of <see cref="VrchatProcessMonitor.SelectRepresentative"/>), not the most
+/// client of <see cref="VrchatProcessMonitor.SelectRepresentative"/>, or in Relaunch mode
+/// the running client launched first according to the Bridge's record), not the most
 /// recently written file, which with several clients would switch between them on
 /// every poll. Every poll asks Windows Restart Manager which processes have the recent
 /// files open (<see cref="VrchatLogOwners"/>): the file that only this client has open,
@@ -55,6 +56,7 @@ public sealed class VrchatLogReader : IVrchatLogReader
     private readonly IVrchatProcessMonitor _processMonitor;
     private readonly ILogger<VrchatLogReader> _logger;
     private readonly Func<string, DateTime> _creationTimeUtc;
+    private readonly IManagedClientStore? _managedClients;
     private readonly Func<string, IReadOnlyList<VrchatLogOwners.Owner>>? _queryOwners;
 
     /// <summary>Only VrchatLogService's sequential loop calls this reader, so no synchronization is needed.</summary>
@@ -70,8 +72,11 @@ public sealed class VrchatLogReader : IVrchatLogReader
     private string? _ownerQueryProblem;
 
     public VrchatLogReader(
-        IOptions<BridgeOptions> options, IVrchatProcessMonitor processMonitor, ILogger<VrchatLogReader> logger)
-        : this(options, processMonitor, logger, File.GetCreationTimeUtc, DefaultOwnerQuery())
+        IOptions<BridgeOptions> options,
+        IVrchatProcessMonitor processMonitor,
+        ILogger<VrchatLogReader> logger,
+        IManagedClientStore managedClients)
+        : this(options, processMonitor, logger, File.GetCreationTimeUtc, DefaultOwnerQuery(), managedClients)
     {
     }
 
@@ -84,27 +89,30 @@ public sealed class VrchatLogReader : IVrchatLogReader
         IOptions<BridgeOptions> options,
         IVrchatProcessMonitor processMonitor,
         ILogger<VrchatLogReader> logger,
-        Func<string, DateTime> creationTimeUtc)
-        : this(options, processMonitor, logger, creationTimeUtc, queryOwners: null)
+        Func<string, DateTime> creationTimeUtc,
+        IManagedClientStore? managedClients = null)
+        : this(options, processMonitor, logger, creationTimeUtc, queryOwners: null, managedClients)
     {
     }
 
     /// <summary>
     /// Test-only seam for the owners too: <paramref name="queryOwners"/> stands in for
     /// <see cref="RestartManagerFileOwners.Query"/> (null: not available) and may throw
-    /// like it.
+    /// like it. <paramref name="managedClients"/> is the Relaunch record (null: none).
     /// </summary>
     internal VrchatLogReader(
         IOptions<BridgeOptions> options,
         IVrchatProcessMonitor processMonitor,
         ILogger<VrchatLogReader> logger,
         Func<string, DateTime> creationTimeUtc,
-        Func<string, IReadOnlyList<VrchatLogOwners.Owner>>? queryOwners)
+        Func<string, IReadOnlyList<VrchatLogOwners.Owner>>? queryOwners,
+        IManagedClientStore? managedClients = null)
     {
         _options = options.Value;
         _processMonitor = processMonitor;
         _logger = logger;
         _creationTimeUtc = creationTimeUtc;
+        _managedClients = managedClients;
         _queryOwners = queryOwners;
     }
 
@@ -178,7 +186,7 @@ public sealed class VrchatLogReader : IVrchatLogReader
             return ReadNewest(logDirectory);
         }
 
-        var client = VrchatProcessMonitor.SelectRepresentative(snapshot.Clients);
+        var client = SelectFirstClient(snapshot.Clients);
         if (client is null)
         {
             return Unmatched("VRChat is running, but its processes could not be checked.");
@@ -404,6 +412,31 @@ public sealed class VrchatLogReader : IVrchatLogReader
     {
         _lastReportedProblem = null;
         return ReadLog(path);
+    }
+
+    /// <summary>
+    /// Relaunch clients run without --watch-worlds, so the Reload rule (the oldest
+    /// --watch-worlds client) does not apply: the first client is the running one that
+    /// comes first in the record's launch order (multi-client plan section 13.3). The
+    /// enumeration only lists the Bridge's own session, so PID and creation time identify
+    /// the recorded client. Without a running recorded client, the Reload rule applies.
+    /// </summary>
+    private VrchatClientInfo? SelectFirstClient(IReadOnlyList<VrchatClientInfo> clients)
+    {
+        if (_options.IsRelaunchMode && _managedClients is not null)
+        {
+            var first = _managedClients.Known
+                .OrderBy(r => r.LaunchOrder)
+                .Select(r => clients.FirstOrDefault(c =>
+                    c.ProcessId == r.ProcessId && c.CreationTimeUtc?.Ticks == r.CreationTimeUtc.Ticks))
+                .FirstOrDefault(c => c is not null);
+            if (first is not null)
+            {
+                return first;
+            }
+        }
+
+        return VrchatProcessMonitor.SelectRepresentative(clients);
     }
 
     private LogSnapshotResult ReadNewest(string logDirectory)

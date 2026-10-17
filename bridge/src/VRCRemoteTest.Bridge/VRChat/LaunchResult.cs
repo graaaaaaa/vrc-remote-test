@@ -14,18 +14,26 @@ public sealed class LaunchResult
     /// </summary>
     public DateTime? CreationTimeUtc { get; }
 
+    /// <summary>
+    /// The started process's Windows session, recorded with the client in Relaunch mode.
+    /// Null when it could not be read (e.g. the process already exited).
+    /// </summary>
+    public int? SessionId { get; }
+
     public string? ErrorMessage { get; }
 
-    private LaunchResult(bool succeeded, int? processId, DateTime? creationTimeUtc, string? errorMessage)
+    private LaunchResult(
+        bool succeeded, int? processId, DateTime? creationTimeUtc, int? sessionId, string? errorMessage)
     {
         Succeeded = succeeded;
         ProcessId = processId;
         CreationTimeUtc = creationTimeUtc;
+        SessionId = sessionId;
         ErrorMessage = errorMessage;
     }
 
-    public static LaunchResult Success(int processId, DateTime? creationTimeUtc) =>
-        new(true, processId, creationTimeUtc, null);
+    public static LaunchResult Success(int processId, DateTime? creationTimeUtc, int? sessionId = null) =>
+        new(true, processId, creationTimeUtc, sessionId, null);
 
-    public static LaunchResult Failure(string errorMessage) => new(false, null, null, errorMessage);
+    public static LaunchResult Failure(string errorMessage) => new(false, null, null, null, errorMessage);
 }

@@ -74,6 +74,39 @@ public sealed class BridgeOptionsValidator : IValidateOptions<BridgeOptions>
                 $"VrchatClientCount must be between 1 and {BridgeOptions.MaxVrchatClientCount} (was {clientCount}).");
         }
 
+        if (string.Equals(options.VrchatClientMode, BridgeOptions.ReloadClientMode, StringComparison.OrdinalIgnoreCase))
+        {
+            ValidateReloadMode(options, failures);
+        }
+        else if (options.IsRelaunchMode)
+        {
+            ValidateRelaunchMode(options, failures);
+        }
+        else
+        {
+            failures.Add(
+                $"VrchatClientMode '{options.VrchatClientMode}' is invalid. Must be " +
+                $"'{BridgeOptions.ReloadClientMode}' or '{BridgeOptions.RelaunchClientMode}' (case-insensitive).");
+        }
+
+        return failures.Count == 0
+            ? ValidateOptionsResult.Success
+            : ValidateOptionsResult.Fail(failures);
+    }
+
+    /// <summary>
+    /// The readiness wait only exists in Reload mode, so only there do the settle delay and
+    /// the timeout have to fit together (multi-client plan section 13.3).
+    /// </summary>
+    private static void ValidateReloadMode(BridgeOptions options, List<string> failures)
+    {
+        if (options.VrchatProfiles is not null)
+        {
+            failures.Add(
+                $"VrchatProfiles is only used when VrchatClientMode is '{BridgeOptions.RelaunchClientMode}'; " +
+                $"remove it, or set VrchatClientMode to '{BridgeOptions.RelaunchClientMode}'.");
+        }
+
         if (options.VrchatStartupSettleDelaySeconds <= 0)
         {
             failures.Add("VrchatStartupSettleDelaySeconds must be positive.");
@@ -87,10 +120,59 @@ public sealed class BridgeOptionsValidator : IValidateOptions<BridgeOptions>
                 $"(VrchatStartupSettleDelaySeconds [{options.VrchatStartupSettleDelaySeconds}] plus " +
                 $"{MinTimeoutMarginSeconds}s of real margin for VRChat's boot time).");
         }
+    }
 
-        return failures.Count == 0
-            ? ValidateOptionsResult.Success
-            : ValidateOptionsResult.Fail(failures);
+    /// <summary>
+    /// Relaunch closes VRChat clients, so it is only ever an explicit opt-in on top of
+    /// AutoLaunchVrchat (spec section 32). The profiles list is the client count, so an
+    /// explicit VrchatClientCount next to it is rejected rather than silently ignored.
+    /// </summary>
+    private static void ValidateRelaunchMode(BridgeOptions options, List<string> failures)
+    {
+        const string mode = BridgeOptions.RelaunchClientMode;
+
+        if (!options.AutoLaunchVrchat)
+        {
+            failures.Add($"AutoLaunchVrchat must be true when VrchatClientMode is '{mode}'.");
+        }
+
+        if (options.VrchatClientCount is not null)
+        {
+            failures.Add(
+                $"VrchatClientCount must not be set when VrchatClientMode is '{mode}': " +
+                "the number of VrchatProfiles is the client count.");
+        }
+
+        var profiles = options.VrchatProfiles;
+        if (profiles is null || profiles.Length == 0)
+        {
+            failures.Add(
+                $"VrchatProfiles must list 1 to {BridgeOptions.MaxVrchatClientCount} VRChat profile numbers " +
+                $"(e.g. [0, 1]) when VrchatClientMode is '{mode}'.");
+            return;
+        }
+
+        if (profiles.Length > BridgeOptions.MaxVrchatClientCount)
+        {
+            failures.Add(
+                $"VrchatProfiles must list at most {BridgeOptions.MaxVrchatClientCount} profiles (was {profiles.Length}).");
+        }
+
+        var outOfRange = profiles.Where(p => p < 0 || p > BridgeOptions.MaxVrchatProfile).ToArray();
+        if (outOfRange.Length > 0)
+        {
+            failures.Add(
+                $"VrchatProfiles entries must be between 0 and {BridgeOptions.MaxVrchatProfile} " +
+                $"(was {string.Join(", ", outOfRange)}).");
+        }
+
+        var duplicates = profiles.GroupBy(p => p).Where(g => g.Count() > 1).Select(g => g.Key).ToArray();
+        if (duplicates.Length > 0)
+        {
+            failures.Add(
+                $"VrchatProfiles must not repeat a profile (repeated: {string.Join(", ", duplicates)}): " +
+                "two clients on one profile share one account.");
+        }
     }
 
     /// <summary>

@@ -5,7 +5,10 @@ public enum VrchatPreparationKind
     /// <summary>Install only: every running --watch-worlds client reloads the new file.</summary>
     DeployOnly,
 
-    /// <summary>No VRChat is running: install, archive, then launch the clients with --url.</summary>
+    /// <summary>
+    /// No VRChat is running (in Relaunch mode: any more, the Bridge's own clients having
+    /// been closed): install, archive, then launch the clients with --url.
+    /// </summary>
     ColdStart,
 
     Failed,
@@ -37,15 +40,24 @@ public sealed class VrchatPreparation
 public sealed class VrchatLaunchOutcome
 {
     public bool Succeeded { get; }
+
+    /// <summary>
+    /// VRCHAT_START_FAILED unless the launch stopped for another reason (Relaunch mode: a
+    /// VRChat the Bridge did not launch appeared, or a client could not be recorded).
+    /// </summary>
+    public string? ErrorCode { get; }
+
     public string? ErrorMessage { get; }
 
-    private VrchatLaunchOutcome(bool succeeded, string? errorMessage)
+    private VrchatLaunchOutcome(bool succeeded, string? errorCode, string? errorMessage)
     {
         Succeeded = succeeded;
+        ErrorCode = errorCode;
         ErrorMessage = errorMessage;
     }
 
-    public static VrchatLaunchOutcome Success() => new(true, null);
+    public static VrchatLaunchOutcome Success() => new(true, null, null);
 
-    public static VrchatLaunchOutcome Failure(string errorMessage) => new(false, errorMessage);
+    public static VrchatLaunchOutcome Failure(string errorMessage, string errorCode = Protocol.ErrorCode.VrchatStartFailed) =>
+        new(false, errorCode, errorMessage);
 }
