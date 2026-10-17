@@ -21,6 +21,9 @@
     配置先ディレクトリ内に新しい候補ファイルを作ってコピーし、その候補の
     SHA-256 を照合してから、同じディレクトリ内の rename で ExePath に置き換える。
     照合後にコピー元を読み直すことはない（セキュリティレビュー S8）。
+    rename がアクセス拒否か共有違反で失敗したときは、照合済みの同じ候補で
+    0.5 秒おきに最大 10 回まで入れ直す（Bridge を止めた直後は、exe の置き換えが
+    しばらく拒否されることがあるため）。
 
     期待するハッシュは、共有以外の経路で用意すること。共有内の .sha256 や、
     侵害されている可能性のある端末が出した値では真正性の保証にならない。
@@ -86,6 +89,10 @@ $OwnershipDescription = 'VRC Remote Test Bridge auto-start (managed by vrc-remot
 
 # 自己完結型の単一ファイル実行体は 100MB 程度。上限は悪意あるコピー元への備え。
 $MaxExeBytes = 1GB
+
+# 置き換えの試行は最初の1回を含めて最大10回、間の待ちは合計 4.5 秒。
+$ReplaceMaxAttempts = 10
+$ReplaceRetryDelayMs = 500
 
 function Assert-ExeLeafName {
     param([string]$Path, [string]$ParamName)
@@ -230,6 +237,57 @@ function Get-Sha256Hex {
     (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash
 }
 
+# Bridge のプロセスが終わった直後は、Windows がまだ exe を閉じきっていない、または
+# ウイルス対策ソフトが調べているため、置き換えが一時的に拒否されることがある
+# （2026-10-18 の実機確認）。アクセス拒否と共有違反だけを一時的な失敗とみなす。
+function Test-TransientReplaceError {
+    param([System.Exception]$Exception)
+
+    if ($Exception -is [System.UnauthorizedAccessException]) {
+        return $true
+    }
+
+    # IOException の HResult は 0x8007xxxx で、下位16ビットが Win32 のエラーコード
+    # （32 = ERROR_SHARING_VIOLATION）。
+    return ($Exception -is [System.IO.IOException]) -and (($Exception.HResult -band 0xFFFF) -eq 32)
+}
+
+# 照合済みの候補を Destination に rename し、成功した試行の回数を返す。一時的な
+# 失敗では同じ候補で入れ直す（コピー元を読み直したり、候補を作り直したりはしない）。
+function Move-VerifiedCandidate {
+    param([string]$Candidate, [string]$Destination)
+
+    for ($attempt = 1; ; $attempt++) {
+        try {
+            [System.IO.File]::Move($Candidate, $Destination, $true)
+            return $attempt
+        }
+        catch {
+            # .NET のメソッドの例外は MethodInvocationException に包まれて届く。
+            $failure = $_.Exception
+            if ($failure -is [System.Management.Automation.MethodInvocationException] -and $failure.InnerException) {
+                $failure = $failure.InnerException
+            }
+
+            if (-not (Test-TransientReplaceError -Exception $failure)) {
+                throw
+            }
+
+            if ($attempt -ge $ReplaceMaxAttempts) {
+                throw "実行体の置き換えが $attempt 回とも拒否されました: $($failure.Message)`n" +
+                    "配置済みの実行体とタスクは変更していません。Bridge が止まっていること（Get-Process -Name VRCRemoteTest.Bridge）を確かめ、" +
+                    "動いていれば Stop-ScheduledTask -TaskName '$TaskName' -TaskPath '$TaskPathRoot' で止めてから、もう一度実行してください。"
+            }
+
+            if ($attempt -eq 1) {
+                Write-Host "置き換えが拒否されました（$($failure.Message)）。$($ReplaceRetryDelayMs / 1000) 秒おきに、最大 $ReplaceMaxAttempts 回まで入れ直します..." -ForegroundColor Yellow
+            }
+
+            Start-Sleep -Milliseconds $ReplaceRetryDelayMs
+        }
+    }
+}
+
 # --- パラメーターと配置先の検査（ここまでは何も変更しない。配置先ディレクトリの作成のみ） ---
 
 Assert-ExeLeafName -Path $ExePath -ParamName '-ExePath'
@@ -339,8 +397,13 @@ else {
         }
 
         # 同じディレクトリ内の rename。照合済みの候補そのものが ExePath になる。
-        [System.IO.File]::Move($candidate, $ExePath, $true)
-        Write-Host "SHA-256 を照合した実行体を配置しました: $ExePath" -ForegroundColor Green
+        $attempts = Move-VerifiedCandidate -Candidate $candidate -Destination $ExePath
+        if ($attempts -gt 1) {
+            Write-Host "SHA-256 を照合した実行体を、$attempts 回目の置き換えで配置しました: $ExePath" -ForegroundColor Green
+        }
+        else {
+            Write-Host "SHA-256 を照合した実行体を配置しました: $ExePath" -ForegroundColor Green
+        }
     }
     finally {
         if (Test-Path -LiteralPath $candidate) {
