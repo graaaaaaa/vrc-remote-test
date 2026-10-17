@@ -71,7 +71,8 @@ public class VrchatLogReaderTests : IDisposable
         {
             VrchatWorldsDirectory = Path.Combine(_tempDir, "does-not-exist", "Worlds"),
         });
-        var reader = new VrchatLogReader(options, _monitor, NullLogger<VrchatLogReader>.Instance);
+        var reader = new VrchatLogReader(
+            options, _monitor, NullLogger<VrchatLogReader>.Instance, new FakeManagedClientStore());
 
         var result = reader.ReadSnapshot();
 
@@ -199,6 +200,67 @@ public class VrchatLogReaderTests : IDisposable
         result.IsAvailable.Should().BeTrue();
         result.Content.Should().Contain("first client line");
         result.Content.Should().NotContain("second client line");
+    }
+
+    private VrchatLogReader CreateRelaunchReader(FakeManagedClientStore store) =>
+        new(
+            Options.Create(new BridgeOptions { VrchatWorldsDirectory = _worldsDir, VrchatClientMode = "Relaunch" }),
+            _monitor,
+            NullLogger<VrchatLogReader>.Instance,
+            CreationTimeFromName,
+            store);
+
+    [Fact]
+    public void In_Relaunch_mode_the_first_client_is_the_running_one_launched_first_according_to_the_record()
+    {
+        WriteLogFor(T0, "older client line\n");
+        WriteLogFor(T0.AddSeconds(3), "first launched line\n");
+        _monitor.AddClient(100, T0, watchWorlds: false);
+        _monitor.AddClient(200, T0.AddSeconds(3), watchWorlds: false);
+        var store = new FakeManagedClientStore
+        {
+            Clients = [new ManagedClient(200, T0.AddSeconds(3), 1, Profile: 1, LaunchOrder: 0), new ManagedClient(100, T0, 1, 0, 1)],
+        };
+
+        var result = CreateRelaunchReader(store).ReadSnapshot();
+
+        result.Content.Should().Contain("first launched line").And.NotContain("older client line");
+    }
+
+    [Fact]
+    public void In_Relaunch_mode_a_recorded_client_that_exited_passes_the_log_to_the_next_one_in_launch_order()
+    {
+        WriteLogFor(T0, "second launched line\n");
+        WriteLogFor(T0.AddSeconds(3), "third launched line\n");
+        _monitor.AddClient(100, T0, watchWorlds: false);
+        _monitor.AddClient(200, T0.AddSeconds(3), watchWorlds: false);
+        var store = new FakeManagedClientStore
+        {
+            Clients =
+            [
+                new ManagedClient(50, T0.AddSeconds(-3), 1, 0, 0), // closed
+                new ManagedClient(200, T0.AddSeconds(3), 1, 2, 2),
+                new ManagedClient(100, T0, 1, 1, 1),
+            ],
+        };
+
+        CreateRelaunchReader(store).ReadSnapshot().Content.Should().Contain("second launched line");
+    }
+
+    [Fact]
+    public void In_Relaunch_mode_a_client_with_the_recorded_PID_but_another_creation_time_is_not_chosen_from_the_record()
+    {
+        WriteLogFor(T0, "older client line\n");
+        WriteLogFor(T0.AddSeconds(3), "reused pid line\n");
+        _monitor.AddClient(100, T0, watchWorlds: false);
+        _monitor.AddClient(200, T0.AddSeconds(3), watchWorlds: false);
+        var store = new FakeManagedClientStore
+        {
+            Clients = [new ManagedClient(200, T0.AddSeconds(3).AddTicks(1), 1, 0, 0)],
+        };
+
+        CreateRelaunchReader(store).ReadSnapshot().Content.Should().Contain("older client line",
+            "without a running recorded client, the oldest client is the first one, as in Reload mode");
     }
 
     [Fact]

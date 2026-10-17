@@ -4,14 +4,20 @@ namespace VRCRemoteTest.Bridge.VRChat;
 
 /// <summary>
 /// One VRChat client to launch. Every value comes from the Bridge itself: the
-/// validated config (executable), the deployed file the Bridge named
+/// validated config (executable, profile), the deployed file the Bridge named
 /// (<c>vrc-remote-{validated buildId}.vrcw</c> in VrchatWorldsDirectory) and a room id
 /// the Bridge generated -- never from a manifest (spec section 49).
 /// </summary>
 /// <param name="WorldPath">Full path of the deployed .vrcw that --url opens.</param>
 /// <param name="RoomId">Shared by every client of one launch batch (see <see cref="NewRoomId"/>).</param>
 /// <param name="NoVr">True for desktop clients; in VR mode only the first client uses the HMD.</param>
-public sealed record VrchatLaunchRequest(string ExecutablePath, string WorldPath, string RoomId, bool NoVr)
+/// <param name="WatchWorlds">
+/// False in Relaunch mode: a --watch-worlds client on another account would reload into
+/// its own instance the moment the next build is deployed (spike case 5).
+/// </param>
+/// <param name="Profile">Relaunch mode only: the client's VRChat profile (0-99), i.e. its account.</param>
+public sealed record VrchatLaunchRequest(
+    string ExecutablePath, string WorldPath, string RoomId, bool NoVr, bool WatchWorlds = true, int? Profile = null)
 {
     private const int RoomIdLength = 10;
 

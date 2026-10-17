@@ -3,6 +3,7 @@ using System.Diagnostics;
 using System.Globalization;
 using System.Management;
 using Microsoft.Extensions.Logging;
+using Microsoft.Win32.SafeHandles;
 using VRCRemoteTest.Bridge.Protocol;
 
 namespace VRCRemoteTest.Bridge.VRChat;
@@ -29,6 +30,10 @@ namespace VRCRemoteTest.Bridge.VRChat;
 /// that disagrees counts as the client having vanished. Anything WMI cannot answer
 /// (the query fails or times out, or a command line comes back empty) makes the
 /// client unverified rather than "without --watch-worlds".
+///
+/// Relaunch mode needs more than an observation: it closes the clients it launched, so
+/// <see cref="OpenClients"/> keeps an open handle to each process and reads its identity
+/// through that handle (<see cref="IVrchatProcessHandle"/>, multi-client plan section 13.3).
 /// </summary>
 public sealed class VrchatProcessMonitor : IVrchatProcessMonitor
 {
@@ -98,6 +103,27 @@ public sealed class VrchatProcessMonitor : IVrchatProcessMonitor
         }
 
         return BuildStatus(snapshot, DateTimeOffset.UtcNow);
+    }
+
+    /// <summary>
+    /// Same session rule and the same single retry as <see cref="GetClients"/>. Each
+    /// handle is opened right after the session check and the creation time is then read
+    /// through it, so a PID reused between enumeration and opening shows up as a
+    /// different creation time, never as the recorded client.
+    /// </summary>
+    public VrchatProcessHandleSnapshot OpenClients()
+    {
+        var first = OpenOnce(out var vanished);
+        if (first.EnumerationError is not null || vanished == 0)
+        {
+            return first;
+        }
+
+        first.Dispose();
+        var second = OpenOnce(out vanished);
+        return vanished == 0
+            ? second
+            : new VrchatProcessHandleSnapshot(second.Handles, second.UnverifiedCount + vanished);
     }
 
     /// <summary>
@@ -370,6 +396,188 @@ public sealed class VrchatProcessMonitor : IVrchatProcessMonitor
 
         candidate = new Candidate(process.Id, creationTimeUtc);
         return ReadOutcome.Candidate;
+    }
+
+    private VrchatProcessHandleSnapshot OpenOnce(out int vanished)
+    {
+        vanished = 0;
+
+        Process[] processes;
+        try
+        {
+            processes = Process.GetProcessesByName(ProcessName);
+        }
+        catch (Exception ex) when (ex is InvalidOperationException or Win32Exception or NotSupportedException)
+        {
+            _logger.LogWarning(ex, "Failed to enumerate VRChat processes.");
+            return VrchatProcessHandleSnapshot.Failed(ex.Message);
+        }
+
+        var handles = new List<IVrchatProcessHandle>();
+        var unverified = 0;
+        var next = 0;
+        try
+        {
+            for (; next < processes.Length; next++)
+            {
+                var process = processes[next];
+                switch (TryOpenHandle(process, out var handle))
+                {
+                    case ReadOutcome.Candidate:
+                        handles.Add(handle!); // now owns the Process
+                        continue;
+                    case ReadOutcome.Vanished:
+                        vanished++;
+                        break;
+                    case ReadOutcome.Unverified:
+                        unverified++;
+                        break;
+                    case ReadOutcome.OtherSession:
+                        break;
+                }
+
+                process.Dispose();
+            }
+        }
+        catch
+        {
+            foreach (var handle in handles)
+            {
+                handle.Dispose();
+            }
+
+            for (; next < processes.Length; next++)
+            {
+                processes[next].Dispose();
+            }
+
+            throw;
+        }
+
+        return new VrchatProcessHandleSnapshot(handles, unverified);
+    }
+
+    /// <summary>
+    /// The session is read from the enumeration before anything is opened, as in
+    /// <see cref="TryReadCandidate"/>. Off Windows there is no native handle, so a VRChat
+    /// process there could never be confirmed.
+    /// </summary>
+    private ReadOutcome TryOpenHandle(Process process, out IVrchatProcessHandle? handle)
+    {
+        handle = null;
+
+        int sessionId;
+        try
+        {
+            sessionId = process.SessionId;
+        }
+        catch (InvalidOperationException)
+        {
+            return ReadOutcome.Vanished;
+        }
+        catch (Exception ex) when (ex is Win32Exception or NotSupportedException)
+        {
+            _logger.LogWarning(ex, "Could not read the session of VRChat process {ProcessId}.", process.Id);
+            return ReadOutcome.Unverified;
+        }
+
+        if (_currentSessionId is null)
+        {
+            return ReadOutcome.Unverified;
+        }
+
+        if (sessionId != _currentSessionId)
+        {
+            return ReadOutcome.OtherSession;
+        }
+
+        if (!OperatingSystem.IsWindows())
+        {
+            return ReadOutcome.Unverified;
+        }
+
+        switch (NativeProcess.TryOpen(process.Id, out var native, out var error))
+        {
+            case NativeProcess.OpenOutcome.Gone:
+                return ReadOutcome.Vanished;
+            case NativeProcess.OpenOutcome.Failed:
+                _logger.LogWarning(
+                    "Could not open VRChat process {ProcessId} (Win32 error {Error}); it may be running elevated.",
+                    process.Id, error);
+                return ReadOutcome.Unverified;
+        }
+
+        var keep = false;
+        try
+        {
+            if (NativeProcess.TryGetCreationTimeUtc(native!) is not { } creationTimeUtc)
+            {
+                _logger.LogWarning("Could not read the creation time of VRChat process {ProcessId}.", process.Id);
+                return ReadOutcome.Unverified;
+            }
+
+            switch (NativeProcess.HasExited(native!))
+            {
+                case true:
+                    return ReadOutcome.Vanished; // exited after enumeration
+                case null:
+                    return ReadOutcome.Unverified;
+            }
+
+            handle = new WindowsProcessHandle(process, native!, sessionId, process.ProcessName, creationTimeUtc);
+            keep = true;
+            return ReadOutcome.Candidate;
+        }
+        finally
+        {
+            if (!keep)
+            {
+                native!.Dispose();
+            }
+        }
+    }
+
+    /// <summary>
+    /// Holds the native handle that pins the PID for as long as this object lives.
+    /// CloseMainWindow and Refresh go through the Process object, which finds the window
+    /// by PID; with the PID pinned that is the same process. Everything that acts on the
+    /// process itself goes through the held handle.
+    /// </summary>
+    private sealed class WindowsProcessHandle(
+        Process process, SafeProcessHandle native, int sessionId, string processName, DateTime creationTimeUtc)
+        : IVrchatProcessHandle
+    {
+        public int ProcessId { get; } = process.Id;
+
+        public int SessionId => sessionId;
+
+        public string ProcessName => processName;
+
+        public DateTime CreationTimeUtc => creationTimeUtc;
+
+        public bool HasExited =>
+            NativeProcess.HasExited(native)
+            ?? throw new InvalidOperationException($"Could not wait on VRChat process {ProcessId}.");
+
+        public bool CloseMainWindow() => process.CloseMainWindow();
+
+        public void Refresh() => process.Refresh();
+
+        public void Kill()
+        {
+            if (NativeProcess.TryTerminate(native, out var error) || NativeProcess.HasExited(native) == true)
+            {
+                return;
+            }
+
+            throw new Win32Exception(error);
+        }
+
+        public void Dispose()
+        {
+            native.Dispose();
+            process.Dispose();
+        }
     }
 
     private int? TryGetCurrentSessionId()

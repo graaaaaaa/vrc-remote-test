@@ -18,7 +18,8 @@ namespace VRCRemoteTest.Bridge.VRChat;
 /// shaped like "YYYY.MM.DD HH:MM:SS Level    - Message".
 ///
 /// With VRChat running, the log shown is the first client's (the representative
-/// client of <see cref="VrchatProcessMonitor.SelectRepresentative"/>), not the most
+/// client of <see cref="VrchatProcessMonitor.SelectRepresentative"/>, or in Relaunch mode
+/// the running client launched first according to the Bridge's record), not the most
 /// recently written file, which with several clients would switch between them on
 /// every poll. The file is matched by <see cref="VrchatLogMatcher"/> and then kept
 /// for that client (its PID and creation time) until the client exits or the file
@@ -48,6 +49,7 @@ public sealed class VrchatLogReader : IVrchatLogReader
     private readonly IVrchatProcessMonitor _processMonitor;
     private readonly ILogger<VrchatLogReader> _logger;
     private readonly Func<string, DateTime> _creationTimeUtc;
+    private readonly IManagedClientStore? _managedClients;
 
     /// <summary>Only VrchatLogService's sequential loop calls this reader, so no synchronization is needed.</summary>
     private PinnedLog? _pinned;
@@ -55,8 +57,11 @@ public sealed class VrchatLogReader : IVrchatLogReader
     private string? _lastReportedProblem;
 
     public VrchatLogReader(
-        IOptions<BridgeOptions> options, IVrchatProcessMonitor processMonitor, ILogger<VrchatLogReader> logger)
-        : this(options, processMonitor, logger, File.GetCreationTimeUtc)
+        IOptions<BridgeOptions> options,
+        IVrchatProcessMonitor processMonitor,
+        ILogger<VrchatLogReader> logger,
+        IManagedClientStore managedClients)
+        : this(options, processMonitor, logger, File.GetCreationTimeUtc, managedClients)
     {
     }
 
@@ -68,12 +73,14 @@ public sealed class VrchatLogReader : IVrchatLogReader
         IOptions<BridgeOptions> options,
         IVrchatProcessMonitor processMonitor,
         ILogger<VrchatLogReader> logger,
-        Func<string, DateTime> creationTimeUtc)
+        Func<string, DateTime> creationTimeUtc,
+        IManagedClientStore? managedClients = null)
     {
         _options = options.Value;
         _processMonitor = processMonitor;
         _logger = logger;
         _creationTimeUtc = creationTimeUtc;
+        _managedClients = managedClients;
     }
 
     private string? LogDirectory => VrchatLogDirectory.Resolve(_options);
@@ -136,7 +143,7 @@ public sealed class VrchatLogReader : IVrchatLogReader
             return ReadNewest(logDirectory);
         }
 
-        var client = VrchatProcessMonitor.SelectRepresentative(snapshot.Clients);
+        var client = SelectFirstClient(snapshot.Clients);
         if (client is null)
         {
             return Unmatched("VRChat is running, but its processes could not be checked.");
@@ -191,6 +198,31 @@ public sealed class VrchatLogReader : IVrchatLogReader
         _logger.LogInformation(
             "Showing {Path} as the log of VRChat client {ProcessId}.", match, client.ProcessId);
         return ReadLog(match);
+    }
+
+    /// <summary>
+    /// Relaunch clients run without --watch-worlds, so the Reload rule (the oldest
+    /// --watch-worlds client) does not apply: the first client is the running one that
+    /// comes first in the record's launch order (multi-client plan section 13.3). The
+    /// enumeration only lists the Bridge's own session, so PID and creation time identify
+    /// the recorded client. Without a running recorded client, the Reload rule applies.
+    /// </summary>
+    private VrchatClientInfo? SelectFirstClient(IReadOnlyList<VrchatClientInfo> clients)
+    {
+        if (_options.IsRelaunchMode && _managedClients is not null)
+        {
+            var first = _managedClients.Known
+                .OrderBy(r => r.LaunchOrder)
+                .Select(r => clients.FirstOrDefault(c =>
+                    c.ProcessId == r.ProcessId && c.CreationTimeUtc?.Ticks == r.CreationTimeUtc.Ticks))
+                .FirstOrDefault(c => c is not null);
+            if (first is not null)
+            {
+                return first;
+            }
+        }
+
+        return VrchatProcessMonitor.SelectRepresentative(clients);
     }
 
     private LogSnapshotResult ReadNewest(string logDirectory)

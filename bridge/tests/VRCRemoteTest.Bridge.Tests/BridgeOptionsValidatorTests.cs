@@ -1,4 +1,5 @@
 using FluentAssertions;
+using Microsoft.Extensions.Configuration;
 using VRCRemoteTest.Bridge.Configuration;
 using Xunit;
 
@@ -453,5 +454,187 @@ public class BridgeOptionsValidatorTests : IDisposable
 
         result.Failed.Should().BeTrue();
         result.Failures.Should().Contain(f => f.Contains("symbolic link"));
+    }
+
+    // === VrchatClientMode (multi-client plan section 13.3) ===
+
+    private BridgeOptions ValidRelaunchOptions(params int[] profiles)
+    {
+        var options = ValidBaseOptions();
+        options.AutoLaunchVrchat = true;
+        options.VrchatExecutable = Path.Combine(_tempDir, "VRChat.exe");
+        File.WriteAllText(options.VrchatExecutable, "fake exe bytes");
+        options.VrchatClientMode = "Relaunch";
+        options.VrchatProfiles = profiles.Length == 0 ? [0, 1] : profiles;
+        return options;
+    }
+
+    [Fact]
+    public void The_client_mode_defaults_to_Reload()
+    {
+        var options = ValidBaseOptions();
+
+        options.VrchatClientMode.Should().Be("Reload");
+        options.IsRelaunchMode.Should().BeFalse();
+        _validator.Validate(name: null, options).Succeeded.Should().BeTrue();
+    }
+
+    [Theory]
+    [InlineData("Reload", false)]
+    [InlineData("reload", false)]
+    [InlineData("Relaunch", true)]
+    [InlineData("RELAUNCH", true)]
+    public void The_client_mode_is_Reload_or_Relaunch_case_insensitively(string mode, bool relaunch)
+    {
+        var options = relaunch ? ValidRelaunchOptions() : ValidBaseOptions();
+        options.VrchatClientMode = mode;
+
+        _validator.Validate(name: null, options).Succeeded.Should().BeTrue();
+        options.IsRelaunchMode.Should().Be(relaunch);
+    }
+
+    [Theory]
+    [InlineData("Restart")]
+    [InlineData("")]
+    [InlineData("Relaunch ")]
+    public void An_unknown_client_mode_is_rejected(string mode)
+    {
+        var options = ValidBaseOptions();
+        options.VrchatClientMode = mode;
+
+        var result = _validator.Validate(name: null, options);
+
+        result.Failed.Should().BeTrue();
+        result.Failures.Should().Contain(f => f.Contains("VrchatClientMode"));
+        options.IsRelaunchMode.Should().BeFalse();
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(0, 1)]
+    [InlineData(99, 0, 5, 1)]
+    public void Relaunch_accepts_one_to_four_distinct_profiles_from_0_to_99(params int[] profiles)
+    {
+        var result = _validator.Validate(name: null, ValidRelaunchOptions(profiles));
+
+        result.Succeeded.Should().BeTrue();
+    }
+
+    [Fact]
+    public void Relaunch_requires_AutoLaunchVrchat()
+    {
+        var options = ValidRelaunchOptions();
+        options.AutoLaunchVrchat = false;
+
+        var result = _validator.Validate(name: null, options);
+
+        result.Failed.Should().BeTrue();
+        result.Failures.Should().Contain(f => f.Contains("AutoLaunchVrchat must be true"));
+    }
+
+    [Fact]
+    public void Relaunch_requires_VrchatProfiles()
+    {
+        var options = ValidRelaunchOptions();
+        options.VrchatProfiles = null;
+
+        var result = _validator.Validate(name: null, options);
+
+        result.Failed.Should().BeTrue();
+        result.Failures.Should().Contain(f => f.Contains("VrchatProfiles must list 1 to 4"));
+    }
+
+    [Fact]
+    public void Relaunch_rejects_an_empty_profile_list()
+    {
+        var options = ValidRelaunchOptions();
+        options.VrchatProfiles = [];
+
+        _validator.Validate(name: null, options).Failures.Should().Contain(f => f.Contains("VrchatProfiles must list"));
+    }
+
+    [Fact]
+    public void Relaunch_rejects_more_than_four_profiles()
+    {
+        var result = _validator.Validate(name: null, ValidRelaunchOptions(0, 1, 2, 3, 4));
+
+        result.Failed.Should().BeTrue();
+        result.Failures.Should().Contain(f => f.Contains("at most 4"));
+    }
+
+    [Theory]
+    [InlineData(-1)]
+    [InlineData(100)]
+    public void Relaunch_rejects_a_profile_outside_0_to_99(int profile)
+    {
+        var result = _validator.Validate(name: null, ValidRelaunchOptions(0, profile));
+
+        result.Failed.Should().BeTrue();
+        result.Failures.Should().Contain(f => f.Contains("between 0 and 99"));
+    }
+
+    [Fact]
+    public void Relaunch_rejects_a_repeated_profile()
+    {
+        var result = _validator.Validate(name: null, ValidRelaunchOptions(1, 0, 1));
+
+        result.Failed.Should().BeTrue();
+        result.Failures.Should().Contain(f => f.Contains("must not repeat") && f.Contains("1"));
+    }
+
+    [Theory]
+    [InlineData(1)]
+    [InlineData(2)]
+    public void Relaunch_rejects_an_explicit_VrchatClientCount(int clientCount)
+    {
+        var options = ValidRelaunchOptions();
+        options.VrchatClientCount = clientCount;
+
+        var result = _validator.Validate(name: null, options);
+
+        result.Failed.Should().BeTrue();
+        result.Failures.Should().Contain(f => f.Contains("VrchatClientCount must not be set"));
+    }
+
+    [Fact]
+    public void Reload_rejects_VrchatProfiles()
+    {
+        var options = ValidBaseOptions();
+        options.VrchatProfiles = [0, 1];
+
+        var result = _validator.Validate(name: null, options);
+
+        result.Failed.Should().BeTrue();
+        result.Failures.Should().Contain(f => f.Contains("VrchatProfiles is only used"));
+    }
+
+    [Fact]
+    public void Relaunch_does_not_check_the_readiness_wait_settings_it_never_uses()
+    {
+        var options = ValidRelaunchOptions();
+        options.VrchatStartupSettleDelaySeconds = 0;
+        options.VrchatStartupTimeoutSeconds = 1;
+
+        _validator.Validate(name: null, options).Succeeded.Should().BeTrue();
+    }
+
+    [Fact]
+    public void VrchatProfiles_bind_from_a_json_array_in_config()
+    {
+        var configuration = new ConfigurationBuilder()
+            .AddInMemoryCollection(new Dictionary<string, string?>
+            {
+                ["Bridge:VrchatClientMode"] = "Relaunch",
+                ["Bridge:VrchatProfiles:0"] = "3",
+                ["Bridge:VrchatProfiles:1"] = "0",
+            })
+            .Build();
+        var options = new BridgeOptions();
+
+        configuration.GetSection("Bridge").Bind(options);
+
+        options.IsRelaunchMode.Should().BeTrue();
+        options.VrchatProfiles.Should().Equal(3, 0);
+        options.VrchatClientCount.Should().BeNull();
     }
 }
