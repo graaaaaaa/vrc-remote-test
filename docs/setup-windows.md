@@ -18,7 +18,7 @@ VRC Remote Testを使うために、Windows実機（VRChatクライアントを�
 - Windows で実行するスクリプトは、Windows のローカルにあるものだけを使う。Mac の共有上のスクリプトを実行すると、Mac が侵害されたときに Windows でコードを実行されてしまう。
 - これらは一人開発・家庭内 LAN を想定した設計。共有の資格情報が漏れれば、任意のワールドを配置される（Mac が侵害された場合も同じ）。
 - `vrcremote` には、シンボリックリンクを作成する特権を与えない（既定のまま）。Bridge は共有内のリンクを取り込まないが、検査と読み取りの間に差し替えられる余地までは塞いでいない。
-- 受け入れている残余リスク: 共有の資格情報を持つ人は、`incoming` へのアップロードでディスクを埋めたり、処理中のアップロードを同名のファイルで妨害したりできる。また、同じ buildId を再度アップロードすると、`results` の結果が `BUILD_ALREADY_PROCESSED` で上書きされる（Unity は buildId を使い回さないので、通常の利用では起きない）。いずれも配置されるワールドの中身には影響しない。
+- 受け入れている残余リスク: 共有の資格情報を持つ人は、`incoming` へのアップロードでディスクを埋めたり、処理中のアップロードを同名のファイルで妨害したりできる。いずれも配置されるワールドの中身には影響しない。処理済みの buildId をもう一度アップロードしても、`results` の結果は書き換わらない（v0.5.0 までは `BUILD_ALREADY_PROCESSED` や `MANIFEST_INVALID` で上書きされた）。
 
 ---
 
@@ -737,6 +737,8 @@ Rename-Item -LiteralPath 'C:\VRCRemoteTest' -NewName ('VRCRemoteTest.old-' + (Ge
 | Bridge が起動直後に `VrchatProfiles ...` `VrchatClientCount must not be set ...` などの `Configuration error` で終了する | Relaunch の設定の組み合わせが合っていない（手順9-3） | `VrchatClientMode`・`VrchatProfiles`・`AutoLaunchVrchat` を手順9-3のとおりにし、`VrchatClientCount` を消す |
 | Log Viewer に `Could not match an output_log_*.txt file ...` が出る | 1台目のログを特定できない（手順11）。Bridge のログに `Could not ask Windows Restart Manager ...` があれば、ファイルを開いているプロセスを調べられず、ファイル名の時刻だけで対応付けている | 台を全部閉じて、Bridge に起動させ直す（前の台のログができてから次を起動するので、ファイルが分かれる）。手で起動するなら、1秒以上あけて1台ずつ起動する |
 | Log Viewer に `... is or was also open by other VRChat clients ...` が出る | 1台目のログに、ほかの台も書いている（ログを書き始めたのが同じ秒だった。手順11） | 台を全部閉じて、Bridge に起動させ直す。CPU の負荷が高いときに起きやすいので、負荷を下げてから起動する |
+| Bridge のログに `Discarding ...: ..., and build ... was already processed, so its result is kept.` や `Build ... was already processed; consumed the duplicate upload and kept its result.` が出る | 処理済みのビルドの manifest と同じ名前のファイルが、あとから `incoming` に届いた。`(0 bytes)` なら、Bridge が取り込んで消した名前に、Mac の SMB クライアントが拡張属性を書いて作り直したとみられる（`docs/validation/smb-late-empty-manifest.md`） | 何もしなくてよい。配置と `results` の結果は最初の処理のまま。よく出るなら、その時刻と Mac の操作を記録して報告する |
+| v0.5.0 以前の Bridge で、`deployed` だった結果ファイルが、数秒後に `MANIFEST_INVALID`（`Manifest could not be parsed.`）に変わっている | 上と同じ空のファイルを、新しいビルドとして読んで失敗を書いた。配置は成功している（`state\archive` に manifest がある） | Bridge を更新する。それまでは、`state\archive\<buildId>.ready.json` があれば配置は成功している |
 | Bridge のログに `Ignoring legacy ... inside the share` が出る | 共有内に旧構成の `processing`・`archive`・`failed` が残っている | 手順14に従って移行し、旧ディレクトリを削除する |
 
 ---
@@ -749,5 +751,6 @@ Rename-Item -LiteralPath 'C:\VRCRemoteTest' -NewName ('VRCRemoteTest.old-' + (Ge
 
 - `docs/validation/watch-worlds-spike.md` — `--watch-worlds`挙動の実機検証記録
 - `docs/validation/multi-client-spike.md` — 複数クライアントの実機検証手順と記録
+- `docs/validation/smb-late-empty-manifest.md` — 配置のあとに空の manifest が現れた件の調査と確認手順
 - `docs/sdk-api-notes.md` — Unity側SDK APIの調査ノート
 - `VRC Remote Test — 実装仕様書.md` §16（Windows Share）、§44（Windows config）、§49（Security）、§63（Setup Flow）

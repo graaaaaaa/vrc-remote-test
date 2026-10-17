@@ -253,8 +253,7 @@ public sealed class StagingWatcher : BackgroundService, IBridgeWatcher
 
         // The claim only counts once the shared copy is consumed, as with the original
         // move-based claim: a shared manifest that survives (e.g. still open on the Mac)
-        // would otherwise be claimed again on the next scan and its BuildAlreadyProcessed
-        // result would overwrite this build's real result.
+        // would otherwise be claimed again on the next scan, as a duplicate of this build.
         if (!SafeDelete(readyFilePath))
         {
             SafeDelete(claimedPath);
@@ -344,16 +343,24 @@ public sealed class StagingWatcher : BackgroundService, IBridgeWatcher
         }
         catch (Exception ex) when (ex is JsonException or IOException)
         {
-            _logger.LogError(ex, "Failed to parse manifest {Path}", claimedManifestPath);
-            MoveToFailed(claimedManifestPath, artifactPath: null);
-            WriteFailureForGuessedBuildId(buildIdGuess, ErrorCode.ManifestInvalid, "Manifest could not be parsed.");
+            if (!DiscardIfAlreadyProcessed(claimedManifestPath, buildIdGuess, "it could not be parsed"))
+            {
+                _logger.LogError(ex, "Failed to parse manifest {Path}", claimedManifestPath);
+                MoveToFailed(claimedManifestPath, artifactPath: null);
+                WriteFailureForGuessedBuildId(buildIdGuess, ErrorCode.ManifestInvalid, "Manifest could not be parsed.");
+            }
+
             return;
         }
 
         if (manifest is null || string.IsNullOrWhiteSpace(manifest.BuildId))
         {
-            MoveToFailed(claimedManifestPath, artifactPath: null);
-            WriteFailureForGuessedBuildId(buildIdGuess, ErrorCode.ManifestInvalid, "Manifest missing buildId.");
+            if (!DiscardIfAlreadyProcessed(claimedManifestPath, buildIdGuess, "it has no buildId"))
+            {
+                MoveToFailed(claimedManifestPath, artifactPath: null);
+                WriteFailureForGuessedBuildId(buildIdGuess, ErrorCode.ManifestInvalid, "Manifest missing buildId.");
+            }
+
             return;
         }
 
@@ -368,18 +375,30 @@ public sealed class StagingWatcher : BackgroundService, IBridgeWatcher
         var buildIdResult = PackageValidator.ValidateBuildId(manifest.BuildId);
         if (buildIdResult is not null)
         {
-            _logger.LogWarning(
-                "Build {BuildId} failed validation: {Code} {Message}",
-                manifest.BuildId, buildIdResult.ErrorCode, buildIdResult.ErrorMessage);
-            MoveToFailed(claimedManifestPath, artifactPath: null);
-            WriteFailureForGuessedBuildId(
-                buildIdGuess,
-                buildIdResult.ErrorCode ?? ErrorCode.UnknownError,
-                buildIdResult.ErrorMessage ?? "Validation failed.");
+            if (!DiscardIfAlreadyProcessed(claimedManifestPath, buildIdGuess, "its buildId is not allowed"))
+            {
+                _logger.LogWarning(
+                    "Build {BuildId} failed validation: {Code} {Message}",
+                    manifest.BuildId, buildIdResult.ErrorCode, buildIdResult.ErrorMessage);
+                MoveToFailed(claimedManifestPath, artifactPath: null);
+                WriteFailureForGuessedBuildId(
+                    buildIdGuess,
+                    buildIdResult.ErrorCode ?? ErrorCode.UnknownError,
+                    buildIdResult.ErrorMessage ?? "Validation failed.");
+            }
+
             return;
         }
 
         progress.BuildId = manifest.BuildId;
+
+        // Before anything below can write a result for this build id: a duplicate must
+        // never replace the result of the build that was processed.
+        if (IsArchived(manifest.BuildId))
+        {
+            ConsumeDuplicate(claimedManifestPath, manifest);
+            return;
+        }
 
         // manifest.FileName must be validated BEFORE it is ever handed to
         // Path.Combine below: Path.Combine silently discards its first argument
@@ -406,19 +425,6 @@ public sealed class StagingWatcher : BackgroundService, IBridgeWatcher
         var artifactPath = Path.Combine(ProcessingDir, manifest.FileName);
         var incomingArtifactPath = Path.Combine(IncomingDir, manifest.FileName);
         progress.ArtifactPath = artifactPath;
-
-        // Idempotency: never reprocess a build that already reached archive/. The
-        // duplicate upload is consumed so it does not linger in the share; note the
-        // BuildAlreadyProcessed result replaces the earlier result file.
-        var archivedManifestPath = Path.Combine(ArchiveDir, $"{manifest.BuildId}{ProtocolConstants.ManifestExtension}");
-        if (File.Exists(archivedManifestPath))
-        {
-            _logger.LogInformation("Build {BuildId} was already processed, skipping.", manifest.BuildId);
-            _resultWriter.WriteFailure(manifest.BuildId, ErrorCode.BuildAlreadyProcessed, "This build was already processed.", ResultsDir);
-            SafeDelete(claimedManifestPath);
-            SafeDelete(incomingArtifactPath);
-            return;
-        }
 
         // Reject what the manifest alone proves invalid before copying a possibly
         // large artifact. The shared artifact is consumed either way, as it was when
@@ -748,7 +754,9 @@ public sealed class StagingWatcher : BackgroundService, IBridgeWatcher
 
     /// <summary>
     /// The guess comes from a shared filename rather than a validated manifest, so it
-    /// must pass the same allow-list before it names a file in results/.
+    /// must pass the same allow-list before it names a file in results/. A build that
+    /// was already processed keeps its result: a manifest that cannot name its build is
+    /// never the upload that result reports on.
     /// </summary>
     private void WriteFailureForGuessedBuildId(string buildIdGuess, string errorCode, string errorMessage)
     {
@@ -760,7 +768,96 @@ public sealed class StagingWatcher : BackgroundService, IBridgeWatcher
             return;
         }
 
+        if (WasAlreadyProcessed(buildIdGuess))
+        {
+            _logger.LogWarning(
+                "Not replacing the result of build {BuildId}, which was already processed: {Code} {Message}",
+                buildIdGuess, errorCode, errorMessage);
+            return;
+        }
+
         _resultWriter.WriteFailure(buildIdGuess, errorCode, errorMessage, ResultsDir);
+    }
+
+    /// <summary>
+    /// A manifest named after a build that was already processed is a late copy, not a
+    /// new upload (Unity never reuses a build id). On 2026-10-18 an empty file with a
+    /// deployed build's manifest name appeared in incoming/ about 10 s after the Bridge
+    /// had consumed the manifest, although the Mac had only renamed it into place once,
+    /// and the MANIFEST_INVALID reported for it replaced the deployed result. Most likely
+    /// the Mac's SMB client wrote an extended attribute to the name, which on NTFS creates
+    /// the file with an empty main stream (docs/validation/smb-late-empty-manifest.md).
+    /// Such a copy is deleted; the build's result and whatever failed/ keeps for it stay
+    /// as they are. Returns false for a build that was not processed, which the caller
+    /// reports as invalid as before.
+    /// </summary>
+    private bool DiscardIfAlreadyProcessed(string claimedManifestPath, string buildIdGuess, string reason)
+    {
+        if (!WasAlreadyProcessed(buildIdGuess))
+        {
+            return false;
+        }
+
+        _logger.LogWarning(
+            "Discarding {Path} ({Length} bytes): {Reason}, and build {BuildId} was already processed, so its result is kept.",
+            claimedManifestPath, LengthOrNull(claimedManifestPath), reason, buildIdGuess);
+        SafeDelete(claimedManifestPath);
+        return true;
+    }
+
+    /// <summary>
+    /// A build has finished once it is archived or has a result: a failed build has only
+    /// the result, and a cold start the Bridge stopped during the launch only the archive.
+    /// </summary>
+    private bool WasAlreadyProcessed(string buildIdGuess) =>
+        PackageValidator.ValidateBuildId(buildIdGuess) is null
+        && (IsArchived(buildIdGuess) || File.Exists(ResultWriter.ResultPath(ResultsDir, buildIdGuess)));
+
+    private bool IsArchived(string buildId) => File.Exists(ArchivedManifestPath(buildId));
+
+    private string ArchivedManifestPath(string buildId) =>
+        Path.Combine(ArchiveDir, $"{buildId}{ProtocolConstants.ManifestExtension}");
+
+    /// <summary>
+    /// Idempotency (spec section 24): a build that reached archive/ is never processed
+    /// again. The duplicate upload is consumed so it does not linger in the share, but the
+    /// build's result is never replaced, since it reports the processing that happened.
+    /// BuildAlreadyProcessed is written only when there is no result yet (a cold start
+    /// stopped during the launch, or results/ was cleaned up).
+    /// </summary>
+    private void ConsumeDuplicate(string claimedManifestPath, BuildManifest manifest)
+    {
+        SafeDelete(claimedManifestPath);
+
+        // The artifact name comes from the share, so it is only used once it is a safe basename.
+        if (PackageValidator.ValidateFileName(manifest.FileName) is null)
+        {
+            SafeDelete(Path.Combine(IncomingDir, manifest.FileName));
+        }
+
+        if (File.Exists(ResultWriter.ResultPath(ResultsDir, manifest.BuildId)))
+        {
+            _logger.LogWarning(
+                "Build {BuildId} was already processed; consumed the duplicate upload and kept its result.",
+                manifest.BuildId);
+            return;
+        }
+
+        _logger.LogInformation("Build {BuildId} was already processed, skipping.", manifest.BuildId);
+        _resultWriter.WriteFailure(
+            manifest.BuildId, ErrorCode.BuildAlreadyProcessed, "This build was already processed.", ResultsDir);
+    }
+
+    private static long? LengthOrNull(string path)
+    {
+        try
+        {
+            return new FileInfo(path).Length;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return null;
+        }
     }
 
     /// <summary>
@@ -773,8 +870,7 @@ public sealed class StagingWatcher : BackgroundService, IBridgeWatcher
     /// </summary>
     private bool TryArchiveProcessed(string manifestPath, string artifactPath, string buildId)
     {
-        var archivedManifest = Path.Combine(ArchiveDir, $"{buildId}{ProtocolConstants.ManifestExtension}");
-        if (!SafeMove(manifestPath, archivedManifest))
+        if (!SafeMove(manifestPath, ArchivedManifestPath(buildId)))
         {
             return false;
         }

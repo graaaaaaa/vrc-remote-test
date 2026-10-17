@@ -720,6 +720,8 @@ incoming/<buildId>.ready.json
 
 Windows Bridgeは`.vrcw`の出現自体では処理を開始しない。
 
+Mac は rename したあと、その名前に触らない。それでも、Bridge が取り込んで消した `.ready.json` と同じ名前の、中身が空（0 バイト）のファイルが、あとから `incoming` に現れたことがある（2026-10-18、Relaunch の配置の約 10 秒後に1回。Mac の SMB クライアントが名前を作り直したとみられる。`docs/validation/smb-late-empty-manifest.md`）。Bridge は、処理済みの buildId の名前で届いたものでは結果を書き換えない（§24）。
+
 ---
 
 # 18. Manifest
@@ -877,12 +879,12 @@ artifact も同様に、`MaxArtifactSizeBytes` を実際に読んだバイト数
 
 その後、
 
-1. JSON schema validation
-2. protocolVersion確認
-3. artifact存在確認
-4. file size確認
-5. SHA-256確認
-6. duplicate build確認
+1. JSON schema validation（buildId の確認を含む）
+2. duplicate build確認（§24。ほかの確認で結果を書く前に行う）
+3. protocolVersion確認
+4. artifact存在確認
+5. file size確認
+6. SHA-256確認
 7. VRChat状態確認
 8. deploy
 
@@ -904,13 +906,17 @@ state/archive/<buildId>.ready.json
 
 の存在で判定可能。archive には manifest だけを残し、artifact は残さない（deploy 済みのものが Worlds にあるため）。重複と判定したアップロードは、共有から消費する。
 
-duplicateの場合：
+結果ファイル（`results/<buildId>.json`）は、その build を処理したときに書いたものを残す。Unity は buildId を使い回さないので、同じ buildId であとから届くのは、遅れて現れた写し（§17）か送り直しで、その build の結果ではない。
+
+duplicateの場合は安全に終了する。結果ファイルがあれば書き換えずに残し、ログに警告を出す。結果ファイルが無いとき（コールドスタートの起動中に Bridge が止まった、results を掃除した）だけ、
 
 ```text
 BUILD_ALREADY_PROCESSED
 ```
 
-とし、安全に終了する。
+を書く。
+
+manifest から buildId が分からない（空、JSON として読めない、buildId が無い・許されない文字を含む）ときは、ファイル名から推した buildId で判断する。その buildId が処理済み（archive にある、または結果ファイルがある）なら、結果を書かず、failed にも移さずに消し、ログに警告を出す（failed に同じ名前で残っている、その build の manifest を上書きしないため）。処理済みでなければ、これまでどおり failed に移して `MANIFEST_INVALID` を書く。64 KiB を超える manifest も同じ。
 
 ---
 
