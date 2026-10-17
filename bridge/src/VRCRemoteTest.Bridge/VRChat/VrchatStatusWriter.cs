@@ -6,10 +6,9 @@ namespace VRCRemoteTest.Bridge.VRChat;
 
 /// <summary>
 /// Writes status/vrchat-status.json using the same atomic tmp-then-rename pattern as
-/// ResultWriter, so a concurrent reader (Unity's PollVrchatStatus) normally never
-/// observes a partially-written file. While the Mac's SMB client holds the file open
-/// the rename cannot replace it, so it is rewritten in place instead (see
-/// SharedFileWriter); PollVrchatStatus already treats a partial read as a transient miss.
+/// ResultWriter, so a concurrent reader (Unity's PollVrchatStatus) never observes a
+/// partially-written file -- including while the Mac's SMB client holds the file open
+/// (see SharedFileWriter).
 /// </summary>
 public sealed class VrchatStatusWriter : IVrchatStatusWriter
 {

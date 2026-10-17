@@ -85,8 +85,8 @@ public class VrchatLogServiceTests : IDisposable
     }
 
     /// <summary>
-    /// Regression for 2026-10-17: while Unity polled the file, the Mac's SMB client
-    /// kept it open (sharing Read|Write|Delete), File.Move(overwrite: true) failed with
+    /// Regression for 2026-10-17: the Mac's SMB client kept the file open (sharing
+    /// Read|Write|Delete), File.Move(overwrite: true) failed with
     /// UnauthorizedAccessException on every poll, the published log went stale, and an
     /// ERR with a stack trace was logged every 5s.
     /// </summary>
@@ -114,15 +114,10 @@ public class VrchatLogServiceTests : IDisposable
         cts.Cancel();
         await service.StopAsync(CancellationToken.None);
 
-        macHandle.Seek(0, SeekOrigin.Begin);
-        using (var reader = new StreamReader(macHandle, leaveOpen: true))
-        {
-            reader.ReadToEnd().Should().Be("fresh snapshot");
-        }
-
-        logger.Entries.Should().NotContain(e => e.Level >= LogLevel.Warning);
-        logger.Entries.Should().ContainSingle()
-            .Which.Exception.Should().BeNull("being held open is expected, not an error worth a stack trace");
+        File.ReadAllText(path).Should().Be("fresh snapshot");
+        logger.Entries.Should().NotBeEmpty()
+            .And.NotContain(e => e.Level >= LogLevel.Warning)
+            .And.OnlyContain(e => e.Exception == null, "being held open is expected, not an error worth a stack trace");
     }
 
     private static async Task WaitUntil(Func<bool> condition, TimeSpan timeout)

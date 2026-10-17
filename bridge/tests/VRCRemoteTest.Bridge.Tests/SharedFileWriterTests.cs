@@ -7,11 +7,11 @@ namespace VRCRemoteTest.Bridge.Tests;
 
 /// <summary>
 /// The held-open cases are Windows-only: on Unix, rename(2) replaces an open
-/// destination, so the in-place fallback never runs there.
+/// destination, so the POSIX-semantics fallback never runs there.
 /// </summary>
 public class SharedFileWriterTests : IDisposable
 {
-    /// <summary>The share mode of the SMB server's handle observed while the Mac polled the file.</summary>
+    /// <summary>The share mode of the SMB server's handle observed while the Mac held the file open.</summary>
     private const FileShare SmbClientShare = FileShare.ReadWrite | FileShare.Delete;
 
     private readonly string _tempDir;
@@ -44,27 +44,30 @@ public class SharedFileWriterTests : IDisposable
     }
 
     [Fact]
-    public void Rewrites_in_place_a_destination_held_open_the_way_the_Mac_SMB_client_holds_it()
+    public void Replaces_a_destination_held_open_the_way_the_Mac_SMB_client_holds_it()
     {
         if (!OperatingSystem.IsWindows())
         {
             return;
         }
 
-        File.WriteAllText(_path, "old content that is longer than the new content");
+        File.WriteAllText(_path, "old content");
         using var macHandle = HoldOpen(SmbClientShare);
 
-        _writer.Write(_path, "new content").Should().Be(SharedFileWriteOutcome.OverwrittenInPlace);
-        ReadThrough(macHandle).Should().Be("new content");
+        _writer.Write(_path, "new content").Should().Be(SharedFileWriteOutcome.ReplacedWhileHeldOpen);
 
-        _writer.Write(_path, "newer content, now longer than before").Should().Be(SharedFileWriteOutcome.OverwrittenInPlace);
-        ReadThrough(macHandle).Should().Be("newer content, now longer than before");
-
+        File.ReadAllText(_path).Should().Be("new content", "a new open must see the new file");
+        ReadThrough(macHandle).Should().Be(
+            "old content", "the held handle keeps the old file intact rather than a half-rewritten one");
         Directory.GetFiles(_tempDir).Should().ContainSingle().Which.Should().Be(_path);
+
+        // The name now refers to a file nobody holds, so the normal path works again.
+        _writer.Write(_path, "newer content").Should().Be(SharedFileWriteOutcome.Replaced);
+        File.ReadAllText(_path).Should().Be("newer content");
     }
 
     [Fact]
-    public void Reports_busy_without_throwing_when_the_reader_does_not_share_write_access()
+    public void Reports_busy_without_throwing_when_the_reader_does_not_share_delete_access()
     {
         if (!OperatingSystem.IsWindows())
         {
@@ -72,7 +75,7 @@ public class SharedFileWriterTests : IDisposable
         }
 
         File.WriteAllText(_path, "old");
-        using var reader = HoldOpen(FileShare.Read);
+        using var reader = HoldOpen(FileShare.ReadWrite);
 
         _writer.Write(_path, "new").Should().Be(SharedFileWriteOutcome.DestinationBusy);
 
@@ -81,11 +84,11 @@ public class SharedFileWriterTests : IDisposable
     }
 
     [Fact]
-    public void Still_throws_when_the_destination_cannot_be_written_at_all()
+    public void Still_throws_when_the_destination_is_read_only()
     {
         if (!OperatingSystem.IsWindows())
         {
-            return; // The read-only attribute blocks rename-over and open-for-write only on Windows.
+            return; // The read-only attribute blocks rename-over only on Windows.
         }
 
         File.WriteAllText(_path, "old");
@@ -95,6 +98,7 @@ public class SharedFileWriterTests : IDisposable
             var write = () => _writer.Write(_path, "new");
 
             write.Should().Throw<UnauthorizedAccessException>();
+            File.ReadAllText(_path).Should().Be("old");
         }
         finally
         {
@@ -112,19 +116,19 @@ public class SharedFileWriterTests : IDisposable
 
         File.WriteAllText(_path, "old");
 
-        using (HoldOpen(SmbClientShare))
-        {
-            WriteThreeTimes();
-        }
-
-        using (HoldOpen(FileShare.Read))
+        using (HoldOpen(FileShare.ReadWrite))
         {
             WriteThreeTimes();
         }
 
         WriteThreeTimes();
 
-        _logger.Entries.Select(e => e.Level).Should().Equal(LogLevel.Information, LogLevel.Warning, LogLevel.Information);
+        using (HoldOpen(SmbClientShare))
+        {
+            _writer.Write(_path, "while held");
+        }
+
+        _logger.Entries.Select(e => e.Level).Should().Equal(LogLevel.Warning, LogLevel.Information, LogLevel.Information);
         _logger.Entries.Should().OnlyContain(e => e.Exception == null);
 
         void WriteThreeTimes()
@@ -136,7 +140,7 @@ public class SharedFileWriterTests : IDisposable
         }
     }
 
-    /// <summary>Unbuffered, so every ReadThrough sees what is on disk now.</summary>
+    /// <summary>Unbuffered, so every ReadThrough sees what the handle refers to now.</summary>
     private FileStream HoldOpen(FileShare share) =>
         new(_path, FileMode.Open, FileAccess.Read, share, bufferSize: 0);
 

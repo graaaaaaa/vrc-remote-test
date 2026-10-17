@@ -81,8 +81,8 @@ public sealed class VrchatLogService : BackgroundService
 
     /// <summary>
     /// Tmp-then-rename like ResultWriter, except that a destination held open by the
-    /// Mac's SMB client is rewritten in place rather than failing every poll (see
-    /// SharedFileWriter).
+    /// Mac's SMB client is replaced with POSIX semantics rather than failing every poll
+    /// (see SharedFileWriter).
     /// </summary>
     private void Publish(string content)
     {

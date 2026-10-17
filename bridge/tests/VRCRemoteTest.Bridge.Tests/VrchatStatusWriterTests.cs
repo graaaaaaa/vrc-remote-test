@@ -92,9 +92,7 @@ public class VrchatStatusWriterTests : IDisposable
 
         _writer.Write(new VrchatStatus { IsRunning = true, UpdatedAtUtc = DateTimeOffset.UtcNow }, _tempDir);
 
-        macHandle.Seek(0, SeekOrigin.Begin);
-        using var reader = new StreamReader(macHandle, leaveOpen: true);
-        var parsed = JsonSerializer.Deserialize<VrchatStatus>(reader.ReadToEnd(), DeserializeOptions);
+        var parsed = JsonSerializer.Deserialize<VrchatStatus>(File.ReadAllText(path), DeserializeOptions);
         parsed!.IsRunning.Should().BeTrue();
         Directory.GetFiles(_tempDir).Should().ContainSingle().Which.Should().Be(path);
     }
