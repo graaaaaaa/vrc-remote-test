@@ -720,7 +720,7 @@ incoming/<buildId>.ready.json
 
 Windows Bridgeは`.vrcw`の出現自体では処理を開始しない。
 
-Mac は rename したあと、その名前に触らない。それでも、Bridge が取り込んで消した `.ready.json` と同じ名前の、中身が空（0 バイト）のファイルが、あとから `incoming` に現れたことがある（2026-10-18、Relaunch の配置の約 10 秒後に1回。Mac の SMB クライアントが名前を作り直したとみられる。`docs/validation/smb-late-empty-manifest.md`）。Bridge は、処理済みの buildId の名前で届いたものでは結果を書き換えない（§24）。
+Mac は rename したあと、その名前に触らない。それでも、Bridge が取り込んで消した `.ready.json` と同じ名前の、中身が空（0 バイト）のファイルが、あとから `incoming` に現れたことがある（2026-10-18 に1回。Mac が rename した 5 ms 後に Bridge が取り込んで消し、その 5 ms 後に、Mac の SMB クライアントがその名前に拡張属性を名前付きストリームとして書いて、Windows がファイルごと作り直した。Windows の変更ジャーナルで確認。`docs/validation/smb-late-empty-manifest.md`）。Bridge は、処理済みの buildId の名前で届いたものでは結果を書き換えない（§24）。
 
 ---
 
