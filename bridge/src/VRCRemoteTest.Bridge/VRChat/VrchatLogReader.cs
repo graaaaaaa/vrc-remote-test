@@ -44,17 +44,6 @@ public sealed class VrchatLogReader : IVrchatLogReader
 
     private const string TruncationMarker = "... [truncated]";
 
-    /// <summary>
-    /// VRChat created its output_log 0.70-0.84 s after the process start on real
-    /// hardware without load (docs/validation/multi-client-spike.md, PR #2 verification),
-    /// so the first 5-second poll after a cold start usually finds no file yet. Until
-    /// the first client is this old, an unmatched log publishes nothing instead of a
-    /// diagnostic. Under heavy load the file took 11-22 s; past this grace, and while the
-    /// file could still be named in the client's range, the diagnostic says the log is
-    /// not there yet rather than that it cannot be matched.
-    /// </summary>
-    private static readonly TimeSpan LogCreationGrace = TimeSpan.FromSeconds(10);
-
     private readonly BridgeOptions _options;
     private readonly IVrchatProcessMonitor _processMonitor;
     private readonly ILogger<VrchatLogReader> _logger;
@@ -167,24 +156,26 @@ public sealed class VrchatLogReader : IVrchatLogReader
             : new VrchatLogMatcher.MatchResult(null, VrchatLogMatcher.MatchFailure.Ambiguous);
         if (result.Path is not { } match)
         {
-            var age = client.CreationTimeUtc is { } created ? DateTime.UtcNow - created : (TimeSpan?)null;
-            if (age < LogCreationGrace)
-            {
-                return LogSnapshotResult.Empty();
-            }
-
-            var started = client.CreationTimeUtc is { } startedUtc
-                ? $"started {startedUtc:yyyy-MM-dd HH:mm:ss}Z"
+            var started = client.CreationTimeUtc is { } created
+                ? $"started {created:yyyy-MM-dd HH:mm:ss}Z"
                 : "start time unknown";
 
-            // Past MaxRangeLength after the start, a new file can no longer be named in the
-            // client's range, so "not yet" would never end; the generic message applies.
-            if (result.Failure == VrchatLogMatcher.MatchFailure.NoFileYet && age < VrchatLogMatcher.MaxRangeLength)
+            // VRChat created its output_log 0.70-0.84 s after the process start on real
+            // hardware without load, and 11-22 s after it with the CPU at about 100%
+            // (docs/validation/multi-client-spike.md, PR #2 verification, item 12), so the
+            // first poll after a cold start usually finds no file yet. Saying so replaces the
+            // previous session's log at once: publishing nothing would leave that closed
+            // client's log on the share, shown as if it were this client's (a9292a1
+            // re-verification). Past MaxRangeLength after the start, a new file can no
+            // longer be named in the client's range, so "not yet" would never end and the
+            // generic message applies.
+            if (result.Failure == VrchatLogMatcher.MatchFailure.NoFileYet
+                && DateTime.UtcNow - client.CreationTimeUtc < VrchatLogMatcher.MaxRangeLength)
             {
                 return Unmatched(
                     $"The first VRChat client (PID {client.ProcessId}, {started}) has not created its " +
-                    $"{OutputLogPattern} file yet; under heavy CPU load this can take 20 seconds or more. " +
-                    "Its log is shown once it appears.");
+                    $"{OutputLogPattern} file yet. This usually takes about a second, and 20 seconds or more " +
+                    "under heavy CPU load; its log is shown once it appears.");
             }
 
             return Unmatched(
