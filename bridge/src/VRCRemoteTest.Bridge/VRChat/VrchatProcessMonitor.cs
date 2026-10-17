@@ -32,7 +32,8 @@ namespace VRCRemoteTest.Bridge.VRChat;
 /// </summary>
 public sealed class VrchatProcessMonitor : IVrchatProcessMonitor
 {
-    private const string ProcessName = "VRChat";
+    /// <summary>The image name without ".exe", as Process.ProcessName reports it.</summary>
+    internal const string ProcessName = "VRChat";
     private const string WmiProcessName = "VRChat.exe";
     private const string WatchWorldsArgument = "--watch-worlds";
 
