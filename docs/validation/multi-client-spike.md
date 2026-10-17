@@ -422,6 +422,19 @@ CPU 負荷あり（16 個の論理 CPU すべてを `pwsh` の空回しで使い
 - `config.json` は確認前のバックアップから元に戻した（`VrchatClientCount` なし、settle 30 秒、timeout 60 秒）。Bridge の exe は `f91ff0e` のビルドのまま（確認前の exe は `%LOCALAPPDATA%\VRCRemoteTest\pr2-test-backup-20261017-175136\` に退避した）。
 - ゲーム内の Logging は確認前から「完全」だったので、`setup-windows.md` §9-2 の戻し方（output_log と共有の写しの削除）は行っていない。
 
+#### `a9292a1` の再確認（2026-10-17 19:05〜19:08）
+
+`a9292a1`（1台目の起動から10秒の間は、ログを対応付けできなくても診断を出さない）を、PR #1（`d39650f`）と手元でマージした `50ad181`（push していない）で確かめた。Windows の `dotnet test` は 306 件中 303 件成功（落ちたのはシンボリックリンクの3件だけ）。exe（SHA-256 `861BBD4B…0134F7E`）を `install-bridge.ps1` で入れ替え、`VrchatClientCount: 2` で、上と同じ模擬のアップロードを使った。
+
+| 確かめたこと | 結果 |
+|------|------|
+| コールドスタートの直後に診断の1行が出ないか（2回） | 出なかった。Bridge のログにも `VRChat log not published` は無く、1台目の起動から 5.1 秒後・2.2 秒後に `Showing ... as the log of VRChat client ...` で固定された |
+| 同じ秒に起動したとき（`start-vrchat-dev.ps1 -Clients 2 -LaunchIntervalSeconds 0`、14ms 差）に、これまでどおり診断が出るか | 出た。1台目の起動から 13.4 秒後（10 秒の猶予のあとの次の読み取り）に `VRChat log not published: Could not match ...` が出て、写しが診断の1行になった |
+
+気づいたこと: 対応付けを待つ間（`LogSnapshotResult.Empty()`）は `VrchatLogService` が写しを書かないので、共有の `vrchat-latest.log` には**前のセッションのログ（閉じた台のログ）が残る**。修正の前は、最初の読み取りで診断の1行がこれを上書きしていた。今回は、コールドスタートで固定されるまでの 2〜5 秒間と、同じ秒に起動したときの約 13 秒間、閉じた台の古いログが写しに残っていた。Unity の Log Viewer には、その間この古いログが表示されると見られる（Unity での表示は未確認）。
+
+後片付け: `config.json` は再び確認前のバックアップに戻した。Bridge の exe は `50ad181` のビルドのまま。
+
 ---
 
 ## Go/No-Go 判定テーブル
