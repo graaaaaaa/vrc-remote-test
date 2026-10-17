@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.5.1] - 2026-10-18
+
+Fixes a Windows Bridge bug that could overwrite a successful build's result with a failure. The fix is in the Bridge only and the Unity package itself has no functional changes, so **update the Windows Bridge** (`docs/setup-windows.md`, steps 1 and 6). An existing `config.json` keeps working as before.
+
+### Fixed
+
+- When the Bridge took in a manifest within milliseconds of the Mac placing it, the Mac's SMB client could recreate an empty file under the same name in `incoming` (it writes an extended attribute to that name, and Windows creates the file). The Bridge read that file as a new build and overwrote the `deployed` result with `MANIFEST_INVALID`, although the world had been deployed and Unity had already shown the build as succeeded. The cause and the checks on Windows are in `docs/validation/smb-late-empty-manifest.md`.
+- A manifest the Bridge cannot read (empty, invalid JSON, missing or invalid `buildId`, over 64 KiB) whose file name is a build that was already processed (its `buildId` is in the Bridge's archive or has a result file) is now deleted without writing a result, and the Bridge logs a warning (`Discarding ...: ..., and build <buildId> was already processed, so its result is kept.`). For a build that was not processed, it still fails with `MANIFEST_INVALID`.
+- A duplicate upload of a processed build no longer rewrites its result file (`Build <buildId> was already processed; consumed the duplicate upload and kept its result.`). `BUILD_ALREADY_PROCESSED` is written only when the build has no result file. The duplicate check now runs right after the `buildId` is checked, so a duplicate with a disallowed artifact file name no longer overwrites the result either.
+
 ## [0.5.0] - 2026-10-18
 
 The Windows Bridge can now put VRChat clients on separate accounts into one instance (`VrchatClientMode: Relaunch`), and the Log Viewer finds the first client's log more reliably. The Unity package itself has no functional changes, so **update the Windows Bridge** (`docs/setup-windows.md`, steps 1 and 6) to get them. An existing `config.json` keeps working as before.

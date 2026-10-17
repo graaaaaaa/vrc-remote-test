@@ -491,7 +491,7 @@ VRChatのホーム画面到達を確認したら準備完了。以降はUnity側
 
 - 配置のたびに全台がログインし直し、ワールドを読み込み直す。スパイクでは、終了に1.5〜3.8秒、起動から2台の入室まで9〜15秒だった
 - 結果（`deployed`）は、全台のプロセスを起動できた時点で書かれる（入室までは確かめない）
-- **Unity の Preflight（v0.3.0〜v0.5.0）は、Relaunch で正常に動いているときも `VRChat is running without --watch-worlds` の警告を出す**。Relaunch では `--watch-worlds` を付けないので想定どおりで、ビルドは止まらない
+- **Unity の Preflight（v0.3.0〜v0.5.1）は、Relaunch で正常に動いているときも `VRChat is running without --watch-worlds` の警告を出す**。Relaunch では `--watch-worlds` を付けないので想定どおりで、ビルドは止まらない
 - Log Viewer は、記録の中で最も早く起動した、まだ動いている台のログを表示する。起動し直しの間（台を閉じ始めてから、新しい1台目を起動して記録するまで。記録の台がもう終了していても同じ）は、前のセッションのログの代わりに「The Bridge is relaunching its VRChat clients ...」の1行になる（手順11）
 - **Relaunch を使っている間は、VRChat を手で起動しない**。手で起動した VRChat があると、次のビルドは何も終了させずに失敗する。閉じてから送り直す
 - Unity 側の Result Timeout: 終了の待ち（最大20秒）が加わる。結果が書かれるまでの時間は「前に並んでいるビルドの残り ＋ コピー・検証 ＋ 終了の待ち（最大20秒）＋ 起動の間隔（(台数−1)×3秒。ログファイルが遅いときは最大で 60秒＋(台数−1)×3秒）＋ 余裕」。手順9の目安どおり **120秒以上、続けて送るなら180秒から**にする
@@ -738,7 +738,7 @@ Rename-Item -LiteralPath 'C:\VRCRemoteTest' -NewName ('VRCRemoteTest.old-' + (Ge
 | Log Viewer に `Could not match an output_log_*.txt file ...` が出る | 1台目のログを特定できない（手順11）。Bridge のログに `Could not ask Windows Restart Manager ...` があれば、ファイルを開いているプロセスを調べられず、ファイル名の時刻だけで対応付けている | 台を全部閉じて、Bridge に起動させ直す（前の台のログができてから次を起動するので、ファイルが分かれる）。手で起動するなら、1秒以上あけて1台ずつ起動する |
 | Log Viewer に `... is or was also open by other VRChat clients ...` が出る | 1台目のログに、ほかの台も書いている（ログを書き始めたのが同じ秒だった。手順11） | 台を全部閉じて、Bridge に起動させ直す。CPU の負荷が高いときに起きやすいので、負荷を下げてから起動する |
 | Bridge のログに `Discarding ...: ..., and build ... was already processed, so its result is kept.` や `Build ... was already processed; consumed the duplicate upload and kept its result.` が出る | 処理済みのビルドの manifest と同じ名前のファイルが、あとから `incoming` に届いた。`(0 bytes)` なら、Mac が置いた直後（数 ms のうち）に Bridge が取り込んで消した名前に、Mac の SMB クライアントが拡張属性を書いて作り直した（`docs/validation/smb-late-empty-manifest.md`） | 何もしなくてよい。配置と `results` の結果は最初の処理のまま。よく出るなら、その時刻と Mac の操作を記録して報告する |
-| v0.5.0 以前の Bridge で、`deployed` だった結果ファイルが、数秒後に `MANIFEST_INVALID`（`Manifest could not be parsed.`）に変わっている | 上と同じ空のファイルを、新しいビルドとして読んで失敗を書いた。配置は成功している（`state\archive` に manifest がある） | Bridge を更新する。それまでは、`state\archive\<buildId>.ready.json` があれば配置は成功している |
+| v0.5.0 以前の Bridge で、`deployed` だった結果ファイルが、数秒後に `MANIFEST_INVALID`（`Manifest could not be parsed.`）に変わっている | 上と同じ空のファイルを、新しいビルドとして読んで失敗を書いた。配置は成功している（`state\archive` に manifest がある） | Bridge を v0.5.1 以降に更新する。それまでは、`state\archive\<buildId>.ready.json` があれば配置は成功している |
 | Bridge のログに `Ignoring legacy ... inside the share` が出る | 共有内に旧構成の `processing`・`archive`・`failed` が残っている | 手順14に従って移行し、旧ディレクトリを削除する |
 
 ---
