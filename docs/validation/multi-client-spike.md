@@ -385,7 +385,7 @@ PR #2（同じアカウントの N 台起動、`VrchatClientCount`）を Windows
 | 4. 2台のうち1台を閉じて送る（2回） | 合格 | 1回目に `VRChat clients changed: deploying to 1 of 2 VRChat client(s); ...` が1回だけ出て成功し、残りの台がリロードした。2回目は警告なしで成功 |
 | 5. `-NoWatchWorlds` の台だけ | 合格 | `VRCHAT_WATCH_WORLDS_MISSING`（2.2 秒）。何も起動しなかった |
 | 5. `--watch-worlds` 付きと混在 | 合格 | `... deploying to 1 of 2 ...; 1 VRChat client(s) without --watch-worlds will not reload.` の警告が1回。付きの台が起動した直後だったので `Waiting for 1 VRChat client(s) ... = 30` のあと 30 秒で配置。付きの台だけがリロードし、無しの台のログには配置したファイルの `World Updated` が出なかった |
-| 6. Unity v0.3.0 の Preflight と Log Viewer | Windows 側だけ確認 | 共有の `status\vrchat-status.json` は 10 秒ごと、`logs\vrchat-latest.log` は 5 秒ごとに更新され続けた（PR #1 の修正が効いている）。Log Viewer の写しは1台目（最初に起動した台。混在のときは `--watch-worlds` 無しの台）のログに固定され、status の代表は `--watch-worlds` 付きの最も古い台だった。`start-vrchat-dev.ps1 -Clients 2 -LaunchIntervalSeconds 0`（13ms 差で起動）では、写しが `Could not match an output_log_*.txt file to the first VRChat client ...` の1行になった（このときのログ名は `17-56-44` と `17-56-45` に分かれていたが、2台とも同じ秒に起動しているので対応付けを拒否した）。**Unity での表示は未確認**（Mac で見る必要がある） |
+| 6. Unity v0.3.0 の Preflight と Log Viewer | 合格（Unity での表示は 19:25〜19:28 に確認、下の「項目6: Unity での表示」） | 共有の `status\vrchat-status.json` は 10 秒ごと、`logs\vrchat-latest.log` は 5 秒ごとに更新され続けた（PR #1 の修正が効いている）。Log Viewer の写しは1台目（最初に起動した台。混在のときは `--watch-worlds` 無しの台）のログに固定され、status の代表は `--watch-worlds` 付きの最も古い台だった。`start-vrchat-dev.ps1 -Clients 2 -LaunchIntervalSeconds 0`（13ms 差で起動）では、写しが `Could not match an output_log_*.txt file to the first VRChat client ...` の1行になった（このときのログ名は `17-56-44` と `17-56-45` に分かれていたが、2台とも同じ秒に起動しているので対応付けを拒否した）。Unity での表示は、あとで `50ad181` のビルドで確かめた |
 | 7. `VrchatMode: VR` で2台 | 未実施 | HMD が要る |
 | 8. settle 15・20・25・30 でコールドスタート直後に次を送る | 合格 | どの値でも `Waiting for 2 VRChat client(s) to finish starting before deploying (VrchatStartupSettleDelaySeconds = N)` のあと、最後の台の起動から 15.6 / 20.8 / 26.0 / 30.1 秒で配置し、2台とも `local:ce318f…:1` へそろってリロードした（各台 `OnPlayerJoined` 2件） |
 | 9. 昇格した VRChat の数え方 | 未実施 | UAC の操作が要る |
@@ -434,6 +434,15 @@ CPU 負荷あり（16 個の論理 CPU すべてを `pwsh` の空回しで使い
 気づいたこと: 対応付けを待つ間（`LogSnapshotResult.Empty()`）は `VrchatLogService` が写しを書かないので、共有の `vrchat-latest.log` には**前のセッションのログ（閉じた台のログ）が残る**。修正の前は、最初の読み取りで診断の1行がこれを上書きしていた。今回は、コールドスタートで固定されるまでの 2〜5 秒間と、同じ秒に起動したときの約 13 秒間、閉じた台の古いログが写しに残っていた。Unity の Log Viewer には、その間この古いログが表示されると見られる（Unity での表示は未確認）。
 
 後片付け: `config.json` は再び確認前のバックアップに戻した。Bridge の exe は `50ad181` のビルドのまま。
+
+#### 項目6: Unity での表示（2026-10-17 19:25〜19:28）
+
+Mac の Unity（Vrc-remote-test プロジェクト、パッケージ v0.3.0）で Preflight と Log Viewer を見た。Windows では `50ad181` のビルドの Bridge のまま（`config.json` は確認前の値）、`start-vrchat-dev.ps1` で VRChat を起動した。Mac 側の観察は Mac のセッションの報告による。
+
+| 手順 | Windows 側 | Mac の Unity | 結果 |
+|------|------|------|------|
+| 1. `-Clients 2`（`--watch-worlds` 付き、`--url` なし、3秒間隔） | 1台目 PID 25568（19:25:30.244）、2台目 PID 29292（19:25:33.271）。19:25:35.700 に `Showing ...output_log_2026-10-17_19-25-30.txt as the log of VRChat client 25568.` | Preflight は「VRChat: Running」（緑）。Log Viewer に 19:25:55 の `[AssetBundleDownloadManager] [100] Unpacking World (local:error_7484453976886834)` が出た | 合格。2台は `--url` が無いので別々の Error World に入り、1台目のログは `local:error_7484453976886834`、2台目のログは `local:error_2111340501460972` だった。Log Viewer は1台目のログを表示していた |
+| 2. `-Clients 2 -LaunchIntervalSeconds 0`（13ms 差） | 1台目 PID 13976（19:27:03.460）、2台目 PID 2300（19:27:03.473）。ログは `19-27-03` と `19-27-04` の2つ。19:27:16.744（1台目の起動から 13.3 秒後）に `VRChat log not published: Could not match an output_log_*.txt file to the first VRChat client (PID 13976, ...)` | Log Viewer に同じ診断の1行が出た | 合格。それまでの約13秒は、手順1の1台目（閉じた台）のログが共有の写しに残っていた（上の「`a9292a1` の再確認」で書いた件） |
 
 ---
 
