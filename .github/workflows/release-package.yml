@@ -271,14 +271,17 @@ jobs:
           echo "sha256=$(sha256sum "dist/$ASSET" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
 
       # Into its own directory, so nothing else in dist/ can be mistaken for
-      # the artifact. download-artifact only warns on an archive digest
-      # mismatch, so the raw executable is compared with the hash the bridge
-      # job attested, and anything else fails the run.
+      # the artifact. Since v8, download-artifact fails on an archive digest
+      # mismatch by default; `digest-mismatch: error` keeps that explicit.
+      # That digest only covers the zip between upload and download, so the
+      # raw executable is still compared with the hash the bridge job
+      # attested, and anything else fails the run.
       - name: Download the Bridge executable built by this run
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: bridge-exe
           path: dist/bridge-artifact
+          digest-mismatch: error
 
       - name: Verify the Bridge executable matches the attested hash
         id: bridge
