@@ -1003,7 +1003,8 @@ Bridgeが起動する場合（§30）は、先頭に次を加える。SDKのBuil
 
 - 配置先のフルパスは、Bridgeが`VrchatWorldsDirectory`と自分で付けた配置名（`vrc-remote-<buildId>.vrcw`）から作り、全体をパーセントエンコードする（`:` `\` 空白 `&` も含む）。manifestの値は引数に入れない（§49）。
 - roomIdは起動のまとまりごとにBridgeが1つ作り、全台に同じ値を渡す。VRChatはroomIdをインスタンスIDに使わない。
-- `--profile`は付けない。全台がprofile 0、つまり同じアカウントになる。
+- 既定（`VrchatClientMode: Reload`）では`--profile`は付けない。全台がprofile 0、つまり同じアカウントになる。
+- `VrchatClientMode: Relaunch`（§32）では、`--watch-worlds`を付けず、末尾に`--profile=<n>`（`VrchatProfiles`の値、0〜99）を付ける。profileの値も設定ファイルで検証した整数だけで、manifestからは何も入れない。
 - 複数台を起動するとき、VR Testでも HMD を使うのは1台目だけで、2台目以降には`--no-vr`を付ける。
 
 ---
@@ -1084,11 +1085,39 @@ cleanup（今回配置したファイルは消さない）
 
 状態を確かめられないVRChat（プロセスの一覧が取れない、セッションを読めない）が動いているときは、コールドスタートせずに`VRCHAT_UNMANAGED_RUNNING`で失敗する。
 
+`VrchatClientMode: Relaunch`（§32、別アカウントの台）では、ビルドのたびに次の順で行う。起動済みの台へ配置するだけ、という場合は無い。
+
+```text
+manifest と artifact の検証
+↓
+同じセッションの VRChat を列挙し、ハンドルを開いたまま記録と照合（§32）
+  管理下でない台・確かめられない台があれば VRCHAT_UNMANAGED_RUNNING（何も終了させない）
+↓
+管理下の台を終了（§32）。確かめられない台があれば VRCHAT_START_FAILED（配置しない）
+↓
+もう一度列挙。新しく現れた台があれば VRCHAT_UNMANAGED_RUNNING（配置しない）
+↓
+.vrcw deploy
+↓
+archive（移動の成功を確かめる）
+↓
+VrchatProfiles の順に --url と --profile=<n> で起動（--watch-worlds なし。間隔は上と同じ）
+  1台起動するごとに記録に書く。書けなければそこで止める（UNKNOWN_ERROR）
+  2台目以降の前に列挙し直し、管理下でない台・確かめられない台が現れていれば止める（VRCHAT_UNMANAGED_RUNNING、「N台中k台を起動」）
+↓
+result
+↓
+cleanup（今回配置したファイルは消さない）
+```
+
+- 起動の途中でBridgeが止まった場合、記録済みの台は次のビルドで終了の対象になる。起動したが記録する前に止まった台は、次のビルドで管理下でない台として止まるので、手で閉じてもらう。archive後なので、同じビルドを配置し直すことはない。
+- 外から起動されるVRChatを完全に締め出すことはできないので、2台目以降の前の確認は「見つけたら止める」までの保証とする。
+
 ---
 
 # 31. VRChat startup readiness
 
-コールドスタート（§30）では待たない。
+コールドスタート（§30）では待たない。`VrchatClientMode: Relaunch`（§30・§32）でも待たない（`--watch-worlds`を付けないので、待つ対象が無い。毎回`--url`で起動し直す）。
 
 起動済みの台へ配置する前は、固定sleepだけに依存しない。Bridgeは`--watch-worlds`付きの全台について、
 
@@ -1138,7 +1167,27 @@ VRChat is running without --watch-worlds
 
 - `--watch-worlds`付きと無しが混ざっているときは、付きの台を対象に配置を成功させ、無しの台は終了させない（リロードされず、Bridgeのログで警告する）。Unityのstatusにはこれが出ない（§29）。
 - 状態を確かめられないVRChatがあるときは、何も終了させず、何も起動せずに`VRCHAT_UNMANAGED_RUNNING`で止め、手で閉じてもらう。
-- 別アカウントの台を配置のたびに終了・起動し直す方式（§65の複数VRChat profile）は、明示的なopt-inとし、Bridgeが起動したと確かめられた台だけを終了させる。v1では未実装。
+
+別アカウントの台（§65の複数VRChat profile）：
+
+別アカウントの台は、`--watch-worlds`でリロードさせるとアカウントごとに別のインスタンスへ分かれる（VRChatの不具合）が、終了して`--url`で起動し直すとそろう。そこで、配置のたびに終了・起動し直す方式を、明示的なopt-inとして用意する。
+
+```json
+{
+  "AutoLaunchVrchat": true,
+  "VrchatClientMode": "Relaunch",
+  "VrchatProfiles": [0, 1]
+}
+```
+
+- `VrchatClientMode`は`Reload`（既定、同じアカウント）か`Relaunch`。`Relaunch`では`AutoLaunchVrchat: true`と`VrchatProfiles`（1〜4件、0〜99、重複なし。件数が台数）が必須で、`VrchatClientCount`を書くと起動時にエラー。`Reload`で`VrchatProfiles`を書いてもエラー。Bridgeは各台のアカウントを判別しない（profileにはあらかじめ手でログインしておく。Bridgeは資格情報を扱わない）。
+- 終了させるのは、Bridgeが起動したと確かめられた台だけ。Bridgeは起動した台を`StateDirectory\managed-clients.json`（共有の外、§49）に記録する（`schemaVersion`、台ごとにPID、作成時刻を精度を落とさないUTCの文字列、セッション、profile、起動の順番）。管理下とみなすのは、PID・作成時刻・同じ対話セッション・プロセス名`VRChat`がすべて記録と一致する台だけで、名前やログの対応だけでは管理下とみなさない。
+- 照合の前にプロセスのハンドルを開き、照合から終了の要求・強制終了・終了の確認まで同じハンドルで行う（途中でPIDから開き直さない。ハンドルを開いている間はPIDが使い回されない）。
+- 終了は、全台にウィンドウを閉じるよう求め（ウィンドウがまだ無い台には、できてから求め直す）、全体で10秒たって残っている台だけを強制終了し、最初から20秒までに全台の終了を確かめる。確かめられない台があれば配置しない。「確かめられない」を「終了した」に読み替えない。停止要求が来たら、それ以上強制終了せず、配置もしない。
+- 記録が壊れているか知らない形式なら、どの台も管理下とみなさない（VRChatが動いていれば`VRCHAT_UNMANAGED_RUNNING`で止まる）。記録を読めない（アクセスの拒否、I/Oの例外）ときは、何も終了・配置せずに`UNKNOWN_ERROR`。記録は一時ファイルに書いて`Flush(true)`してから置き換え、書けなければ次の台を起動しない。
+- `status/vrchat-status.json`の`watchWorldsDetected`はfalseのままとし、偽ってtrueにはしない。Unity v0.3.0は正常に動いているときも`VRChat is running without --watch-worlds`の警告を出すが、ビルドは止まらない（手順書に書く）。
+- モードを切り替えるときは、VRChatを全部手で閉じてからBridgeを再起動する。動いている台を別のモードへ自動で移すことはしない。
+- §34（成功は「配置した」まで）と§49（manifestから何も実行しない）はそのまま。
 
 ---
 
@@ -2209,7 +2258,7 @@ SSH/SFTP transport
 
 Desktop / VR profile切替
 
-複数VRChat profile
+複数VRChat profile（配置のたびに終了・起動し直す方式は §32 の`VrchatClientMode: Relaunch`として実装済み。アカウントの自動判別、一部の台だけの起動し直しは未実装）
 
 VRC Quick Launcher integration
 

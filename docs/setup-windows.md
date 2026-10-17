@@ -385,10 +385,10 @@ VRChatのホーム画面到達を確認したら準備完了。以降はUnity側
 ```
 
 - `VrchatExecutable`は実際のSteamインストール先に合わせて調整する。ファイル名は`VRChat.exe`と完全一致している必要がある（大文字小文字は不問）
-- `VrchatClientCount`は起動する台数（1〜4、省略時は1）。2以上の使い方は手順9-1
+- `VrchatClientCount`は起動する台数（1〜4、省略時は1）。2以上の使い方は手順9-1。別々のアカウントの台を使うときは手順9-3（`VrchatClientMode: Relaunch`）
 - 有効化するとBridgeは、VRChatが1台も起動していない状態でビルドを受け取ると、**先にWorldsディレクトリへ配置してから**、そのファイルを`--url`に渡してVRChatを起動する（コールドスタート）。VRChatは起動時にそのワールドへ直接入るので、ホーム画面に着くのを待つ時間は無い。結果は、全台のプロセスを起動できた時点で書かれる（ワールドへの入室までは確かめない）
 - VRChatが起動済みなら、配置するだけで`--watch-worlds`付きの全台がリロードする。ただし、起動から`VrchatStartupSettleDelaySeconds`たっていない台があれば、その時間まで待ってから配置する。VRChatはログインが済むまで配置を拾わないため（コールドスタートの直後に続けて送ったビルドも、この待ちになる）
-- **既に`--watch-worlds`無しでVRChatが起動中の場合、Bridgeは自動的に再起動・終了させない**（`VRCHAT_WATCH_WORLDS_MISSING`でビルド失敗となる）。この場合は手動でVRChatを終了させるか、手順8の通り`--watch-worlds`付きで起動し直す
+- **既に`--watch-worlds`無しでVRChatが起動中の場合、Bridgeは自動的に再起動・終了させない**（`VRCHAT_WATCH_WORLDS_MISSING`でビルド失敗となる）。この場合は手動でVRChatを終了させるか、手順8の通り`--watch-worlds`付きで起動し直す。Bridge が VRChat を終了させるのは、手順9-3の Relaunch を選んだときに、自分で起動したと確かめられた台だけ
 - Bridgeが状態を確かめられないVRChat（プロセスの一覧を取れない、セッションを読めない、WMI がコマンドラインを返さない・時間内に答えない、など）が動いているときも、何も起動せず、何も終了させずに`VRCHAT_UNMANAGED_RUNNING`でビルドが失敗する。そのVRChatを手で閉じてから、もう一度ビルドを送る。Unity v0.3.0 にはこのコードの案内文がまだ無く、コードとメッセージだけが表示される。別のユーザーのセッション（別の Windows アカウントやリモートデスクトップ）で動いている VRChat は数えない
 - **`VrchatStartupSettleDelaySeconds`（起動済みの台へ配置するまでの最低待機時間）は環境によって調整が必要**。デフォルト30秒でも短すぎる場合、ファイル配置は成功してもリロードされないことがある。手で起動したVRChatがホーム画面へ到達するまでの体感時間を確認し、それに応じて値を調整すること（`--url`で起動した台は、実測では起動の10秒後から配置を拾った）
 - 同じ Windows アカウントでは、Bridge は1つしか動かない。`%LOCALAPPDATA%\VRCRemoteTest\state\bridge.lock`を開いたままにしておき、2つ目のBridgeは「Another VRC Remote Test Bridge is already running」とログに出して起動を拒否する。その日のログファイルは1つ目の Bridge が開いているので、2つ目のメッセージは `%LOCALAPPDATA%\VRCRemoteTest\logs\bridge-<日付>_001.log` のような別名のファイルに書かれる。ロックはアカウントごとなので、共有と Worlds は Bridge 用のアカウント（U）1つだけで使う
@@ -399,7 +399,7 @@ VRChatのホーム画面到達を確認したら準備完了。以降はUnity側
 
 `"VrchatClientCount": 2` のように2以上にすると、SDK の Build & Test の Number of Clients と同じように、コールドスタートで N 台を3秒以上の間隔で起動し（前の台のログファイルができるのを待つ。手順11）、全台が同じインスタンスに入る。以降のビルドでは、全台がそろって同じインスタンスへリロードする（`docs/validation/multi-client-spike.md`、4台まで確認済み）。
 
-- **全台が同じ VRChat アカウントになる**（`--profile` を付けないので、全台が profile 0）。別アカウントの台を混ぜる構成には未対応。今の VRChat では、別アカウントの台は配置のたびに別々のインスタンスへ分かれてしまう（スパイクのケース5）
+- **全台が同じ VRChat アカウントになる**（`--profile` を付けないので、全台が profile 0）。今の VRChat では、別アカウントの台は配置のたびのリロードで別々のインスタンスへ分かれてしまう（スパイクのケース5）。別アカウントの台は手順9-3の Relaunch で使う
 - 動いている台が `VrchatClientCount` より少ないとき（1台を手で閉じた、など）は、残っている台に配置するだけで、足りない台は起動しない（足した台は、リロードした台と別のインスタンスに入ってしまうため）。Bridge のログに台数の警告が、変わったときに1度だけ出る。N 台にそろえ直すには、VRChat を全部閉じてから次のビルドを送る
 - `--watch-worlds` 無しの VRChat が混ざっていても、`--watch-worlds` 付きの台があれば配置は成功する。無しの台はリロードされない（ログに警告が出る）
 - `VrchatMode: VR` では、HMD を使うのは1台目だけで、2台目以降はデスクトップで起動する
@@ -442,6 +442,76 @@ VRChatのホーム画面到達を確認したら準備完了。以降はUnity側
    Start-ScheduledTask -TaskName 'VRCRemoteTestBridge' -TaskPath '\'
    ```
 
+### 9-3. 別アカウントの複数台（`VrchatClientMode: Relaunch`）
+
+別々の VRChat アカウントの台を同じインスタンスに入れたいとき（プレイヤー間の同期の確認など）に使う。今の VRChat では、別アカウントの台を `--watch-worlds` でリロードさせると、アカウントごとに別のインスタンスに分かれてしまう（`docs/validation/multi-client-spike.md` のケース5）。全台を終了して `--url` で起動し直すとそろう（ケース4、ゲート2）。そこで Relaunch では、Bridge が配置のたびに、自分が起動した台を終了させてからワールドを配置し、profile ごとに起動し直す。Bridge が自分で起動したと確かめられた台しか終了させないので、明示的に選んだときだけ動く（既定は手順9-1の `Reload`）。
+
+`config.json`（手順9の例に2行足し、`VrchatClientCount` は消す）:
+
+```json
+{
+  "Bridge": {
+    "StagingDirectory": "C:\\VRCRemoteTest",
+    "VrchatWorldsDirectory": "C:\\Users\\<ユーザー名>\\AppData\\LocalLow\\VRChat\\VRChat\\Worlds",
+    "MaxArtifactSizeBytes": 524288000,
+    "RetainBuilds": 10,
+    "VrchatExecutable": "C:\\Program Files (x86)\\Steam\\steamapps\\common\\VRChat\\VRChat.exe",
+    "VrchatMode": "Desktop",
+    "AutoLaunchVrchat": true,
+    "VrchatClientMode": "Relaunch",
+    "VrchatProfiles": [0, 1]
+  }
+}
+```
+
+- `VrchatClientMode` は `Reload`（既定）か `Relaunch`（大文字小文字は不問）
+- `VrchatProfiles` は台ごとの VRChat の profile 番号（0〜99、1〜4件、重複なし）。並べた順に起動し、件数が台数になる。`VrchatClientCount` を書くと起動時の検証でエラーになる。`Reload` のまま `VrchatProfiles` を書いてもエラーになる
+- `AutoLaunchVrchat: true` が必要
+- `VrchatStartupSettleDelaySeconds` と `VrchatStartupTimeoutSeconds` は使わない（Relaunch では準備待ちをしない）
+- `VrchatMode: VR` では、HMD を使うのは1台目だけ（手順9-1と同じ）
+
+**準備（profile ごとに1回）**: 各 profile に、使うアカウントで一度ログインしておく。Bridge はアカウントの資格情報を扱わない。ビルドを送らずに、profile ごとに1台だけ起動してログインし、閉じる（手順8と同じく Windows のローカルにあるスクリプトを使う）:
+
+```powershell
+& (Join-Path $scripts 'start-vrchat-dev.ps1') -Profiles 0
+# ログインして VRChat を閉じてから
+& (Join-Path $scripts 'start-vrchat-dev.ps1') -Profiles 1
+```
+
+ゲーム内の Logging の設定は profile ごとではなく全 profile 共通（手順9-2）。
+
+**配置のたびに Bridge がすること**:
+
+1. 同じセッションの VRChat を調べ、Bridge の記録と照らして、Bridge が起動したと確かめられた台だけを対象にする。それ以外の VRChat（手で起動した台、記録の無い台、状態を確かめられない台）が1台でもあれば、**何も終了させずに**`VRCHAT_UNMANAGED_RUNNING`でビルドが失敗する
+2. 対象の台にウィンドウを閉じるよう求める（正常終了）。ウィンドウがまだ無い台（起動から1秒ほどの間）には、ウィンドウができてから求め直す。10秒たっても残っている台は強制終了する（強制終了しても次の起動・ログイン・ウィンドウの位置・設定に影響は無かった。スパイクのゲート3）。20秒以内に全台の終了を確かめられなければ、配置せずに`VRCHAT_START_FAILED`
+3. もう一度 VRChat を調べ、その間に起動された VRChat があれば、配置せずに`VRCHAT_UNMANAGED_RUNNING`
+4. ワールドを配置し、`VrchatProfiles` の順に `--url` と `--profile=<番号>` を付けて起動する（`--watch-worlds` は付けない）。間隔は手順9-1と同じく3秒以上で、前の台のログファイルができるのを待つ（手順11）。全台が同じインスタンスに入る
+5. 起動した台は、1台起動するごとに `%LOCALAPPDATA%\VRCRemoteTest\state\managed-clients.json` に記録する（PID、プロセスの作成時刻、セッション、profile、起動の順番）。次の配置で終了させるのは、PID・作成時刻（100ナノ秒の精度で比べる）・セッション・プロセス名 `VRChat` がすべて記録と一致する台だけ。PID が別のプロセスに使い回されていても、作成時刻が違うので終了させない。名前やログファイルだけで Bridge の台とみなすことはない
+6. 2台目以降を起動する前にも VRChat を調べ直し、Bridge が起動していない VRChat が現れていれば、それ以上起動せずに`VRCHAT_UNMANAGED_RUNNING`（メッセージに「Launched 1 of 2 ...」のように何台起動したかが出る）。現れた台は終了させない。外から VRChat を起動されるのを防ぐことはできないので、これは「見つけたら止める」までの保証
+
+- 配置のたびに全台がログインし直し、ワールドを読み込み直す。スパイクでは、終了に1.5〜3.8秒、起動から2台の入室まで9〜15秒だった
+- 結果（`deployed`）は、全台のプロセスを起動できた時点で書かれる（入室までは確かめない）
+- **Unity v0.3.0 の Preflight は、Relaunch で正常に動いているときも `VRChat is running without --watch-worlds` の警告を出す**。Relaunch では `--watch-worlds` を付けないので想定どおりで、ビルドは止まらない
+- Log Viewer は、記録の中で最も早く起動した、まだ動いている台のログを表示する（手順11）
+- **Relaunch を使っている間は、VRChat を手で起動しない**。手で起動した VRChat があると、次のビルドは何も終了させずに失敗する。閉じてから送り直す
+- Unity 側の Result Timeout: 終了の待ち（最大20秒）が加わる。結果が書かれるまでの時間は「前に並んでいるビルドの残り ＋ コピー・検証 ＋ 終了の待ち（最大20秒）＋ 起動の間隔（(台数−1)×3秒。ログファイルが遅いときは最大で 60秒＋(台数−1)×3秒）＋ 余裕」。手順9の目安どおり **90秒以上、続けて送るなら120秒から**にする
+- 2台目以降が VRCNP の名前付きパイプを作れないこと、メモリの目安、台の切り替え方（Option+Tab）は手順9-1と同じ
+
+**モードを切り替えるとき**: VRChat を全部手で閉じてから `config.json` を書き換え、Bridge を再起動する（`config.json` は Bridge の起動時にしか読まない。Task Scheduler で動かしているなら `Stop-ScheduledTask` と `Start-ScheduledTask`）。動いている台を別のモードへ移すことはしない。Reload の台を残したまま Relaunch にすると、それらは手で起動した台と同じ扱いになって止まる。Relaunch の台を残したまま Reload にすると、`--watch-worlds` 無しの台として `VRCHAT_WATCH_WORLDS_MISSING` になる。Relaunch のまま Bridge だけを再起動した場合は、記録と照合できる台をそのまま引き継ぐ。
+
+**うまくいかないとき（復旧手順）**:
+
+| 状況 | 原因と対処 |
+|------|------|
+| `VRCHAT_UNMANAGED_RUNNING` で失敗する | Bridge が起動したと確かめられない VRChat が動いている。何も終了・配置していない。Bridge のログの `VRChat is running that the Bridge did not launch or could not check (...)` に PID が出るので、その VRChat を手で閉じてから送り直す。Bridge が起動した台でも、記録する前に Bridge が止まった台や、記録を消したあとの台はこの扱いになる |
+| Bridge が台を起動している途中で止まった（強制終了、PC の再起動など） | 記録済みの台は、次の配置で終了・起動し直される。止まったビルドの結果は書かれず、Unity は `RESULT_TIMEOUT` になる（そのビルドは処理済みになるので、Unity でビルドし直して送る）。起動したが記録する前に止まった台は、次の配置で `VRCHAT_UNMANAGED_RUNNING` になるので、手で閉じる |
+| Bridge が台を終了させている途中で止まった | 配置も起動もしていない。Bridge を起動し直すと、そのビルドを最初（台の確認）からやり直す |
+| `VRCHAT_START_FAILED` で、メッセージが `Could not close ...` | Bridge が起動した台を20秒以内に終了させられなかった（応答なし、権限が変わった、など）。配置はしていない。その台をタスクマネージャーなどで終了させてから送り直す |
+| `UNKNOWN_ERROR` で、メッセージに `managed-clients.json` が出る | 記録を読めない（`could not be read`）・更新できない（`could not update its record`）・新しい台を記録できない（`could not be recorded`。その台までは起動している）。下の「記録の消し方」で記録を消す |
+| Bridge のログに `Ignoring ...managed-clients.json: ...` が出る | 記録が壊れているか、知らない形式。どの台も Bridge が起動した台とみなさないので、VRChat が動いていれば `VRCHAT_UNMANAGED_RUNNING` になる。VRChat を全部手で閉じてから送れば、正しい記録に書き直される |
+
+記録の消し方: 消すと、動いている台を Bridge が自分の台と認めなくなるので、**先に VRChat を全部閉じる**。そのあと Bridge を止め（手順9-2の3.）、`%LOCALAPPDATA%\VRCRemoteTest\state\managed-clients.json` と、あれば `managed-clients.json.tmp` を消して、Bridge を起動し直す。ファイルが無いのは初回として正常に扱われる。
+
 ---
 
 ## 10. （任意）Moonlight連携
@@ -457,7 +527,7 @@ Moonlight（NVIDIA GameStream/Sunshine互換のリモートデスクトップク
 
 `RemoteBuildCommand`が使う同じSMB共有経由で、BridgeがVRChatの`output_log_*.txt`（最新200行、直近ウィンドウのスナップショット）を5秒間隔で配信する。Windows側の追加設定は不要 — `VrchatWorldsDirectory`が正しく設定済みであれば自動的に有効になる。Unity側の `VRC Remote Test` ウィンドウの `VRChat Log` foldoutから、カテゴリフィルタ（All/Error/Exception/Udon/Shader/Warning）付きで閲覧できる。表示専用で、readiness判定やビルドの成否には一切影響しない。
 
-VRChat が動いている間は、最新のファイルではなく1台目（`--watch-worlds` 付きの台のうち最も早く起動した台）のログを表示する。output_log には PID が出ないので、ファイル名の時刻と台の起動時刻で対応付け、その台が動いている間は同じファイルを表示し続ける。表示は次のとおり。Logging の設定は手順9-2を参照。
+VRChat が動いている間は、最新のファイルではなく1台目（`--watch-worlds` 付きの台のうち最も早く起動した台。Relaunch（手順9-3）では、Bridge の記録の中で最も早く起動した、まだ動いている台）のログを表示する。output_log には PID が出ないので、ファイル名の時刻と台の起動時刻で対応付け、その台が動いている間は同じファイルを表示し続ける。表示は次のとおり。Logging の設定は手順9-2を参照。
 
 - 1台目のログファイルがまだ無いときは、「The first VRChat client (PID ...) has not created its output_log_*.txt file yet ...」という1行を表示する。起動直後の最初の更新はたいていこの1行になる（ファイルができるのは起動の約1秒後で、負荷が高いと20秒以上かかる）。ファイルができれば、次の更新（5秒以内）で1台目のログに切り替わる。この1行が、前のセッション（閉じた台）のログの表示を置き換える
 - 同じ秒に起動した台がある、ログが1つのファイルに混ざった、起動から1分以上たってログができた、ログを作ったあとに時計やタイムゾーンが変わった、などで対応付けられないときは、ログの代わりに「Could not match an output_log_*.txt file to the first VRChat client ...」という1行を表示する。別の台のログを1台目のものとして表示することはしない
@@ -470,7 +540,7 @@ VRChat はログファイルに、ログを書き始めた時刻（秒まで）�
 - 待つのは、1回のコールドスタートで合わせて60秒まで。過ぎると Bridge のログに `... has not created an output_log file within 60s ...` の警告を出し、残りの台を3秒間隔で起動する。このとき、残りの台どうしのログは1つのファイルに混ざることがある。混ざったファイルは、そのとき1台目の台のログとしては表示しないが、前の台を閉じていって残った台が1台目になると、その台のログとして表示されることがある
 - ログの一覧を読めないとき（権限、ファイルが512個を超えている、など）は、待たずに3秒間隔で起動し、Bridge のログに警告を出す
 
-この待ちは Bridge が起動する台（`AutoLaunchVrchat: true` のコールドスタート）だけに効く。`start-vrchat-dev.ps1 -Clients N` は決まった間隔（`-LaunchIntervalSeconds`、既定3秒）で起動するので、CPU の負荷が高いと Log Viewer が1台目のログを表示できないことがあり、ログが起動の間隔を超えて遅れると、終了した台のログを次の台のものとして表示することもありうる。負荷の高い状態で手で起動するなら、`-LaunchIntervalSeconds 30` のように間隔を延ばす。
+この待ちは Bridge が起動する台（`AutoLaunchVrchat: true` のコールドスタートと、Relaunch の起動し直し）だけに効く。`start-vrchat-dev.ps1 -Clients N` は決まった間隔（`-LaunchIntervalSeconds`、既定3秒）で起動するので、CPU の負荷が高いと Log Viewer が1台目のログを表示できないことがあり、ログが起動の間隔を超えて遅れると、終了した台のログを次の台のものとして表示することもありうる。負荷の高い状態で手で起動するなら、`-LaunchIntervalSeconds 30` のように間隔を延ばす。
 
 VRChat のログには、自分の表示名やユーザー ID、訪れたワールドの情報、同じインスタンスにいた他プレイヤーの表示名が含まれる。共有に読み取り権限を持つ人はこれを読めるので、共有の資格情報は他人に渡さないこと。
 
@@ -652,6 +722,10 @@ Rename-Item -LiteralPath 'C:\VRCRemoteTest' -NewName ('VRCRemoteTest.old-' + (Ge
 | Bridge が `Another VRC Remote Test Bridge is already running` と出して終了する（このメッセージは `logs\bridge-<日付>_001.log` など、末尾に番号の付いた別名のログファイルにある） | 別の Bridge がすでに動いている（手動で起動したものと Task Scheduler のものが重なった、など） | `Get-Process VRCRemoteTest.Bridge` で確認し、1つだけにする。動いている Bridge が無いのにこのメッセージが出るなら、`%LOCALAPPDATA%\VRCRemoteTest\state\bridge.lock` を開いているプロセスを確かめる |
 | ビルドが `VRCHAT_UNMANAGED_RUNNING` で失敗する | Bridge が状態を確かめられない VRChat が動いている（手順9）。何も起動・終了していない | その VRChat を手で閉じてから、もう一度ビルドを送る。Bridge のログに理由（プロセスの一覧が取れない、確かめられない台の数）が出る |
 | `VrchatClientCount` を2以上にしたのに、1台にしか配置されない・台が増えない | 動いている台があると、足りない台は起動しない（手順9-1） | VRChat を全部閉じてから次のビルドを送る。Bridge のログの `VRChat clients changed` で台数を確認できる |
+| 別アカウントの台が、配置のたびに別々のインスタンスに分かれる | `Reload`（既定）では、別アカウントの台は `--watch-worlds` のリロードで分かれる（VRChat の不具合） | 手順9-3の `VrchatClientMode: Relaunch` にする |
+| Relaunch で、Unity の Preflight に `VRChat is running without --watch-worlds` が出る | Relaunch では `--watch-worlds` を付けない（手順9-3） | 想定どおり。ビルドは止まらない |
+| Relaunch で、ビルドが `VRCHAT_UNMANAGED_RUNNING`・`VRCHAT_START_FAILED`・`UNKNOWN_ERROR` で失敗する | 手で起動した VRChat がある、台を終了させられない、記録を読み書きできない、など | 手順9-3の「うまくいかないとき」を見る |
+| Bridge が起動直後に `VrchatProfiles ...` `VrchatClientCount must not be set ...` などの `Configuration error` で終了する | Relaunch の設定の組み合わせが合っていない（手順9-3） | `VrchatClientMode`・`VrchatProfiles`・`AutoLaunchVrchat` を手順9-3のとおりにし、`VrchatClientCount` を消す |
 | Log Viewer に `Could not match an output_log_*.txt file ...` が出る | 1台目のログを特定できない（手順11） | 台を全部閉じて、Bridge に起動させ直す（3秒間隔で起動するので、ファイルが分かれる）。手で起動するなら、1秒以上あけて1台ずつ起動する |
 | Bridge のログに `Ignoring legacy ... inside the share` が出る | 共有内に旧構成の `processing`・`archive`・`failed` が残っている | 手順14に従って移行し、旧ディレクトリを削除する |
 
