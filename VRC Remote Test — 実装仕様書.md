@@ -1186,7 +1186,7 @@ VRChat is running without --watch-worlds
 - 照合の前にプロセスのハンドルを開き、照合から終了の要求・強制終了・終了の確認まで同じハンドルで行う（途中でPIDから開き直さない。ハンドルを開いている間はPIDが使い回されない）。
 - 終了は、全台にウィンドウを閉じるよう求め（ウィンドウがまだ無い台には、できてから求め直す）、全体で10秒たって残っている台だけを強制終了し、最初から20秒までに全台の終了を確かめる。確かめられない台があれば配置しない。「確かめられない」を「終了した」に読み替えない。停止要求が来たら、それ以上強制終了せず、配置もしない。
 - 記録が壊れているか知らない形式なら、どの台も管理下とみなさない（VRChatが動いていれば`VRCHAT_UNMANAGED_RUNNING`で止まる）。記録を読めない（アクセスの拒否、I/Oの例外）ときは、何も終了・配置せずに`UNKNOWN_ERROR`。記録は一時ファイルに書いて`Flush(true)`してから置き換え、書けなければ次の台を起動しない。
-- `status/vrchat-status.json`の`watchWorldsDetected`はfalseのままとし、偽ってtrueにはしない。Unity（v0.3.0・v0.4.0）は正常に動いているときも`VRChat is running without --watch-worlds`の警告を出すが、ビルドは止まらない（手順書に書く）。
+- `status/vrchat-status.json`の`watchWorldsDetected`はfalseのままとし、偽ってtrueにはしない。Unity（v0.3.0〜v0.5.0）は正常に動いているときも`VRChat is running without --watch-worlds`の警告を出すが、ビルドは止まらない（手順書に書く）。
 - モードを切り替えるときは、VRChatを全部手で閉じてからBridgeを再起動する。動いている台を別のモードへ自動で移すことはしない。
 - §34（成功は「配置した」まで）と§49（manifestから何も実行しない）はそのまま。
 

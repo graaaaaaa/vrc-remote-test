@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.5.0] - 2026-10-18
+
+The Windows Bridge can now put VRChat clients on separate accounts into one instance (`VrchatClientMode: Relaunch`), and the Log Viewer finds the first client's log more reliably. The Unity package itself has no functional changes, so **update the Windows Bridge** (`docs/setup-windows.md`, steps 1 and 6) to get them. An existing `config.json` keeps working as before.
+
+### Added
+
+- `VrchatClientMode: Relaunch` with `VrchatProfiles` (1–4 profile numbers, 0–99) in the Bridge's `config.json`, for clients on separate VRChat accounts (`docs/setup-windows.md`, step 9-3). Clients on different accounts split into separate instances when `--watch-worlds` reloads them, so on every deploy the Bridge closes the clients it launched, deploys, and starts one client per profile again with `--url` and `--profile` (without `--watch-worlds`); they all enter the same instance. It is an explicit opt-in (the default stays `Reload`) and requires `AutoLaunchVrchat`. Log in to each profile once beforehand (`start-vrchat-dev.ps1 -Profiles <n>`). In this mode Unity's Preflight shows "VRChat is running without --watch-worlds" while everything works; this is expected.
+- The Bridge records the clients it launches in `%LOCALAPPDATA%\VRCRemoteTest\state\managed-clients.json` and only closes a process whose PID, creation time, session and name all match that record. Any other VRChat (started by hand, not recorded, or one the Bridge cannot check) makes the build fail with `VRCHAT_UNMANAGED_RUNNING` without closing anything.
+- While Relaunch closes and restarts the clients, the Log Viewer shows a one-line notice instead of the previous session's log.
+
+### Changed
+
+- The Log Viewer picks the first client's log by asking Windows Restart Manager which process has each log file open, so it can show the log even when VRChat creates it late under heavy CPU load. A file that several clients write to is never shown as one client's log. When Restart Manager gives no answer, the times in the file names are used as before.
+- Recommended `Result Timeout` in the Unity window: 120 s or more, 180 s when sending builds back to back (`docs/setup-windows.md`, step 9).
+
+### Fixed
+
+- `install-bridge.ps1` retries the final replacement of the executable (up to 10 times, 0.5 s apart) when Windows briefly refuses it right after the Bridge stopped, instead of failing.
+
 ## [0.4.0] - 2026-10-17
 
 The Windows Bridge can now run several VRChat clients on the same account, like the SDK's Number of Clients. The Unity package only adds guidance for one new error code, so **update the Windows Bridge as well** (`docs/setup-windows.md`, steps 1 and 6). An existing `config.json` keeps working as one client.

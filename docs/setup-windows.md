@@ -491,10 +491,10 @@ VRChatのホーム画面到達を確認したら準備完了。以降はUnity側
 
 - 配置のたびに全台がログインし直し、ワールドを読み込み直す。スパイクでは、終了に1.5〜3.8秒、起動から2台の入室まで9〜15秒だった
 - 結果（`deployed`）は、全台のプロセスを起動できた時点で書かれる（入室までは確かめない）
-- **Unity の Preflight（v0.3.0・v0.4.0）は、Relaunch で正常に動いているときも `VRChat is running without --watch-worlds` の警告を出す**。Relaunch では `--watch-worlds` を付けないので想定どおりで、ビルドは止まらない
+- **Unity の Preflight（v0.3.0〜v0.5.0）は、Relaunch で正常に動いているときも `VRChat is running without --watch-worlds` の警告を出す**。Relaunch では `--watch-worlds` を付けないので想定どおりで、ビルドは止まらない
 - Log Viewer は、記録の中で最も早く起動した、まだ動いている台のログを表示する。起動し直しの間（台を閉じ始めてから、新しい1台目を起動して記録するまで。記録の台がもう終了していても同じ）は、前のセッションのログの代わりに「The Bridge is relaunching its VRChat clients ...」の1行になる（手順11）
 - **Relaunch を使っている間は、VRChat を手で起動しない**。手で起動した VRChat があると、次のビルドは何も終了させずに失敗する。閉じてから送り直す
-- Unity 側の Result Timeout: 終了の待ち（最大20秒）が加わる。結果が書かれるまでの時間は「前に並んでいるビルドの残り ＋ コピー・検証 ＋ 終了の待ち（最大20秒）＋ 起動の間隔（(台数−1)×3秒。ログファイルが遅いときは最大で 60秒＋(台数−1)×3秒）＋ 余裕」。手順9の目安どおり **90秒以上、続けて送るなら120秒から**にする
+- Unity 側の Result Timeout: 終了の待ち（最大20秒）が加わる。結果が書かれるまでの時間は「前に並んでいるビルドの残り ＋ コピー・検証 ＋ 終了の待ち（最大20秒）＋ 起動の間隔（(台数−1)×3秒。ログファイルが遅いときは最大で 60秒＋(台数−1)×3秒）＋ 余裕」。手順9の目安どおり **120秒以上、続けて送るなら180秒から**にする
 - 2台目以降が VRCNP の名前付きパイプを作れないこと、メモリの目安、台の切り替え方（Option+Tab）は手順9-1と同じ
 
 **モードを切り替えるとき**: VRChat を全部手で閉じてから `config.json` を書き換え、Bridge を再起動する（`config.json` は Bridge の起動時にしか読まない。Task Scheduler で動かしているなら `Stop-ScheduledTask` と `Start-ScheduledTask`）。動いている台を別のモードへ移すことはしない。Reload の台を残したまま Relaunch にすると、それらは手で起動した台と同じ扱いになって止まる。Relaunch の台を残したまま Reload にすると、`--watch-worlds` 無しの台として `VRCHAT_WATCH_WORLDS_MISSING` になる。Relaunch のまま Bridge だけを再起動した場合は、記録と照合できる台をそのまま引き継ぐ。
