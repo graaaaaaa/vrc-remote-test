@@ -97,7 +97,7 @@ jobs:
       # Same inputs as the release, except that nothing needs the artifact
       # after this run.
       - name: Upload the executable for the artifact-handoff job
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: bridge-exe
           path: dist/bridge/VRCRemoteTest.Bridge.exe
@@ -109,11 +109,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
+      # Same inputs as the release job's download step.
       - name: Download the Bridge executable built by this run
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: bridge-exe
           path: dist/bridge-artifact
+          digest-mismatch: error
 
       - name: Verify the Bridge executable matches the published hash
         env:
