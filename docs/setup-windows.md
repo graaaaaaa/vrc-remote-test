@@ -593,5 +593,6 @@ Rename-Item -LiteralPath 'C:\VRCRemoteTest' -NewName ('VRCRemoteTest.old-' + (Ge
 以下は開発者向け（このツールのセットアップ・利用には不要）:
 
 - `docs/validation/watch-worlds-spike.md` — `--watch-worlds`挙動の実機検証記録
+- `docs/validation/multi-client-spike.md` — 複数クライアントの実機検証手順と記録
 - `docs/sdk-api-notes.md` — Unity側SDK APIの調査ノート
 - `VRC Remote Test — 実装仕様書.md` §16（Windows Share）、§44（Windows config）、§49（Security）、§63（Setup Flow）

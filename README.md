@@ -53,6 +53,7 @@ Windows Bridge の実行体（`VRCRemoteTest.Bridge.exe`）は、[Releases](http
 - `VRC Remote Test — 実装仕様書.md`（リポジトリルート）— 設計仕様書
 - [`docs/sdk-api-notes.md`](./docs/sdk-api-notes.md) — VRChat SDK Public APIの調査ノート
 - [`docs/validation/watch-worlds-spike.md`](./docs/validation/watch-worlds-spike.md) — `--watch-worlds`挙動の実機検証記録
+- [`docs/validation/multi-client-spike.md`](./docs/validation/multi-client-spike.md) — 複数クライアント（Number of Clients相当）の実機検証手順と記録
 - `bridge/README.md`・`package/CHANGELOG.md` — 各コンポーネントのビルド方法・変更履歴
 
 ## ライセンス
