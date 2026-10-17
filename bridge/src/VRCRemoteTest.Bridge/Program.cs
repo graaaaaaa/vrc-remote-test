@@ -3,6 +3,7 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Options;
 using Serilog;
+using VRCRemoteTest.Bridge;
 using VRCRemoteTest.Bridge.Configuration;
 using VRCRemoteTest.Bridge.Deployment;
 using VRCRemoteTest.Bridge.VRChat;
@@ -82,11 +83,11 @@ try
     builder.Services.AddSingleton<IVrchatStatusWriter, VrchatStatusWriter>();
     builder.Services.AddHostedService<VrchatMonitorService>();
 
-    // Phase 4.1: reuses IVrchatProcessMonitor above; only invoked by StagingWatcher when AutoLaunchVrchat is true.
+    // Phase 4.1 / multi-client: reuses IVrchatProcessMonitor above; only invoked by StagingWatcher when AutoLaunchVrchat is true.
     builder.Services.AddSingleton<IVrchatLauncher, VrchatLauncher>();
-    builder.Services.AddSingleton<IVrchatReadinessCoordinator, VrchatReadinessCoordinator>();
+    builder.Services.AddSingleton<IVrchatClientCoordinator, VrchatClientCoordinator>();
 
-    // Phase 5: independent stateless snapshot reader + its own polling BackgroundService.
+    // Phase 5: snapshot reader (kept on the first VRChat client's log) + its own polling BackgroundService.
     builder.Services.AddSingleton<IVrchatLogReader, VrchatLogReader>();
     builder.Services.AddHostedService<VrchatLogService>();
 
@@ -95,7 +96,19 @@ try
     // Fail fast on invalid configuration (e.g. missing VrchatWorldsDirectory) before
     // the watcher loop ever starts (spec section 11 preflight philosophy, applied
     // Bridge-side).
-    _ = host.Services.GetRequiredService<IOptions<BridgeOptions>>().Value;
+    var options = host.Services.GetRequiredService<IOptions<BridgeOptions>>().Value;
+
+    // Acquired before any hosted service starts, so a second Bridge never touches the
+    // share, the state directory or VRChat.
+    using var instanceLock = BridgeInstanceLock.TryAcquire(options.StateDirectory);
+    if (instanceLock is null)
+    {
+        Log.Fatal(
+            "Another VRC Remote Test Bridge is already running (lock file {LockFile} is in use); refusing to start.",
+            BridgeInstanceLock.PathFor(options.StateDirectory));
+        Environment.ExitCode = 1;
+        return;
+    }
 
     await host.RunAsync();
 }

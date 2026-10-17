@@ -8,6 +8,11 @@ public sealed class BridgeOptions
 {
     public const string SectionName = "Bridge";
 
+    public const int DefaultVrchatClientCount = 1;
+
+    /// <summary>The largest client count verified on real hardware (docs/validation/multi-client-spike.md, case 7).</summary>
+    public const int MaxVrchatClientCount = 4;
+
     /// <summary>
     /// Root of the SMB-shared staging area (incoming/results/status/logs).
     /// Deliberately separate from <see cref="VrchatWorldsDirectory"/> so a
@@ -45,7 +50,10 @@ public sealed class BridgeOptions
     /// </summary>
     public string VrchatExecutable { get; set; } = string.Empty;
 
-    /// <summary>"Desktop" or "VR" (case-insensitive). Controls whether --no-vr is passed.</summary>
+    /// <summary>
+    /// "Desktop" or "VR" (case-insensitive). Controls whether --no-vr is passed; with
+    /// several clients only the first one uses the HMD.
+    /// </summary>
     public string VrchatMode { get; set; } = "Desktop";
 
     /// <summary>
@@ -56,22 +64,30 @@ public sealed class BridgeOptions
     public bool AutoLaunchVrchat { get; set; } = false;
 
     /// <summary>
-    /// Readiness timeout after launching VRChat. Must leave real margin beyond
-    /// VrchatStartupSettleDelaySeconds + stability polling.
+    /// How many VRChat clients a cold start launches (all on the same account, like the
+    /// SDK's Number of Clients). Nullable so validation can tell an explicit value from
+    /// an omitted one; read it through <see cref="ResolvedVrchatClientCount"/>.
+    /// </summary>
+    public int? VrchatClientCount { get; set; }
+
+    public int ResolvedVrchatClientCount => VrchatClientCount ?? DefaultVrchatClientCount;
+
+    /// <summary>
+    /// Upper bound on the wait before deploying to already-running clients. Must leave
+    /// real margin beyond VrchatStartupSettleDelaySeconds + stability polling.
     /// </summary>
     public int VrchatStartupTimeoutSeconds { get; set; } = 60;
 
     /// <summary>
-    /// Minimum time VrchatReadinessCoordinator waits after VRChat's process
-    /// StartTimeUtc before declaring readiness, even if the WMI-based
-    /// IsRunning/WatchWorldsDetected signal is already stable -- the command
-    /// line is visible to WMI essentially at process creation, long before
-    /// VRChat has actually finished booting to its home screen and armed its
-    /// Worlds-directory watcher. Default (30s) is a starting point; tune this
-    /// per machine based on how long VRChat actually takes to reach the home
-    /// screen (real-hardware testing on 2026-09-02 observed ~15-30s, and the
-    /// original 15s default proved too short -- a build deployed at that point
-    /// did not trigger a reload).
+    /// Minimum time VrchatClientCoordinator waits after each running client's process
+    /// creation time before deploying to it, even if the WMI-based --watch-worlds
+    /// signal is already stable -- the command line is visible to WMI essentially at
+    /// process creation, long before VRChat has logged in and armed its
+    /// Worlds-directory watcher. Default (30s) is a starting point; tune this per
+    /// machine (real-hardware testing on 2026-09-02 observed ~15-30s to the home
+    /// screen, and the original 15s default proved too short -- a build deployed at
+    /// that point did not trigger a reload). A cold start does not wait for it: the
+    /// clients load the deployed world through --url.
     /// </summary>
     public int VrchatStartupSettleDelaySeconds { get; set; } = 30;
 }

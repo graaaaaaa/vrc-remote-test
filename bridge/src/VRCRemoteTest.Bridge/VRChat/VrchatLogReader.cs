@@ -6,20 +6,29 @@ using VRCRemoteTest.Bridge.Configuration;
 namespace VRCRemoteTest.Bridge.VRChat;
 
 /// <summary>
-/// Stateless snapshot reader: every call re-resolves the newest output_log_*.txt
-/// and reads a bounded tail window, rather than tracking a persistent
-/// (file, offset, incomplete-line-buffer) state machine. This design replaced an
-/// original stateful-tailer proposal that Codex plan review found underspecified
-/// (FileShare flags, encoding, rotation/truncation handling) and over-built for a
-/// "glance at recent logs" developer convenience feature (Codex plan review
-/// Phase 5, Rounds 1-3, confidence converged to 0.91). Real VRChat output_log
-/// files were inspected on real Windows hardware before writing this class:
-/// filename pattern output_log_YYYY-MM-DD_HH-MM-SS.txt, no BOM, UTF-8-compatible
-/// encoding, lines shaped like "YYYY.MM.DD HH:MM:SS Level    - Message".
+/// Snapshot reader: every call re-resolves the log file and reads a bounded tail
+/// window, rather than tracking a persistent (file, offset, incomplete-line-buffer)
+/// state machine. This design replaced an original stateful-tailer proposal that
+/// Codex plan review found underspecified (FileShare flags, encoding,
+/// rotation/truncation handling) and over-built for a "glance at recent logs"
+/// developer convenience feature (Codex plan review Phase 5, Rounds 1-3, confidence
+/// converged to 0.91). Real VRChat output_log files were inspected on real Windows
+/// hardware before writing this class: filename pattern
+/// output_log_YYYY-MM-DD_HH-MM-SS.txt, no BOM, UTF-8-compatible encoding, lines
+/// shaped like "YYYY.MM.DD HH:MM:SS Level    - Message".
+///
+/// With VRChat running, the log shown is the first client's (the representative
+/// client of <see cref="VrchatProcessMonitor.SelectRepresentative"/>), not the most
+/// recently written file, which with several clients would switch between them on
+/// every poll. The file is matched by <see cref="VrchatLogMatcher"/> and then kept
+/// for that client (its PID and creation time) until the client exits or the file
+/// disappears; when no file can be matched, a diagnostic is published instead.
+/// Only with no VRChat running is the newest file shown, so the last session's log
+/// stays readable (multi-client plan section 13.2).
 /// </summary>
 public sealed class VrchatLogReader : IVrchatLogReader
 {
-    private const string OutputLogPattern = "output_log_*.txt";
+    private const string OutputLogPattern = VrchatLogMatcher.FileNamePrefix + "*" + VrchatLogMatcher.FileNameSuffix;
 
     /// <summary>Directory enumeration cap (Codex plan review Phase 5, Round 2, confidence 0.87).</summary>
     private const int MaxDirectoryScan = 512;
@@ -37,13 +46,45 @@ public sealed class VrchatLogReader : IVrchatLogReader
 
     private const string TruncationMarker = "... [truncated]";
 
-    private readonly BridgeOptions _options;
-    private readonly ILogger<VrchatLogReader> _logger;
+    /// <summary>
+    /// VRChat created its output_log 0.70-0.84 s after the process start on real
+    /// hardware without load (docs/validation/multi-client-spike.md, PR #2 verification),
+    /// so the first 5-second poll after a cold start usually finds no file yet. Until
+    /// the first client is this old, an unmatched log publishes nothing instead of a
+    /// diagnostic. Under heavy load the file took 11-22 s, and the diagnostic then shows.
+    /// </summary>
+    private static readonly TimeSpan LogCreationGrace = TimeSpan.FromSeconds(10);
 
-    public VrchatLogReader(IOptions<BridgeOptions> options, ILogger<VrchatLogReader> logger)
+    private readonly BridgeOptions _options;
+    private readonly IVrchatProcessMonitor _processMonitor;
+    private readonly ILogger<VrchatLogReader> _logger;
+    private readonly Func<string, DateTime> _creationTimeUtc;
+
+    /// <summary>Only VrchatLogService's sequential loop calls this reader, so no synchronization is needed.</summary>
+    private PinnedLog? _pinned;
+
+    private string? _lastReportedProblem;
+
+    public VrchatLogReader(
+        IOptions<BridgeOptions> options, IVrchatProcessMonitor processMonitor, ILogger<VrchatLogReader> logger)
+        : this(options, processMonitor, logger, File.GetCreationTimeUtc)
+    {
+    }
+
+    /// <summary>
+    /// Test-only seam: not every filesystem the tests run on can set a file's creation
+    /// time, and matching depends on it.
+    /// </summary>
+    internal VrchatLogReader(
+        IOptions<BridgeOptions> options,
+        IVrchatProcessMonitor processMonitor,
+        ILogger<VrchatLogReader> logger,
+        Func<string, DateTime> creationTimeUtc)
     {
         _options = options.Value;
+        _processMonitor = processMonitor;
         _logger = logger;
+        _creationTimeUtc = creationTimeUtc;
     }
 
     /// <summary>
@@ -68,30 +109,177 @@ public sealed class VrchatLogReader : IVrchatLogReader
             return LogSnapshotResult.Empty();
         }
 
+        var snapshot = _processMonitor.GetClients();
+
+        // The pinned client keeps its log for as long as it is seen, whichever client
+        // would be chosen as representative right now (e.g. while WMI cannot read its
+        // command line for one poll). Only a confirmed exit, a reused PID or a deleted
+        // file releases the pin; an observation that cannot tell keeps it.
+        if (_pinned is { } pinned)
+        {
+            if (!File.Exists(pinned.Path))
+            {
+                _pinned = null;
+            }
+            else if (snapshot.EnumerationError is not null)
+            {
+                return Unmatched("VRChat processes could not be checked; the log is shown again once they can be.");
+            }
+            else
+            {
+                var owner = snapshot.Clients.FirstOrDefault(c => c.ProcessId == pinned.Client.ProcessId);
+                if (owner is not null && owner.CreationTimeUtc == pinned.Client.CreationTimeUtc)
+                {
+                    _lastReportedProblem = null;
+                    return ReadLog(pinned.Path);
+                }
+
+                if (owner is { CreationTimeUtc: null } || (owner is null && snapshot.UnverifiedCount > 0))
+                {
+                    return Unmatched(
+                        $"VRChat client {pinned.Client.ProcessId} could not be checked; " +
+                        "its log is shown again once it can be.");
+                }
+
+                _pinned = null;
+            }
+        }
+
+        if (snapshot.EnumerationError is not null)
+        {
+            return Unmatched("The VRChat process list could not be read.");
+        }
+
+        if (snapshot.Clients.Count == 0 && snapshot.UnverifiedCount == 0)
+        {
+            _lastReportedProblem = null;
+            return ReadNewest(logDirectory);
+        }
+
+        var client = VrchatProcessMonitor.SelectRepresentative(snapshot.Clients);
+        if (client is null)
+        {
+            return Unmatched("VRChat is running, but its processes could not be checked.");
+        }
+
+        var clientKey = new ClientKey(client.ProcessId, client.CreationTimeUtc);
+
+        var (candidates, scanCapped) = ListCandidates(logDirectory);
+        if (scanCapped)
+        {
+            return ScanCapped();
+        }
+
+        // A VRChat that could not be checked might own any file in the range.
+        var match = snapshot.UnverifiedCount == 0
+            ? VrchatLogMatcher.Match(client, snapshot.Clients, candidates, TimeZoneInfo.Local)
+            : null;
+        if (match is null)
+        {
+            if (client.CreationTimeUtc is { } justStarted && DateTime.UtcNow - justStarted < LogCreationGrace)
+            {
+                return LogSnapshotResult.Empty();
+            }
+
+            var started = client.CreationTimeUtc is { } created
+                ? $"started {created:yyyy-MM-dd HH:mm:ss}Z"
+                : "start time unknown";
+            return Unmatched(
+                $"Could not match an {OutputLogPattern} file to the first VRChat client " +
+                $"(PID {client.ProcessId}, {started}); " +
+                "not showing another client's log instead. This happens when clients start within the same second, " +
+                "or when the clock or time zone changed after the log was created.");
+        }
+
+        _pinned = new PinnedLog(clientKey, match);
+        _lastReportedProblem = null;
+        _logger.LogInformation(
+            "Showing {Path} as the log of VRChat client {ProcessId}.", match, client.ProcessId);
+        return ReadLog(match);
+    }
+
+    private LogSnapshotResult ReadNewest(string logDirectory)
+    {
         var (newestFile, scanCapped) = FindNewestOutputLog(logDirectory);
         if (scanCapped)
         {
-            return LogSnapshotResult.Diagnostic(
-                $"Too many {OutputLogPattern} files in the VRChat log directory; " +
-                $"newest log was not selected because the scan cap ({MaxDirectoryScan}) was exceeded.");
+            return ScanCapped();
         }
 
-        if (newestFile is null)
-        {
-            return LogSnapshotResult.Empty();
-        }
+        return newestFile is null ? LogSnapshotResult.Empty() : ReadLog(newestFile);
+    }
 
+    private LogSnapshotResult ReadLog(string path)
+    {
         try
         {
-            var lines = ReadTailLines(newestFile);
+            var lines = ReadTailLines(path);
             return LogSnapshotResult.Success(BuildBoundedOutput(lines));
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
-            _logger.LogWarning(ex, "Failed to read VRChat log file {Path}.", newestFile);
+            _logger.LogWarning(ex, "Failed to read VRChat log file {Path}.", path);
             return LogSnapshotResult.Empty();
         }
     }
+
+    private static LogSnapshotResult ScanCapped() =>
+        LogSnapshotResult.Diagnostic(
+            $"Too many {OutputLogPattern} files in the VRChat log directory; " +
+            $"no log was selected because the scan cap ({MaxDirectoryScan}) was exceeded.");
+
+    /// <summary>
+    /// Logged once per distinct problem, not on every 5-second poll, and only as
+    /// information: right after a client starts, its file usually does not exist yet.
+    /// </summary>
+    private LogSnapshotResult Unmatched(string message)
+    {
+        if (message != _lastReportedProblem)
+        {
+            _logger.LogInformation("VRChat log not published: {Message}", message);
+            _lastReportedProblem = message;
+        }
+
+        return LogSnapshotResult.Diagnostic(message);
+    }
+
+    /// <summary>Same bounded scan as <see cref="FindNewestOutputLog"/>; unreadable files are skipped.</summary>
+    private (List<VrchatLogMatcher.Candidate> Candidates, bool ScanCapped) ListCandidates(string logDirectory)
+    {
+        var candidates = new List<VrchatLogMatcher.Candidate>();
+        var scanned = 0;
+
+        foreach (var path in Directory.EnumerateFiles(logDirectory, OutputLogPattern))
+        {
+            if (scanned == MaxDirectoryScan)
+            {
+                return ([], true);
+            }
+
+            scanned++;
+
+            var nameTime = VrchatLogMatcher.ParseNameTime(Path.GetFileName(path));
+            if (nameTime is null)
+            {
+                continue;
+            }
+
+            try
+            {
+                candidates.Add(new VrchatLogMatcher.Candidate(path, nameTime, _creationTimeUtc(path)));
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                // Unreadable now; the next poll looks again.
+            }
+        }
+
+        return (candidates, false);
+    }
+
+    private readonly record struct ClientKey(int ProcessId, DateTime? CreationTimeUtc);
+
+    private sealed record PinnedLog(ClientKey Client, string Path);
 
     /// <summary>
     /// Bounded single-pass scan: stops as soon as a (MaxDirectoryScan + 1)th

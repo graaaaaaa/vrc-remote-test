@@ -358,6 +358,92 @@ Bridge に複数台起動を組み込む計画（案B: 同じアカウント、�
 
 未実施。管理者として VRChat を起動するには、Windows の前で UAC の確認に応える必要がある。
 
+### Bridge への組み込み後の確認（PR #2）（2026-10-17 17:49〜18:10）
+
+PR #2（同じアカウントの N 台起動、`VrchatClientCount`）を Windows 実機で確かめた。
+
+**試したビルド**: PR #2 の先頭 `752bdae` に、PR #1（`d39650f`、共有ファイルの置き換えの修正）を手元でマージした `f91ff0e`（push していない）。PR #2 だけでは、Mac が共有のファイルを開いている間 Log Viewer と状態の更新が止まる既知の不具合が残り、項目6・13 の確認が濁るため。両者に競合は無かった。Windows（.NET SDK 10.0.400）で `dotnet publish -c Release -r win-x64 --self-contained -p:PublishSingleFile=true` で作った exe（SHA-256 `9F74993C…AB14B59`）を、PR #2 のチェックアウトの `install-bridge.ps1` で入れ替えた。
+
+**ビルドの送り方**: Mac の Remote Build & Test は使わず、Windows 上で同じ形のアップロードを模擬した（`incoming` に `<buildId>.vrcw.part` を書いて rename、続けて `<buildId>.ready.json.part` を書いて rename。中身は Unity の `SmbRemoteTransport` と同じ manifest）。結果は `results\<buildId>.json` を 120 秒まで待って読んだ（Unity の Result Timeout と同じ）。ワールドは build-A / build-B。同じインスタンスにいるかは、スパイクと同じく各台の output_log の行き先（`local:…`）と `OnPlayerJoined` で確かめた。ゲーム内の Logging は「完全」。
+
+#### テスト（Windows）
+
+| 対象 | 結果 |
+|------|------|
+| PR #2（`752bdae`） | 296 件中 293 件成功 |
+| PR #2 ＋ PR #1（`f91ff0e`） | 303 件中 300 件成功 |
+
+どちらも、落ちたのはシンボリックリンクの作成権限が要る3件（`Fails_when_StateDirectory_is_a_symbolic_link`、`A_symbolic_link_manifest_is_never_ingested`、`A_symbolic_link_artifact_is_never_copied`）だけ。
+
+#### 項目ごとの結果
+
+| 項目 | 結果 | 記録 |
+|------|------|------|
+| 1. VRChat 0 台からの送信（`VrchatClientCount: 2`） | 合格 | 送信から 7.4 秒で `deployed`（Bridge が拾うまでの約4秒を含む）。`Launched VRChat client 1/2`（17:52:17.653）と `2/2`（17:52:20.671）が 3.0 秒差・同じ roomId。2台とも `local:dab8e4…:1` に入り、お互いの `OnPlayerJoined` が出た。1台目の起動の 0.1 秒後に `VRChat log not published: Could not match ...` が1回出て、5秒後に1台目のログに固定された（下の「気づいたこと」1） |
+| 2. 続けてもう一度送る | 合格 | 最後の台の起動から 30.4 秒後に送ったので待ちは無く、5.7 秒で配置。2台とも `local:ce318f…:1` へそろってリロードした。30 秒以内に送ったときの待ちは項目8の settle 30 で確かめた（30.1 秒後に配置） |
+| 3. `VrchatClientCount: 1` で 0 台から送る | 合格 | 3.5 秒で `deployed`、`Launched VRChat client 1/1`、起動から約9秒で入室 |
+| 4. 2台のうち1台を閉じて送る（2回） | 合格 | 1回目に `VRChat clients changed: deploying to 1 of 2 VRChat client(s); ...` が1回だけ出て成功し、残りの台がリロードした。2回目は警告なしで成功 |
+| 5. `-NoWatchWorlds` の台だけ | 合格 | `VRCHAT_WATCH_WORLDS_MISSING`（2.2 秒）。何も起動しなかった |
+| 5. `--watch-worlds` 付きと混在 | 合格 | `... deploying to 1 of 2 ...; 1 VRChat client(s) without --watch-worlds will not reload.` の警告が1回。付きの台が起動した直後だったので `Waiting for 1 VRChat client(s) ... = 30` のあと 30 秒で配置。付きの台だけがリロードし、無しの台のログには配置したファイルの `World Updated` が出なかった |
+| 6. Unity v0.3.0 の Preflight と Log Viewer | 合格（Unity での表示は 19:25〜19:28 に確認、下の「項目6: Unity での表示」） | 共有の `status\vrchat-status.json` は 10 秒ごと、`logs\vrchat-latest.log` は 5 秒ごとに更新され続けた（PR #1 の修正が効いている）。Log Viewer の写しは1台目（最初に起動した台。混在のときは `--watch-worlds` 無しの台）のログに固定され、status の代表は `--watch-worlds` 付きの最も古い台だった。`start-vrchat-dev.ps1 -Clients 2 -LaunchIntervalSeconds 0`（13ms 差で起動）では、写しが `Could not match an output_log_*.txt file to the first VRChat client ...` の1行になった（このときのログ名は `17-56-44` と `17-56-45` に分かれていたが、2台とも同じ秒に起動しているので対応付けを拒否した）。Unity での表示は、あとで `50ad181` のビルドで確かめた |
+| 7. `VrchatMode: VR` で2台 | 未実施 | HMD が要る |
+| 8. settle 15・20・25・30 でコールドスタート直後に次を送る | 合格 | どの値でも `Waiting for 2 VRChat client(s) to finish starting before deploying (VrchatStartupSettleDelaySeconds = N)` のあと、最後の台の起動から 15.6 / 20.8 / 26.0 / 30.1 秒で配置し、2台とも `local:ce318f…:1` へそろってリロードした（各台 `OnPlayerJoined` 2件） |
+| 9. 昇格した VRChat の数え方 | 未実施 | UAC の操作が要る |
+| 10. 4台のコールドスタート中に Bridge を強制終了 | 合格 | `Launched VRChat client 2/4` の直後（18:08:46）に `Stop-Process -Force`。起動済みの2台はそのまま残り、Bridge を起動し直しても配置し直しも追加の起動もしなかった。そのビルドの結果ファイルは書かれず（Unity では RESULT_TIMEOUT になる）、manifest は `state\archive` に入った。次のビルドは `deploying to 2 of 4 ...` の警告1回のあと残りの2台に配置され、2台ともそろってリロードした |
+| 11. Bridge の二重起動 | 合格 | タスクの Bridge が動いている状態で exe を手で起動すると、`[FTL] Another VRC Remote Test Bridge is already running (lock file ...\state\bridge.lock is in use); refusing to start.` を出して終了コード 1。拒否された側は、ログを別名の `bridge-20261017_001.log` に書いた |
+| 12. ログ名の遅れ | 負荷なしは合格。**CPU 負荷が高いと前提が崩れる** | 下の表 |
+| 13. 4台の起動中の WMI と更新 | 負荷なしは合格 | PR #2 を入れてからの Bridge のログに `Failed to query VRChat command lines via WMI` は0件、`[ERR]` も0件。4台の起動中も status は 10 秒ごと、Log Viewer の写しは 5 秒ごとに更新された。CPU 負荷が高いときは status の間隔が 16〜21 秒、写しは 30 秒で3回に延びた（止まりはしない） |
+
+#### 項目12: ログ名の遅れ（`VrchatClientCount: 4`、3秒間隔）
+
+負荷なし（3回、計12台）: どの台も、ログファイルは起動の 0.70〜0.84 秒後に作られ、名前の時刻は起動の時刻を秒に切り捨てた値か、その次の秒だった（名前 − 起動 = −0.29〜+0.27 秒）。1秒を超えて遅れた台は無い。Bridge は毎回1台目のログに固定した（1台目の起動から 1.3〜5.6 秒後に `Showing ...`）。
+
+CPU 負荷あり（16 個の論理 CPU すべてを `pwsh` の空回しで使い切り、CPU 使用率約100%、2回）:
+
+| 回 | 起動（Bridge のログの作成時刻） | ログファイル | 結果 |
+|------|------|------|------|
+| 1 | 1台目 18:03:59.922、2台目 18:04:07.608（間隔が 7.7 秒に延びた）、3台目 18:04:13.077、4台目 18:04:16.093 | `18-04-10` と `18-04-11`（どちらも 18:04:11 に作成）、`18-04-13`（+0.74 秒）、`18-04-16`（+0.76 秒） | 1台目と2台目のログができたのは 18:04:11 で、1台目は起動から約 11 秒遅れた。名前が1台目の範囲（18:03:58〜18:04:07）に入らず、Bridge は `Could not match ...` を出したまま固定しなかった |
+| 2 | 1台目 18:05:02.222、2台目 18:05:07.280、3台目 18:05:14.659、4台目 18:05:22.254 | `18-05-24` の1つだけ（18:05:24.442 に作成） | **4台すべてが同じファイルに書き込んだ**（`User Authenticated` 2行、`Arg: --watch-worlds` 1行、`OnPlayerJoined` 4行が混ざっていた）。1台目のログは起動から約 22 秒遅れ。Bridge は `Could not match ...` を出したまま固定しなかった |
+
+- 負荷が高いと、VRChat がログファイルを作るのが起動から最大 20 秒以上遅れ、3秒以上あけて起動した台どうしでもファイル名の秒が重なる。スパイクのオプションB（同じ秒に起動）と同じく、ログが1つのファイルに混ざる。
+- どちらの回も、Bridge は別の台のログを1台目のものとして表示せず、診断の1行を出し続けた（安全側に倒れている）。ただし、その間 Log Viewer にログは出ない。
+
+固定した台を閉じたとき（負荷なし、4台）: 1台目（固定していた台）を閉じると、Bridge は2台目のログ（`18-06-37`）に固定し直した（`Showing ... as the log of VRChat client 26336`）。閉じた台のログを残りの台のものとして表示することは無かった。固定していない4台目を閉じても、固定は変わらなかった。
+
+#### 気づいたこと（不具合ではないもの、判断が要るもの）
+
+1. コールドスタートのたびに、1台目の起動から 0.1〜0.6 秒後の観測で `VRChat log not published: Could not match ...` が出る。まだログファイルができていない（作られるのは起動の約 0.7〜0.8 秒後）ためで、次の観測（約5秒後）で固定される。その間 Log Viewer の写しは診断の1行になる。
+2. CPU 負荷が高いと、ログ名の前提（起動から約1秒）が崩れ、Log Viewer が固定できないままになる（項目12）。
+3. status の `startTimeUtc` は `"2026-10-17T08:55:00.5442545+00:00"` の形だった（UTC だが `Z` ではない）。PR #1 の書き出しと合わせたビルドでの値で、Unity は `DateTimeOffset` で読むので互換。
+4. CPU 負荷が高いと、Bridge が台を起動する間隔が3秒より延びる（`Start-Process` 自体が遅くなる）。roomId は同じで、全台が起動した。
+
+#### 確認後の後片付け
+
+- `config.json` は確認前のバックアップから元に戻した（`VrchatClientCount` なし、settle 30 秒、timeout 60 秒）。Bridge の exe は `f91ff0e` のビルドのまま（確認前の exe は `%LOCALAPPDATA%\VRCRemoteTest\pr2-test-backup-20261017-175136\` に退避した）。
+- ゲーム内の Logging は確認前から「完全」だったので、`setup-windows.md` §9-2 の戻し方（output_log と共有の写しの削除）は行っていない。
+
+#### `a9292a1` の再確認（2026-10-17 19:05〜19:08）
+
+`a9292a1`（1台目の起動から10秒の間は、ログを対応付けできなくても診断を出さない）を、PR #1（`d39650f`）と手元でマージした `50ad181`（push していない）で確かめた。Windows の `dotnet test` は 306 件中 303 件成功（落ちたのはシンボリックリンクの3件だけ）。exe（SHA-256 `861BBD4B…0134F7E`）を `install-bridge.ps1` で入れ替え、`VrchatClientCount: 2` で、上と同じ模擬のアップロードを使った。
+
+| 確かめたこと | 結果 |
+|------|------|
+| コールドスタートの直後に診断の1行が出ないか（2回） | 出なかった。Bridge のログにも `VRChat log not published` は無く、1台目の起動から 5.1 秒後・2.2 秒後に `Showing ... as the log of VRChat client ...` で固定された |
+| 同じ秒に起動したとき（`start-vrchat-dev.ps1 -Clients 2 -LaunchIntervalSeconds 0`、14ms 差）に、これまでどおり診断が出るか | 出た。1台目の起動から 13.4 秒後（10 秒の猶予のあとの次の読み取り）に `VRChat log not published: Could not match ...` が出て、写しが診断の1行になった |
+
+気づいたこと: 対応付けを待つ間（`LogSnapshotResult.Empty()`）は `VrchatLogService` が写しを書かないので、共有の `vrchat-latest.log` には**前のセッションのログ（閉じた台のログ）が残る**。修正の前は、最初の読み取りで診断の1行がこれを上書きしていた。今回は、コールドスタートで固定されるまでの 2〜5 秒間と、同じ秒に起動したときの約 13 秒間、閉じた台の古いログが写しに残っていた。Unity の Log Viewer には、その間この古いログが表示されると見られる（Unity での表示は未確認）。
+
+後片付け: `config.json` は再び確認前のバックアップに戻した。Bridge の exe は `50ad181` のビルドのまま。
+
+#### 項目6: Unity での表示（2026-10-17 19:25〜19:28）
+
+Mac の Unity（Vrc-remote-test プロジェクト、パッケージ v0.3.0）で Preflight と Log Viewer を見た。Windows では `50ad181` のビルドの Bridge のまま（`config.json` は確認前の値）、`start-vrchat-dev.ps1` で VRChat を起動した。Mac 側の観察は Mac のセッションの報告による。
+
+| 手順 | Windows 側 | Mac の Unity | 結果 |
+|------|------|------|------|
+| 1. `-Clients 2`（`--watch-worlds` 付き、`--url` なし、3秒間隔） | 1台目 PID 25568（19:25:30.244）、2台目 PID 29292（19:25:33.271）。19:25:35.700 に `Showing ...output_log_2026-10-17_19-25-30.txt as the log of VRChat client 25568.` | Preflight は「VRChat: Running」（緑）。Log Viewer に 19:25:55 の `[AssetBundleDownloadManager] [100] Unpacking World (local:error_7484453976886834)` が出た | 合格。2台は `--url` が無いので別々の Error World に入り、1台目のログは `local:error_7484453976886834`、2台目のログは `local:error_2111340501460972` だった。Log Viewer は1台目のログを表示していた |
+| 2. `-Clients 2 -LaunchIntervalSeconds 0`（13ms 差） | 1台目 PID 13976（19:27:03.460）、2台目 PID 2300（19:27:03.473）。ログは `19-27-03` と `19-27-04` の2つ。19:27:16.744（1台目の起動から 13.3 秒後）に `VRChat log not published: Could not match an output_log_*.txt file to the first VRChat client (PID 13976, ...)` | Log Viewer に同じ診断の1行が出た | 合格。それまでの約13秒は、手順1の1台目（閉じた台）のログが共有の写しに残っていた（上の「`a9292a1` の再確認」で書いた件） |
+
 ---
 
 ## Go/No-Go 判定テーブル
