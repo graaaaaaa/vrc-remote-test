@@ -27,6 +27,7 @@ public class VrchatRelaunchCoordinatorTests
     private readonly FakeVrchatLauncher _launcher = new();
     private readonly FakeManagedClientStore _store = new();
     private readonly CapturingLogger<VrchatRelaunchCoordinator> _logger = new();
+    private readonly VrchatLogNotice _logNotice = new();
     private DateTime _now = T0;
 
     private VrchatRelaunchCoordinator CreateCoordinator(
@@ -49,6 +50,7 @@ public class VrchatRelaunchCoordinatorTests
             _monitor,
             _launcher,
             _store,
+            _logNotice,
             _logger,
             delay ?? ((wait, _) =>
             {
@@ -524,5 +526,148 @@ public class VrchatRelaunchCoordinatorTests
         preparation.Kind.Should().Be(VrchatPreparationKind.ColdStart);
         firstBatch.Should().HaveCount(2).And.AllSatisfy(p => p.IsRunning.Should().BeFalse());
         _store.Clients.Should().BeEmpty();
+    }
+
+    // ---- The Log Viewer's notice (VrchatLogNotice) ----
+
+    [Fact]
+    public async Task The_Log_Viewer_shows_the_relaunch_notice_from_closing_until_the_first_new_client_is_recorded()
+    {
+        var first = Running(1001, Earlier);
+        Running(1002, Earlier.AddSeconds(3));
+        Recorded(1001, Earlier, profile: 0, launchOrder: 0);
+        Recorded(1002, Earlier.AddSeconds(3), profile: 1, launchOrder: 1);
+        string? atClose = null;
+        first.OnCloseMainWindow = () => atClose = _logNotice.Message;
+        var atLaunch = new List<string?>();
+        _launcher.OnLaunch = pid =>
+        {
+            atLaunch.Add(_logNotice.Message);
+            Running(pid, _launcher.Launched[^1].CreationTimeUtc);
+        };
+        var coordinator = CreateCoordinator(profiles: [0, 1]);
+
+        var preparation = await coordinator.PrepareAsync(CancellationToken.None);
+        var betweenTheCalls = _logNotice.Message;
+        var outcome = await coordinator.LaunchClientsAsync(WorldPath, CancellationToken.None);
+
+        preparation.Kind.Should().Be(VrchatPreparationKind.ColdStart);
+        outcome.Succeeded.Should().BeTrue();
+        atClose.Should().Be(VrchatRelaunchCoordinator.RelaunchNotice);
+        betweenTheCalls.Should().Be(
+            VrchatRelaunchCoordinator.RelaunchNotice, "with no VRChat running, the newest log is the closed clients'");
+        atLaunch.Should().Equal(
+            new[] { VrchatRelaunchCoordinator.RelaunchNotice, null },
+            "the first client is recorded, so the Log Viewer can find it, before the second one starts");
+        _logNotice.Message.Should().BeNull();
+    }
+
+    [Fact]
+    public async Task No_notice_is_shown_when_none_of_the_Bridges_clients_is_running()
+    {
+        // As at a Reload cold start: the newest log stays until the first client is seen.
+        var atLaunch = new List<string?>();
+        _launcher.OnLaunch = pid =>
+        {
+            atLaunch.Add(_logNotice.Message);
+            Running(pid, _launcher.Launched[^1].CreationTimeUtc);
+        };
+        var coordinator = CreateCoordinator(profiles: [0, 1]);
+
+        (await coordinator.PrepareAsync(CancellationToken.None)).Kind.Should().Be(VrchatPreparationKind.ColdStart);
+        (await coordinator.LaunchClientsAsync(WorldPath, CancellationToken.None)).Succeeded.Should().BeTrue();
+
+        atLaunch.Should().Equal(new string?[] { null, null });
+        (await _logNotice.WaitForChangeAsync(TimeSpan.Zero, CancellationToken.None)).Should()
+            .BeFalse("the Log Viewer is not woken either");
+    }
+
+    [Fact]
+    public async Task A_VRChat_the_Bridge_did_not_launch_shows_no_notice()
+    {
+        Running(3003, Earlier);
+
+        var preparation = await CreateCoordinator().PrepareAsync(CancellationToken.None);
+
+        preparation.ErrorCode.Should().Be(ErrorCode.VrchatUnmanagedRunning);
+        (await _logNotice.WaitForChangeAsync(TimeSpan.Zero, CancellationToken.None)).Should()
+            .BeFalse("nothing was closed");
+    }
+
+    [Fact]
+    public async Task The_notice_is_cleared_when_a_client_cannot_be_closed()
+    {
+        var stuck = Running(1001, Earlier);
+        stuck.CloseTakes = null;
+        stuck.IgnoresKill = true;
+        Recorded(1001, Earlier);
+        string? atClose = null;
+        stuck.OnCloseMainWindow = () => atClose = _logNotice.Message;
+
+        var preparation = await CreateCoordinator().PrepareAsync(CancellationToken.None);
+
+        preparation.ErrorCode.Should().Be(ErrorCode.VrchatStartFailed);
+        atClose.Should().Be(VrchatRelaunchCoordinator.RelaunchNotice);
+        _logNotice.Message.Should().BeNull("the client that is still running has its log shown again");
+    }
+
+    [Fact]
+    public async Task The_notice_is_cleared_when_a_VRChat_starts_while_the_clients_close()
+    {
+        Running(1001, Earlier);
+        Recorded(1001, Earlier);
+        _monitor.OnOpenClients = call =>
+        {
+            if (call == 2)
+            {
+                Running(3003, _now);
+            }
+        };
+
+        var preparation = await CreateCoordinator().PrepareAsync(CancellationToken.None);
+
+        preparation.ErrorCode.Should().Be(ErrorCode.VrchatUnmanagedRunning);
+        _logNotice.Message.Should().BeNull();
+    }
+
+    [Fact]
+    public async Task The_notice_is_cleared_on_a_stop_request_while_closing()
+    {
+        using var cts = new CancellationTokenSource();
+        var process = Running(1001, Earlier);
+        process.CloseTakes = TimeSpan.Zero;
+        process.OnCloseMainWindow = cts.Cancel;
+        Recorded(1001, Earlier);
+
+        var act = async () => await CreateCoordinator().PrepareAsync(cts.Token);
+
+        await act.Should().ThrowAsync<OperationCanceledException>();
+        _logNotice.Message.Should().BeNull();
+    }
+
+    [Fact]
+    public async Task The_notice_is_cleared_when_the_first_client_fails_to_start()
+    {
+        _logNotice.Show(VrchatRelaunchCoordinator.RelaunchNotice);
+        _launcher.ShouldSucceed = false;
+
+        var outcome = await CreateCoordinator(profiles: [0, 1]).LaunchClientsAsync(WorldPath, CancellationToken.None);
+
+        outcome.Succeeded.Should().BeFalse();
+        _logNotice.Message.Should().BeNull("with no client running, the newest log is shown as usual");
+    }
+
+    [Fact]
+    public async Task The_notice_is_cleared_on_a_stop_request_before_the_first_launch()
+    {
+        _logNotice.Show(VrchatRelaunchCoordinator.RelaunchNotice);
+        using var cts = new CancellationTokenSource();
+        cts.Cancel();
+
+        var act = async () => await CreateCoordinator().LaunchClientsAsync(WorldPath, cts.Token);
+
+        await act.Should().ThrowAsync<OperationCanceledException>();
+        _launcher.LaunchCalled.Should().BeFalse();
+        _logNotice.Message.Should().BeNull();
     }
 }

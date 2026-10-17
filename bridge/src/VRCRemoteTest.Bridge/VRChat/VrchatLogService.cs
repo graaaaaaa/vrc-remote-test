@@ -16,6 +16,11 @@ namespace VRCRemoteTest.Bridge.VRChat;
 /// BackgroundService.ExecuteAsync stops the entire Generic Host by default (.NET
 /// 6+ BackgroundServiceExceptionBehavior) -- the same lesson Phase 4a learned the
 /// hard way for VrchatMonitorService, applied here from the start.
+///
+/// While the deploy flow shows a <see cref="VrchatLogNotice"/> (Relaunch mode, from closing
+/// the clients until the first new one is recorded), that line is published instead of the
+/// log, and the log is not read. Showing or clearing it wakes this loop, so the line
+/// replaces the log, and the log returns, without waiting for the next poll.
 /// </summary>
 public sealed class VrchatLogService : BackgroundService
 {
@@ -23,6 +28,7 @@ public sealed class VrchatLogService : BackgroundService
 
     private readonly BridgeOptions _options;
     private readonly IVrchatLogReader _logReader;
+    private readonly VrchatLogNotice _notice;
     private readonly ILogger<VrchatLogService> _logger;
     private readonly SharedFileWriter _fileWriter;
     private readonly TimeSpan _pollInterval;
@@ -30,8 +36,9 @@ public sealed class VrchatLogService : BackgroundService
     public VrchatLogService(
         IOptions<BridgeOptions> options,
         IVrchatLogReader logReader,
+        VrchatLogNotice notice,
         ILogger<VrchatLogService> logger)
-        : this(options, logReader, logger, DefaultPollInterval)
+        : this(options, logReader, notice, logger, DefaultPollInterval)
     {
     }
 
@@ -39,11 +46,13 @@ public sealed class VrchatLogService : BackgroundService
     internal VrchatLogService(
         IOptions<BridgeOptions> options,
         IVrchatLogReader logReader,
+        VrchatLogNotice notice,
         ILogger<VrchatLogService> logger,
         TimeSpan pollInterval)
     {
         _options = options.Value;
         _logReader = logReader;
+        _notice = notice;
         _logger = logger;
         _fileWriter = new SharedFileWriter(logger);
         _pollInterval = pollInterval;
@@ -57,7 +66,7 @@ public sealed class VrchatLogService : BackgroundService
         {
             try
             {
-                var snapshot = _logReader.ReadSnapshot();
+                var snapshot = NextSnapshot();
                 if (snapshot.IsAvailable)
                 {
                     Publish(snapshot.Content);
@@ -70,13 +79,29 @@ public sealed class VrchatLogService : BackgroundService
 
             try
             {
-                await Task.Delay(_pollInterval, stoppingToken);
+                await _notice.WaitForChangeAsync(_pollInterval, stoppingToken);
             }
             catch (OperationCanceledException)
             {
                 break;
             }
         }
+    }
+
+    /// <summary>
+    /// A notice shown while the log was being read replaces what was read, which is then
+    /// the log of a client being closed. One shown after this check is published on the
+    /// next iteration, which its wake starts at once.
+    /// </summary>
+    private LogSnapshotResult NextSnapshot()
+    {
+        if (_notice.Message is { } shown)
+        {
+            return LogSnapshotResult.Diagnostic(shown);
+        }
+
+        var snapshot = _logReader.ReadSnapshot();
+        return _notice.Message is { } message ? LogSnapshotResult.Diagnostic(message) : snapshot;
     }
 
     /// <summary>

@@ -55,6 +55,7 @@ public sealed class StagingWatcher : BackgroundService, IBridgeWatcher
     private readonly IResultWriter _resultWriter;
     private readonly ICleanupService _cleanupService;
     private readonly IVrchatClientCoordinator _clientCoordinator;
+    private readonly VrchatLogNotice _logNotice;
     private readonly ILogger<StagingWatcher> _logger;
 
     public StagingWatcher(
@@ -64,6 +65,7 @@ public sealed class StagingWatcher : BackgroundService, IBridgeWatcher
         IResultWriter resultWriter,
         ICleanupService cleanupService,
         IVrchatClientCoordinator clientCoordinator,
+        VrchatLogNotice logNotice,
         ILogger<StagingWatcher> logger)
     {
         _options = options.Value;
@@ -72,6 +74,7 @@ public sealed class StagingWatcher : BackgroundService, IBridgeWatcher
         _resultWriter = resultWriter;
         _cleanupService = cleanupService;
         _clientCoordinator = clientCoordinator;
+        _logNotice = logNotice;
         _logger = logger;
     }
 
@@ -269,6 +272,10 @@ public sealed class StagingWatcher : BackgroundService, IBridgeWatcher
     /// Round 2). Cancellation keeps the claim for recovery at the next start. Once a
     /// cold start has archived the build, the manifest stays in archive/ whatever fails
     /// next, so the build is never deployed again.
+    ///
+    /// A Relaunch notice in the Log Viewer never outlives the build that put it up: the
+    /// coordinator clears it itself, except when the build stops between a cold start
+    /// and the launch (the install or the archive fails), which only this flow sees.
     /// </summary>
     private async Task ProcessClaimedManifestSafelyAsync(string claimedManifestPath, CancellationToken cancellationToken)
     {
@@ -306,6 +313,10 @@ public sealed class StagingWatcher : BackgroundService, IBridgeWatcher
             {
                 _logger.LogError(writeEx, "Could not write the failure result for {Path}.", claimedManifestPath);
             }
+        }
+        finally
+        {
+            _logNotice.Clear();
         }
     }
 

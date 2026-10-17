@@ -96,8 +96,11 @@ try
             : sp.GetRequiredService<VrchatClientCoordinator>());
 
     // Phase 5: snapshot reader (kept on the first VRChat client's log; in Relaunch mode the
-    // first one the record lists) + its own polling BackgroundService.
+    // first one the record lists) + its own polling BackgroundService. While a Relaunch
+    // replaces the clients, the deploy flow sets VrchatLogNotice and the service publishes it
+    // instead of the log.
     builder.Services.AddSingleton<IVrchatLogReader, VrchatLogReader>();
+    builder.Services.AddSingleton<VrchatLogNotice>();
     builder.Services.AddHostedService<VrchatLogService>();
 
     using var host = builder.Build();
