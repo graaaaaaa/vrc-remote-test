@@ -1,16 +1,21 @@
 name: Bridge tests
 
+# release-package.yml only runs on a tag push, so a pull request that changes
+# it (typically a Dependabot update of its action pins) runs this workflow
+# instead: the jobs below exercise the same actions with contents: read.
 on:
   push:
     branches: [main]
     paths:
       - "bridge/**"
       - ".github/workflows/bridge-tests.yml"
+      - ".github/workflows/release-package.yml"
   pull_request:
     branches: [main]
     paths:
       - "bridge/**"
       - ".github/workflows/bridge-tests.yml"
+      - ".github/workflows/release-package.yml"
 
 permissions:
   contents: read
@@ -28,7 +33,8 @@ jobs:
       #
       # Pinned to the same commits as release-package.yml's bridge job, which
       # only runs on a tag push, so this workflow is where a change to those
-      # actions gets exercised before a release.
+      # actions gets exercised before a release. The action-pins job below
+      # fails if the two workflows drift apart.
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           persist-credentials: false
@@ -41,3 +47,169 @@ jobs:
       - name: dotnet test
         working-directory: bridge
         run: dotnet test VRCRemoteTest.Bridge.sln --configuration Release
+
+  # Dry run of the release path for the Bridge executable: the same publish
+  # command as release-package.yml's bridge job, then the hand-off to another
+  # job through upload-artifact/download-artifact and the SHA-256 check the
+  # release job runs before publishing. Keep these steps in sync with that
+  # workflow.
+  #
+  # attest-build-provenance is deliberately not run: it needs id-token: write,
+  # which pull requests (Dependabot's included) must never get. Its pin is
+  # checked by action-pins, and its first real run is the bridge job on a tag
+  # push, where a failure stops the run before anything is published.
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      sha256: ${{ steps.hash.outputs.sha256 }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-dotnet@d4c94342e560b34958eacfc5d055d21461ed1c5d # v5.0.0
+        with:
+          dotnet-version: "10.0.x"
+
+      # The release takes the version from the tag, which it requires to
+      # match package/package.json.
+      - name: Publish the win-x64 single-file executable
+        run: |
+          VERSION=$(jq -r '.version' package/package.json)
+          dotnet publish bridge/src/VRCRemoteTest.Bridge/VRCRemoteTest.Bridge.csproj \
+            -c Release -r win-x64 --self-contained \
+            -p:PublishSingleFile=true -p:ContinuousIntegrationBuild=true \
+            -p:Version="$VERSION" -o dist/bridge
+
+      - name: Compute SHA-256
+        id: hash
+        run: |
+          EXE=dist/bridge/VRCRemoteTest.Bridge.exe
+          test -f "$EXE"
+          SHA256=$(sha256sum "$EXE" | cut -d' ' -f1)
+          if [[ ! "$SHA256" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "::error::Unexpected SHA-256 output: '$SHA256'"
+            exit 1
+          fi
+          echo "sha256=$SHA256" >> "$GITHUB_OUTPUT"
+
+      # Same inputs as the release, except that nothing needs the artifact
+      # after this run.
+      - name: Upload the executable for the artifact-handoff job
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: bridge-exe
+          path: dist/bridge/VRCRemoteTest.Bridge.exe
+          if-no-files-found: error
+          retention-days: 1
+
+  artifact-handoff:
+    needs: publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Download the Bridge executable built by this run
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: bridge-exe
+          path: dist/bridge-artifact
+
+      - name: Verify the Bridge executable matches the published hash
+        env:
+          EXPECTED: ${{ needs.publish.outputs.sha256 }}
+        run: |
+          if [[ ! "$EXPECTED" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "::error::publish job output is not a SHA-256: '$EXPECTED'"
+            exit 1
+          fi
+          if [ "$(find dist/bridge-artifact -type f | wc -l)" -ne 1 ] || \
+             [ ! -f dist/bridge-artifact/VRCRemoteTest.Bridge.exe ]; then
+            echo "::error::The bridge-exe artifact must contain exactly VRCRemoteTest.Bridge.exe"
+            exit 1
+          fi
+          ACTUAL=$(sha256sum dist/bridge-artifact/VRCRemoteTest.Bridge.exe | cut -d' ' -f1)
+          if [ "$ACTUAL" != "$EXPECTED" ]; then
+            echo "::error::Downloaded Bridge executable ($ACTUAL) does not match the published build ($EXPECTED)"
+            exit 1
+          fi
+
+  # Every remote action must be pinned as owner/repo@<commit SHA> # vX.Y.Z,
+  # the form Dependabot updates. GitHub also resolves a SHA that only exists
+  # in a fork of the action's repository, so each tag is resolved in the
+  # action's own repository and must point at the pinned commit. Each action
+  # must also be pinned to one commit across all workflows, so the jobs above
+  # run exactly what release-package.yml runs. This is the only check
+  # attest-build-provenance gets before a tag push.
+  action-pins:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+
+      - name: Verify every action pin against its upstream tag
+        env:
+          GIT_TERMINAL_PROMPT: "0"
+        run: |
+          shopt -s nullglob
+          WORKFLOWS=(.github/workflows/*.yml .github/workflows/*.yaml)
+          USES_RE='^[[:space:]]*(-[[:space:]]+)?uses:'
+          PIN_RE="${USES_RE}"'[[:space:]]*([^@[:space:]]+)@([0-9a-f]{40})[[:space:]]+#[[:space:]]*(v[0-9]+\.[0-9]+\.[0-9]+)[[:space:]]*$'
+          declare -A PINNED_SHA PINNED_AT TAG_COMMIT
+          FAILED=0
+          CHECKED=0
+
+          while IFS=: read -r FILE LINE TEXT; do
+            if [[ "$TEXT" =~ ${USES_RE}[[:space:]]*\./ ]]; then
+              continue
+            fi
+            if [[ ! "$TEXT" =~ $PIN_RE ]]; then
+              echo "::error file=$FILE,line=$LINE::Pin remote actions as owner/repo@<commit SHA> # vX.Y.Z"
+              FAILED=1
+              continue
+            fi
+            ACTION=${BASH_REMATCH[2]}
+            SHA=${BASH_REMATCH[3]}
+            TAG=${BASH_REMATCH[4]}
+            REPO=$(cut -d/ -f1-2 <<<"$ACTION")
+            CHECKED=$((CHECKED + 1))
+
+            if [ -n "${PINNED_SHA[$ACTION]:-}" ] && [ "${PINNED_SHA[$ACTION]}" != "$SHA" ]; then
+              echo "::error file=$FILE,line=$LINE::$ACTION is pinned to $SHA here but to ${PINNED_SHA[$ACTION]} at ${PINNED_AT[$ACTION]}"
+              FAILED=1
+              continue
+            fi
+            PINNED_SHA[$ACTION]=$SHA
+            PINNED_AT[$ACTION]="$FILE:$LINE"
+
+            # Peeled commit for an annotated tag, else the tag's own SHA.
+            KEY="$REPO@$TAG"
+            if [ -z "${TAG_COMMIT[$KEY]+set}" ]; then
+              if ! REFS=$(git ls-remote "https://github.com/$REPO.git" "refs/tags/$TAG" "refs/tags/$TAG^{}"); then
+                echo "::error file=$FILE,line=$LINE::Could not list the tags of $REPO"
+                FAILED=1
+                continue
+              fi
+              TAG_COMMIT[$KEY]=$(awk -v tag="refs/tags/$TAG" '
+                $2 == tag {direct=$1}
+                $2 == tag "^{}" {peeled=$1}
+                END {print (peeled != "") ? peeled : direct}
+              ' <<<"$REFS")
+            fi
+            if [ -z "${TAG_COMMIT[$KEY]}" ]; then
+              echo "::error file=$FILE,line=$LINE::$REPO has no tag $TAG"
+              FAILED=1
+            elif [ "${TAG_COMMIT[$KEY]}" != "$SHA" ]; then
+              echo "::error file=$FILE,line=$LINE::$REPO tag $TAG points at ${TAG_COMMIT[$KEY]}, not the pinned $SHA"
+              FAILED=1
+            fi
+          done < <(grep -HnE "$USES_RE" "${WORKFLOWS[@]}")
+
+          if [ "$CHECKED" -eq 0 ]; then
+            echo "::error::No action pins were found under .github/workflows"
+            exit 1
+          fi
+          echo "Checked $CHECKED action pins."
+          exit "$FAILED"
