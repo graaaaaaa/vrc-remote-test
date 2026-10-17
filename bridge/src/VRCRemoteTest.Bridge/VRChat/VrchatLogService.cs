@@ -17,10 +17,10 @@ namespace VRCRemoteTest.Bridge.VRChat;
 /// 6+ BackgroundServiceExceptionBehavior) -- the same lesson Phase 4a learned the
 /// hard way for VrchatMonitorService, applied here from the start.
 ///
-/// While the deploy flow shows a <see cref="VrchatLogNotice"/> (Relaunch mode, from closing
-/// the clients until the first new one is recorded), that line is published instead of the
-/// log, and the log is not read. Showing or clearing it wakes this loop, so the line
-/// replaces the log, and the log returns, without waiting for the next poll.
+/// While the deploy flow shows a <see cref="VrchatLogNotice"/> (Relaunch mode, from just
+/// before closing the recorded clients until the first new one is recorded), that line is
+/// published instead of the log, and the log is not read. Showing or clearing it wakes this
+/// loop, so the line replaces the log, and the log returns, without waiting for the next poll.
 /// </summary>
 public sealed class VrchatLogService : BackgroundService
 {

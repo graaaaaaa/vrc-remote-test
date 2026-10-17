@@ -563,7 +563,33 @@ public class VrchatRelaunchCoordinatorTests
     }
 
     [Fact]
-    public async Task No_notice_is_shown_when_none_of_the_Bridges_clients_is_running()
+    public async Task The_notice_is_shown_when_the_recorded_clients_have_already_exited()
+    {
+        // As when the Bridge stopped while closing them and recovers the build after its
+        // restart: the newest logs are still theirs (Windows verification of PR #19, item 4).
+        Recorded(1001, Earlier, profile: 0, launchOrder: 0);
+        Recorded(1002, Earlier.AddSeconds(3), profile: 1, launchOrder: 1);
+        var atLaunch = new List<string?>();
+        _launcher.OnLaunch = pid =>
+        {
+            atLaunch.Add(_logNotice.Message);
+            Running(pid, _launcher.Launched[^1].CreationTimeUtc);
+        };
+        var coordinator = CreateCoordinator(profiles: [0, 1]);
+
+        var preparation = await coordinator.PrepareAsync(CancellationToken.None);
+        var betweenTheCalls = _logNotice.Message;
+        var outcome = await coordinator.LaunchClientsAsync(WorldPath, CancellationToken.None);
+
+        preparation.Kind.Should().Be(VrchatPreparationKind.ColdStart);
+        outcome.Succeeded.Should().BeTrue();
+        betweenTheCalls.Should().Be(VrchatRelaunchCoordinator.RelaunchNotice);
+        atLaunch.Should().Equal(new[] { VrchatRelaunchCoordinator.RelaunchNotice, null });
+        _logNotice.Message.Should().BeNull();
+    }
+
+    [Fact]
+    public async Task No_notice_is_shown_when_the_record_is_empty()
     {
         // As at a Reload cold start: the newest log stays until the first client is seen.
         var atLaunch = new List<string?>();
@@ -585,13 +611,15 @@ public class VrchatRelaunchCoordinatorTests
     [Fact]
     public async Task A_VRChat_the_Bridge_did_not_launch_shows_no_notice()
     {
+        Running(1001, Earlier);
+        Recorded(1001, Earlier);
         Running(3003, Earlier);
 
         var preparation = await CreateCoordinator().PrepareAsync(CancellationToken.None);
 
         preparation.ErrorCode.Should().Be(ErrorCode.VrchatUnmanagedRunning);
         (await _logNotice.WaitForChangeAsync(TimeSpan.Zero, CancellationToken.None)).Should()
-            .BeFalse("nothing was closed");
+            .BeFalse("nothing was closed, so the line never flashed");
     }
 
     [Fact]

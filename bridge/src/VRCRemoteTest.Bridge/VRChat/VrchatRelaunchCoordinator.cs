@@ -33,12 +33,15 @@ namespace VRCRemoteTest.Bridge.VRChat;
 /// empty, so running VRChat then stops the build; a record that cannot be read stops it
 /// with UNKNOWN_ERROR.
 ///
-/// From the moment it starts closing clients until the first new client is recorded, the
-/// Log Viewer shows <see cref="RelaunchNotice"/> instead of a log (<see cref="VrchatLogNotice"/>):
-/// the closing clients' logs, and with none running the newest file, are the previous
-/// session's. A relaunch that stops before that point clears the line here, except after a
-/// cold start that StagingWatcher does not go on to launch (the install fails), where
-/// StagingWatcher clears it.
+/// Once nothing but the Bridge's own clients is running and the record lists any, until the
+/// first new client is recorded, the Log Viewer shows <see cref="RelaunchNotice"/> instead of
+/// a log (<see cref="VrchatLogNotice"/>): the closing clients' logs, and with none running the
+/// newest file, are the previous session's. That holds when the recorded clients have already
+/// exited too, as when the Bridge stopped while closing them and recovers the build after its
+/// restart (Windows verification of PR #19, item 4: the closed client's log stayed 5.2 s
+/// after the new first client started). A relaunch that stops before that point clears the
+/// line here, except after a cold start that StagingWatcher does not go on to launch (the
+/// install fails), where StagingWatcher clears it.
 /// </summary>
 public sealed class VrchatRelaunchCoordinator : IVrchatClientCoordinator
 {
@@ -171,9 +174,15 @@ public sealed class VrchatRelaunchCoordinator : IVrchatClientCoordinator
                     $"{others.Count} VRChat client(s) that the Bridge did not launch (PID {ProcessIds(others)}){corruptHint}");
             }
 
-            if (managed.Count > 0)
+            // Shown only past the check above, so a build that stops for another VRChat never
+            // flashes it.
+            if (records.Count > 0)
             {
                 _logNotice.Show(RelaunchNotice);
+            }
+
+            if (managed.Count > 0)
+            {
                 var closed = await _terminator.CloseAsync(managed, cancellationToken).ConfigureAwait(false);
                 if (closed.NotConfirmed.Count > 0)
                 {
