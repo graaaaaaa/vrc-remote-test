@@ -1,12 +1,15 @@
 using System.Text.Json;
+using Microsoft.Extensions.Logging;
 using VRCRemoteTest.Bridge.Protocol;
 
 namespace VRCRemoteTest.Bridge.VRChat;
 
 /// <summary>
 /// Writes status/vrchat-status.json using the same atomic tmp-then-rename pattern as
-/// ResultWriter, so a concurrent reader (Unity's PollVrchatStatus) never observes a
-/// partially-written file.
+/// ResultWriter, so a concurrent reader (Unity's PollVrchatStatus) normally never
+/// observes a partially-written file. While the Mac's SMB client holds the file open
+/// the rename cannot replace it, so it is rewritten in place instead (see
+/// SharedFileWriter); PollVrchatStatus already treats a partial read as a transient miss.
 /// </summary>
 public sealed class VrchatStatusWriter : IVrchatStatusWriter
 {
@@ -14,15 +17,18 @@ public sealed class VrchatStatusWriter : IVrchatStatusWriter
 
     private static readonly JsonSerializerOptions SerializerOptions = new() { WriteIndented = true };
 
+    private readonly SharedFileWriter _fileWriter;
+
+    public VrchatStatusWriter(ILogger<VrchatStatusWriter> logger)
+    {
+        _fileWriter = new SharedFileWriter(logger);
+    }
+
     public void Write(VrchatStatus status, string statusDirectory)
     {
         Directory.CreateDirectory(statusDirectory);
 
-        var finalPath = Path.Combine(statusDirectory, FileName);
-        var tempPath = Path.Combine(statusDirectory, $"{FileName}.tmp");
-
         var json = JsonSerializer.Serialize(status, SerializerOptions);
-        File.WriteAllText(tempPath, json);
-        File.Move(tempPath, finalPath, overwrite: true);
+        _fileWriter.Write(Path.Combine(statusDirectory, FileName), json);
     }
 }

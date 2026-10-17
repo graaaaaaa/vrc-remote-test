@@ -1,5 +1,6 @@
 using System.Text.Json;
 using FluentAssertions;
+using Microsoft.Extensions.Logging.Abstractions;
 using VRCRemoteTest.Bridge.Protocol;
 using VRCRemoteTest.Bridge.VRChat;
 using Xunit;
@@ -11,7 +12,7 @@ public class VrchatStatusWriterTests : IDisposable
     private static readonly JsonSerializerOptions DeserializeOptions = new() { PropertyNameCaseInsensitive = true };
 
     private readonly string _tempDir;
-    private readonly VrchatStatusWriter _writer = new();
+    private readonly VrchatStatusWriter _writer = new(NullLogger<VrchatStatusWriter>.Instance);
 
     public VrchatStatusWriterTests()
     {
@@ -74,5 +75,27 @@ public class VrchatStatusWriterTests : IDisposable
         var parsed = JsonSerializer.Deserialize<VrchatStatus>(
             File.ReadAllText(Path.Combine(_tempDir, "vrchat-status.json")), DeserializeOptions);
         parsed!.IsRunning.Should().BeTrue();
+    }
+
+    [Fact]
+    public void Keeps_updating_the_status_file_while_the_Mac_SMB_client_holds_it_open()
+    {
+        if (!OperatingSystem.IsWindows())
+        {
+            return; // On Unix, rename(2) replaces an open destination, so nothing is held open in that sense.
+        }
+
+        _writer.Write(new VrchatStatus { IsRunning = false, UpdatedAtUtc = DateTimeOffset.UtcNow }, _tempDir);
+        var path = Path.Combine(_tempDir, "vrchat-status.json");
+        using var macHandle = new FileStream(
+            path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete, bufferSize: 0);
+
+        _writer.Write(new VrchatStatus { IsRunning = true, UpdatedAtUtc = DateTimeOffset.UtcNow }, _tempDir);
+
+        macHandle.Seek(0, SeekOrigin.Begin);
+        using var reader = new StreamReader(macHandle, leaveOpen: true);
+        var parsed = JsonSerializer.Deserialize<VrchatStatus>(reader.ReadToEnd(), DeserializeOptions);
+        parsed!.IsRunning.Should().BeTrue();
+        Directory.GetFiles(_tempDir).Should().ContainSingle().Which.Should().Be(path);
     }
 }

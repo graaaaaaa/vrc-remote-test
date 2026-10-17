@@ -24,6 +24,7 @@ public sealed class VrchatLogService : BackgroundService
     private readonly BridgeOptions _options;
     private readonly IVrchatLogReader _logReader;
     private readonly ILogger<VrchatLogService> _logger;
+    private readonly SharedFileWriter _fileWriter;
     private readonly TimeSpan _pollInterval;
 
     public VrchatLogService(
@@ -44,6 +45,7 @@ public sealed class VrchatLogService : BackgroundService
         _options = options.Value;
         _logReader = logReader;
         _logger = logger;
+        _fileWriter = new SharedFileWriter(logger);
         _pollInterval = pollInterval;
     }
 
@@ -58,7 +60,7 @@ public sealed class VrchatLogService : BackgroundService
                 var snapshot = _logReader.ReadSnapshot();
                 if (snapshot.IsAvailable)
                 {
-                    WriteAtomic(snapshot.Content, LogsDirectory);
+                    Publish(snapshot.Content);
                 }
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
@@ -77,15 +79,14 @@ public sealed class VrchatLogService : BackgroundService
         }
     }
 
-    /// <summary>Same tmp-then-rename pattern as ResultWriter/VrchatStatusWriter.</summary>
-    private static void WriteAtomic(string content, string logsDirectory)
+    /// <summary>
+    /// Tmp-then-rename like ResultWriter, except that a destination held open by the
+    /// Mac's SMB client is rewritten in place rather than failing every poll (see
+    /// SharedFileWriter).
+    /// </summary>
+    private void Publish(string content)
     {
-        Directory.CreateDirectory(logsDirectory);
-
-        var finalPath = Path.Combine(logsDirectory, "vrchat-latest.log");
-        var tempPath = Path.Combine(logsDirectory, "vrchat-latest.log.tmp");
-
-        File.WriteAllText(tempPath, content);
-        File.Move(tempPath, finalPath, overwrite: true);
+        Directory.CreateDirectory(LogsDirectory);
+        _fileWriter.Write(Path.Combine(LogsDirectory, "vrchat-latest.log"), content);
     }
 }

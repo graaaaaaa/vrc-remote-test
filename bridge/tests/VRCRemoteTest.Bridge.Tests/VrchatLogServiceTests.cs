@@ -1,4 +1,5 @@
 using FluentAssertions;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
 using VRCRemoteTest.Bridge.Configuration;
@@ -25,11 +26,11 @@ public class VrchatLogServiceTests : IDisposable
         try { Directory.Delete(_tempDir, recursive: true); } catch (IOException) { }
     }
 
-    private VrchatLogService CreateService(FakeVrchatLogReader logReader) =>
+    private VrchatLogService CreateService(FakeVrchatLogReader logReader, ILogger<VrchatLogService>? logger = null) =>
         new(
             Options.Create(new BridgeOptions { StagingDirectory = _tempDir }),
             logReader,
-            NullLogger<VrchatLogService>.Instance,
+            logger ?? NullLogger<VrchatLogService>.Instance,
             TimeSpan.FromMilliseconds(10));
 
     [Fact]
@@ -81,6 +82,47 @@ public class VrchatLogServiceTests : IDisposable
         await service.StopAsync(CancellationToken.None);
 
         logReader.ReadSnapshotCallCount.Should().BeGreaterThanOrEqualTo(3);
+    }
+
+    /// <summary>
+    /// Regression for 2026-10-17: while Unity polled the file, the Mac's SMB client
+    /// kept it open (sharing Read|Write|Delete), File.Move(overwrite: true) failed with
+    /// UnauthorizedAccessException on every poll, the published log went stale, and an
+    /// ERR with a stack trace was logged every 5s.
+    /// </summary>
+    [Fact]
+    public async Task Keeps_updating_vrchat_latest_log_while_the_Mac_SMB_client_holds_it_open()
+    {
+        if (!OperatingSystem.IsWindows())
+        {
+            return; // On Unix, rename(2) replaces an open destination, so nothing is held open in that sense.
+        }
+
+        var path = Path.Combine(_tempDir, "logs", "vrchat-latest.log");
+        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+        File.WriteAllText(path, "stale snapshot");
+        using var macHandle = new FileStream(
+            path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete, bufferSize: 0);
+
+        var logReader = new FakeVrchatLogReader { ResultToReturn = LogSnapshotResult.Success("fresh snapshot") };
+        var logger = new ListLogger<VrchatLogService>();
+        var service = CreateService(logReader, logger);
+
+        using var cts = new CancellationTokenSource();
+        await service.StartAsync(cts.Token);
+        await WaitUntil(() => logReader.ReadSnapshotCallCount >= 3, TimeSpan.FromSeconds(2));
+        cts.Cancel();
+        await service.StopAsync(CancellationToken.None);
+
+        macHandle.Seek(0, SeekOrigin.Begin);
+        using (var reader = new StreamReader(macHandle, leaveOpen: true))
+        {
+            reader.ReadToEnd().Should().Be("fresh snapshot");
+        }
+
+        logger.Entries.Should().NotContain(e => e.Level >= LogLevel.Warning);
+        logger.Entries.Should().ContainSingle()
+            .Which.Exception.Should().BeNull("being held open is expected, not an error worth a stack trace");
     }
 
     private static async Task WaitUntil(Func<bool> condition, TimeSpan timeout)
