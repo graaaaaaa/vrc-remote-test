@@ -214,6 +214,37 @@ public class VrchatLogReaderTests : IDisposable
         result.Content.Should().NotContain("some other session");
     }
 
+    [Fact]
+    public void ReadSnapshot_publishes_nothing_while_a_just_started_client_has_no_log_yet()
+    {
+        var previous = WriteLogFor(T0, "previous session line\n");
+        _monitor.AddClient(100, DateTime.UtcNow);
+
+        var result = CreateReader().ReadSnapshot();
+
+        result.IsAvailable.Should().BeFalse("the share keeps its last log instead of a diagnostic");
+        File.Exists(previous).Should().BeTrue();
+    }
+
+    [Fact]
+    public void ReadSnapshot_reports_the_diagnostic_once_the_client_is_past_the_grace_period()
+    {
+        _monitor.AddClient(100, DateTime.UtcNow.AddSeconds(-11));
+
+        var result = CreateReader().ReadSnapshot();
+
+        result.IsAvailable.Should().BeTrue();
+        result.Content.Should().Contain("Could not match");
+    }
+
+    [Fact]
+    public void ReadSnapshot_reports_the_diagnostic_at_once_when_the_start_time_is_unknown()
+    {
+        _monitor.AddClient(100, creationTimeUtc: null);
+
+        CreateReader().ReadSnapshot().Content.Should().Contain("Could not match").And.Contain("start time unknown");
+    }
+
     /// <summary>Clients 100 (first) and 200 with their own logs; the reader has pinned 100's.</summary>
     private VrchatLogReader CreatePinnedReader()
     {

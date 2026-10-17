@@ -46,6 +46,15 @@ public sealed class VrchatLogReader : IVrchatLogReader
 
     private const string TruncationMarker = "... [truncated]";
 
+    /// <summary>
+    /// VRChat created its output_log 0.70-0.84 s after the process start on real
+    /// hardware without load (docs/validation/multi-client-spike.md, PR #2 verification),
+    /// so the first 5-second poll after a cold start usually finds no file yet. Until
+    /// the first client is this old, an unmatched log publishes nothing instead of a
+    /// diagnostic. Under heavy load the file took 11-22 s, and the diagnostic then shows.
+    /// </summary>
+    private static readonly TimeSpan LogCreationGrace = TimeSpan.FromSeconds(10);
+
     private readonly BridgeOptions _options;
     private readonly IVrchatProcessMonitor _processMonitor;
     private readonly ILogger<VrchatLogReader> _logger;
@@ -167,6 +176,11 @@ public sealed class VrchatLogReader : IVrchatLogReader
             : null;
         if (match is null)
         {
+            if (client.CreationTimeUtc is { } justStarted && DateTime.UtcNow - justStarted < LogCreationGrace)
+            {
+                return LogSnapshotResult.Empty();
+            }
+
             var started = client.CreationTimeUtc is { } created
                 ? $"started {created:yyyy-MM-dd HH:mm:ss}Z"
                 : "start time unknown";

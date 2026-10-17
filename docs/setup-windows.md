@@ -391,7 +391,7 @@ VRChatのホーム画面到達を確認したら準備完了。以降はUnity側
 - **既に`--watch-worlds`無しでVRChatが起動中の場合、Bridgeは自動的に再起動・終了させない**（`VRCHAT_WATCH_WORLDS_MISSING`でビルド失敗となる）。この場合は手動でVRChatを終了させるか、手順8の通り`--watch-worlds`付きで起動し直す
 - Bridgeが状態を確かめられないVRChat（プロセスの一覧を取れない、セッションを読めない、WMI がコマンドラインを返さない・時間内に答えない、など）が動いているときも、何も起動せず、何も終了させずに`VRCHAT_UNMANAGED_RUNNING`でビルドが失敗する。そのVRChatを手で閉じてから、もう一度ビルドを送る。Unity v0.3.0 にはこのコードの案内文がまだ無く、コードとメッセージだけが表示される。別のユーザーのセッション（別の Windows アカウントやリモートデスクトップ）で動いている VRChat は数えない
 - **`VrchatStartupSettleDelaySeconds`（起動済みの台へ配置するまでの最低待機時間）は環境によって調整が必要**。デフォルト30秒でも短すぎる場合、ファイル配置は成功してもリロードされないことがある。手で起動したVRChatがホーム画面へ到達するまでの体感時間を確認し、それに応じて値を調整すること（`--url`で起動した台は、実測では起動の10秒後から配置を拾った）
-- 同じ Windows アカウントでは、Bridge は1つしか動かない。`%LOCALAPPDATA%\VRCRemoteTest\state\bridge.lock`を開いたままにしておき、2つ目のBridgeは「Another VRC Remote Test Bridge is already running」とログに出して起動を拒否する。ロックはアカウントごとなので、共有と Worlds は Bridge 用のアカウント（U）1つだけで使う
+- 同じ Windows アカウントでは、Bridge は1つしか動かない。`%LOCALAPPDATA%\VRCRemoteTest\state\bridge.lock`を開いたままにしておき、2つ目のBridgeは「Another VRC Remote Test Bridge is already running」とログに出して起動を拒否する。その日のログファイルは1つ目の Bridge が開いているので、2つ目のメッセージは `%LOCALAPPDATA%\VRCRemoteTest\logs\bridge-<日付>_001.log` のような別名のファイルに書かれる。ロックはアカウントごとなので、共有と Worlds は Bridge 用のアカウント（U）1つだけで使う
 
 **Unity側のResult Timeout推奨値**: 結果が書かれるまでの時間は、「前に並んでいるビルドの残り ＋ このビルドのコピー・検証・配置 ＋ 準備待ち（起動直後の台があれば最大`VrchatStartupTimeoutSeconds`、デフォルト60秒）＋ コールドスタートでの起動の間隔（(台数−1)×3秒、4台で9秒）＋ 余裕」になる。Unity側の `VRC Remote Test` ウィンドウ設定foldoutにある `Result Timeout (s)` はデフォルトの60秒だと足りないことがあるので、**90秒以上、ビルドを続けて送るなら120秒から**にする。120秒でも、ビルドがいくつ並んでも間に合うという保証ではない。
 
@@ -457,7 +457,7 @@ Moonlight（NVIDIA GameStream/Sunshine互換のリモートデスクトップク
 
 `RemoteBuildCommand`が使う同じSMB共有経由で、BridgeがVRChatの`output_log_*.txt`（最新200行、直近ウィンドウのスナップショット）を5秒間隔で配信する。Windows側の追加設定は不要 — `VrchatWorldsDirectory`が正しく設定済みであれば自動的に有効になる。Unity側の `VRC Remote Test` ウィンドウの `VRChat Log` foldoutから、カテゴリフィルタ（All/Error/Exception/Udon/Shader/Warning）付きで閲覧できる。表示専用で、readiness判定やビルドの成否には一切影響しない。
 
-VRChat が動いている間は、最新のファイルではなく1台目（`--watch-worlds` 付きの台のうち最も早く起動した台）のログを表示する。output_log には PID が出ないので、ファイル名の時刻と台の起動時刻で対応付け、その台が動いている間は同じファイルを表示し続ける。同じ秒に起動した台がある、ログを作ったあとに時計やタイムゾーンが変わった、などで対応付けられないときは、ログの代わりに「Could not match an output_log_*.txt file to the first VRChat client ...」という1行を表示する。VRChat が1台も動いていないときは、今までどおり最新のファイル（前回のセッションのログ）を表示する。Logging の設定は手順9-2を参照。
+VRChat が動いている間は、最新のファイルではなく1台目（`--watch-worlds` 付きの台のうち最も早く起動した台）のログを表示する。output_log には PID が出ないので、ファイル名の時刻と台の起動時刻で対応付け、その台が動いている間は同じファイルを表示し続ける。同じ秒に起動した台がある、ログを作ったあとに時計やタイムゾーンが変わった、などで対応付けられないときは、ログの代わりに「Could not match an output_log_*.txt file to the first VRChat client ...」という1行を表示する。ただし1台目の起動から10秒の間は、VRChat がまだログファイルを作っていないことが多いので、この1行は出さず、それまでの表示のままにする。VRChat が1台も動いていないときは、今までどおり最新のファイル（前回のセッションのログ）を表示する。Logging の設定は手順9-2を参照。
 
 この対応付けは、VRChat が起動から1秒ほどのうちにログファイルを作ることを前提にしている（実機ではまだ測っていない）。それより遅いと対応付けられないことがあり、起動の間隔（3秒）を超えて遅れると、終了した台のログを次の台のものとして表示することもありうる。
 
@@ -638,7 +638,7 @@ Rename-Item -LiteralPath 'C:\VRCRemoteTest' -NewName ('VRCRemoteTest.old-' + (Ge
 | `install-bridge.ps1`が「稼働中の Bridge…を先に停止してください」で失敗する | 置き換えには実行中の exe の停止が必要（自動停止はしない） | `Stop-ScheduledTask -TaskName 'VRCRemoteTestBridge'` で停止してから再実行する |
 | `install-bridge.ps1`登録後、ログオンしてもBridgeが起動していない | タスクが無効化されたまま、または`config.json`が無効 | `Get-ScheduledTask -TaskName 'VRCRemoteTestBridge'` の `State` を確認し、`Disabled` なら `Enable-ScheduledTask`。`Get-ScheduledTaskInfo -TaskName 'VRCRemoteTestBridge' -TaskPath '\' \| Select-Object LastRunTime, LastTaskResult`で終了コードを確認し、`%LOCALAPPDATA%\VRCRemoteTest\logs\bridge-*.log`の最新ログを確認する |
 | `install-bridge.ps1`が「本スクリプトが管理するタスクとは判別できません」で失敗する | 同名の無関係なタスクが既に存在する | `Get-ScheduledTask -TaskName 'VRCRemoteTestBridge' -TaskPath '\'`で内容を確認し、無関係であれば`-TaskName`で別名を指定するか、手動で削除してから再実行する |
-| Bridge が `Another VRC Remote Test Bridge is already running` と出して終了する | 別の Bridge がすでに動いている（手動で起動したものと Task Scheduler のものが重なった、など） | `Get-Process VRCRemoteTest.Bridge` で確認し、1つだけにする。動いている Bridge が無いのにこのメッセージが出るなら、`%LOCALAPPDATA%\VRCRemoteTest\state\bridge.lock` を開いているプロセスを確かめる |
+| Bridge が `Another VRC Remote Test Bridge is already running` と出して終了する（このメッセージは `logs\bridge-<日付>_001.log` など、末尾に番号の付いた別名のログファイルにある） | 別の Bridge がすでに動いている（手動で起動したものと Task Scheduler のものが重なった、など） | `Get-Process VRCRemoteTest.Bridge` で確認し、1つだけにする。動いている Bridge が無いのにこのメッセージが出るなら、`%LOCALAPPDATA%\VRCRemoteTest\state\bridge.lock` を開いているプロセスを確かめる |
 | ビルドが `VRCHAT_UNMANAGED_RUNNING` で失敗する | Bridge が状態を確かめられない VRChat が動いている（手順9）。何も起動・終了していない | その VRChat を手で閉じてから、もう一度ビルドを送る。Bridge のログに理由（プロセスの一覧が取れない、確かめられない台の数）が出る |
 | `VrchatClientCount` を2以上にしたのに、1台にしか配置されない・台が増えない | 動いている台があると、足りない台は起動しない（手順9-1） | VRChat を全部閉じてから次のビルドを送る。Bridge のログの `VRChat clients changed` で台数を確認できる |
 | Log Viewer に `Could not match an output_log_*.txt file ...` が出る | 1台目のログを特定できない（手順11） | 台を全部閉じて、Bridge に起動させ直す（3秒間隔で起動するので、ファイルが分かれる）。手で起動するなら、1秒以上あけて1台ずつ起動する |
