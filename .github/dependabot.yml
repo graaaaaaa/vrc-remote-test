@@ -24,10 +24,13 @@ updates:
       day: monday
       time: "09:00"
       timezone: Asia/Tokyo
-    # 公開から 3 日経っていない版は提案しない。タグの付け替えや壊れた
-    # リリースが見つかるまでの猶予で、security updates には効かない。
+    # 公開から 14 日経っていない版は提案しない。タグの付け替えや壊れた
+    # リリースが見つかるまでの猶予。週 1 回の確認と重なるので、新しい版が
+    # PR になるのは公開から 14〜21 日後になる。SHA 固定の action には
+    # security updates が届かないので、セキュリティ修正もこの猶予を待つ。
+    # 急ぐ修正は手で SHA を更新する。
     cooldown:
-      default-days: 3
+      default-days: 14
     # actions/* のマイナー・パッチ更新は 1 つの PR にまとめる。メジャー更新は
     # Node ランタイムや入力の既定値が変わるので、action ごとに別の PR にして
     # 1 つずつレビュー・revert できるようにする。actions/* 以外の action を
