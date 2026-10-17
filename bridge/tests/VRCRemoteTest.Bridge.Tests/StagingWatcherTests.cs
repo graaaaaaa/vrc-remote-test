@@ -23,6 +23,7 @@ public class StagingWatcherTests : IDisposable
     private readonly string _stagingDir;
     private readonly string _stateDir;
     private readonly string _worldsDir;
+    private readonly VrchatLogNotice _logNotice = new();
 
     public StagingWatcherTests()
     {
@@ -72,6 +73,7 @@ public class StagingWatcherTests : IDisposable
             resultWriter ?? new ResultWriter(),
             new CleanupService(),
             clientCoordinator ?? new FakeVrchatClientCoordinator(),
+            _logNotice,
             NullLogger<StagingWatcher>.Instance);
 
     /// <summary>
@@ -1053,6 +1055,34 @@ public class StagingWatcherTests : IDisposable
         launcher.LaunchCalled.Should().BeFalse();
         File.Exists(DeployedPath("build-warm")).Should().BeTrue();
         ReadResult("build-warm").Status.Should().Be("deployed");
+    }
+
+    [Fact]
+    public async Task Reload_deploys_neither_show_a_notice_nor_wake_the_Log_Viewer()
+    {
+        // Only Relaunch closes clients; Reload keeps the Log Viewer's 5 s polls as they were.
+        var monitor = new FakeVrchatProcessMonitor();
+        var launcher = new FakeVrchatLauncher();
+        var noticeAtLaunch = new List<string?>();
+        launcher.OnLaunch = pid =>
+        {
+            noticeAtLaunch.Add(_logNotice.Message);
+            monitor.AddClient(pid, DateTime.UtcNow.AddMinutes(-5));
+        };
+        var watcher = CreateWatcher(
+            autoLaunchVrchat: true, clientCoordinator: CreateCoordinator(monitor, launcher, clientCount: 2));
+
+        WriteIncomingBuild(_stagingDir, "build-cold", Encoding.UTF8.GetBytes("bundle-cold"));
+        await watcher.RunOnceAsync(CancellationToken.None);
+        WriteIncomingBuild(_stagingDir, "build-warm", Encoding.UTF8.GetBytes("bundle-warm"));
+        await watcher.RunOnceAsync(CancellationToken.None);
+
+        ReadResult("build-cold").Status.Should().Be("deployed");
+        ReadResult("build-warm").Status.Should().Be("deployed");
+        launcher.Requests.Should().HaveCount(2, "the second build reloads the running clients");
+        noticeAtLaunch.Should().Equal(new string?[] { null, null });
+        _logNotice.Message.Should().BeNull();
+        (await _logNotice.WaitForChangeAsync(TimeSpan.Zero, CancellationToken.None)).Should().BeFalse();
     }
 
     [Fact]

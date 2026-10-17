@@ -32,15 +32,31 @@ namespace VRCRemoteTest.Bridge.VRChat;
 /// a name or a plausible log file never makes it one. A record that is corrupt counts as
 /// empty, so running VRChat then stops the build; a record that cannot be read stops it
 /// with UNKNOWN_ERROR.
+///
+/// Once nothing but the Bridge's own clients is running and the record lists any, until the
+/// first new client is recorded, the Log Viewer shows <see cref="RelaunchNotice"/> instead of
+/// a log (<see cref="VrchatLogNotice"/>): the closing clients' logs, and with none running the
+/// newest file, are the previous session's. That holds when the recorded clients have already
+/// exited too, as when the Bridge stopped while closing them and recovers the build after its
+/// restart (Windows verification of PR #19, item 4: the closed client's log stayed 5.2 s
+/// after the new first client started). A relaunch that stops before that point clears the
+/// line here, except after a cold start that StagingWatcher does not go on to launch (the
+/// install fails), where StagingWatcher clears it.
 /// </summary>
 public sealed class VrchatRelaunchCoordinator : IVrchatClientCoordinator
 {
     private const string VrchatProcessName = "VRChat";
 
+    internal const string RelaunchNotice =
+        "The Bridge is relaunching its VRChat clients with the new build (VrchatClientMode: Relaunch): " +
+        "they are closed, the build is installed, and they are started again. " +
+        "The first client's log is shown once it has started.";
+
     private readonly BridgeOptions _options;
     private readonly IVrchatProcessMonitor _processMonitor;
     private readonly IVrchatLauncher _launcher;
     private readonly IManagedClientStore _store;
+    private readonly VrchatLogNotice _logNotice;
     private readonly ILogger<VrchatRelaunchCoordinator> _logger;
     private readonly Func<DateTime> _utcNow;
     private readonly VrchatClientTerminator _terminator;
@@ -51,12 +67,14 @@ public sealed class VrchatRelaunchCoordinator : IVrchatClientCoordinator
         IVrchatProcessMonitor processMonitor,
         IVrchatLauncher launcher,
         IManagedClientStore store,
+        VrchatLogNotice logNotice,
         ILogger<VrchatRelaunchCoordinator> logger)
         : this(
             options,
             processMonitor,
             launcher,
             store,
+            logNotice,
             logger,
             Task.Delay,
             () => VrchatLaunchPacer.ListLogFiles(options.Value),
@@ -74,6 +92,7 @@ public sealed class VrchatRelaunchCoordinator : IVrchatClientCoordinator
         IVrchatProcessMonitor processMonitor,
         IVrchatLauncher launcher,
         IManagedClientStore store,
+        VrchatLogNotice logNotice,
         ILogger<VrchatRelaunchCoordinator> logger,
         Func<TimeSpan, CancellationToken, Task> delay,
         Func<IReadOnlyList<VrchatLogMatcher.Candidate>?> listLogFiles,
@@ -84,6 +103,7 @@ public sealed class VrchatRelaunchCoordinator : IVrchatClientCoordinator
         _processMonitor = processMonitor;
         _launcher = launcher;
         _store = store;
+        _logNotice = logNotice;
         _logger = logger;
         _utcNow = utcNow;
         _terminator = new VrchatClientTerminator(logger, utcNow, delay);
@@ -95,8 +115,27 @@ public sealed class VrchatRelaunchCoordinator : IVrchatClientCoordinator
     /// record says so on disk, and no other VRChat is running. A stop request while
     /// closing kills nothing more and deploys nothing: the claim stays in processing/ and
     /// the Bridge starts again from step 1 after its restart (multi-client plan section 13.3).
+    /// Anything but a cold start ends the relaunch, so the Log Viewer shows what runs again.
     /// </summary>
     public async Task<VrchatPreparation> PrepareAsync(CancellationToken cancellationToken)
+    {
+        var coldStart = false;
+        try
+        {
+            var preparation = await PrepareCoreAsync(cancellationToken).ConfigureAwait(false);
+            coldStart = preparation.Kind == VrchatPreparationKind.ColdStart;
+            return preparation;
+        }
+        finally
+        {
+            if (!coldStart)
+            {
+                _logNotice.Clear();
+            }
+        }
+    }
+
+    private async Task<VrchatPreparation> PrepareCoreAsync(CancellationToken cancellationToken)
     {
         var load = _store.Load();
         if (load.Status == ManagedClientLoadStatus.Unreadable)
@@ -133,6 +172,13 @@ public sealed class VrchatRelaunchCoordinator : IVrchatClientCoordinator
                     : string.Empty;
                 return Unmanaged(
                     $"{others.Count} VRChat client(s) that the Bridge did not launch (PID {ProcessIds(others)}){corruptHint}");
+            }
+
+            // Shown only past the check above, so a build that stops for another VRChat never
+            // flashes it.
+            if (records.Count > 0)
+            {
+                _logNotice.Show(RelaunchNotice);
             }
 
             if (managed.Count > 0)
@@ -193,9 +239,23 @@ public sealed class VrchatRelaunchCoordinator : IVrchatClientCoordinator
     /// happens, so a Bridge that stops between two launches still closes the clients it
     /// started on the next deploy; a client that started but could not be recorded stops
     /// the batch (it then blocks the next deploy as a VRChat the Bridge did not launch,
-    /// until it is closed by hand). Stop requests are honoured as in Reload mode.
+    /// until it is closed by hand). Stop requests are honoured as in Reload mode. The Log
+    /// Viewer's notice ends once the first client is recorded, or when the batch stops before.
     /// </summary>
     public async Task<VrchatLaunchOutcome> LaunchClientsAsync(
+        string deployedWorldPath, CancellationToken cancellationToken)
+    {
+        try
+        {
+            return await LaunchClientsCoreAsync(deployedWorldPath, cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            _logNotice.Clear();
+        }
+    }
+
+    private async Task<VrchatLaunchOutcome> LaunchClientsCoreAsync(
         string deployedWorldPath, CancellationToken cancellationToken)
     {
         var profiles = _options.VrchatProfiles
@@ -285,6 +345,13 @@ public sealed class VrchatRelaunchCoordinator : IVrchatClientCoordinator
                 "Launched VRChat client {Index}/{Count} (profile {Profile}, PID {ProcessId}, created {CreationTimeUtc:O}, " +
                 "roomId {RoomId}).",
                 i + 1, count, profile, processId, creationTimeUtc, roomId);
+
+            // The Log Viewer finds the first client through the record (VrchatLogReader), so
+            // from here on it shows that client's state instead of the previous session's log.
+            if (i == 0)
+            {
+                _logNotice.Clear();
+            }
         }
 
         cancellationToken.ThrowIfCancellationRequested();

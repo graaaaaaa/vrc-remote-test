@@ -2,6 +2,7 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using FluentAssertions;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using VRCRemoteTest.Bridge.Configuration;
 using VRCRemoteTest.Bridge.Deployment;
@@ -28,6 +29,7 @@ public class StagingWatcherRelaunchTests : IDisposable
     private readonly FakeVrchatProcessMonitor _monitor = new();
     private readonly FakeVrchatLauncher _launcher = new();
     private readonly RecordingWorldInstaller _installer = new();
+    private readonly VrchatLogNotice _logNotice = new();
     private DateTime _now = T0;
 
     public StagingWatcherRelaunchTests()
@@ -72,6 +74,7 @@ public class StagingWatcherRelaunchTests : IDisposable
             _monitor,
             _launcher,
             store ?? new ManagedClientStore(_stateDir),
+            _logNotice,
             NullLogger<VrchatRelaunchCoordinator>.Instance,
             delay ?? ((wait, token) =>
             {
@@ -90,6 +93,7 @@ public class StagingWatcherRelaunchTests : IDisposable
             new ResultWriter(),
             new CleanupService(),
             coordinator,
+            _logNotice,
             NullLogger<StagingWatcher>.Instance);
     }
 
@@ -406,6 +410,177 @@ public class StagingWatcherRelaunchTests : IDisposable
         _launcher.Requests.Should().ContainSingle().Which.WorldPath.Should().Be(Path.GetFullPath(DeployedPath("b1")));
         File.Exists(DeployedPath("b1")).Should().BeTrue();
         File.Exists(newerLooking).Should().BeFalse();
+    }
+
+    // ---- The Log Viewer during a relaunch (VrchatLogNotice) ----
+
+    private static readonly TimeSpan PublishWait = TimeSpan.FromSeconds(5);
+
+    private string? Published() => PublishedFile.TryRead(Path.Combine(_stagingDir, "logs", "vrchat-latest.log"));
+
+    /// <summary>
+    /// The real Log Viewer loop over a fake reader, with polls an hour apart, so that only
+    /// the notice's wakes publish during a test. Started on the thread pool: the deploy
+    /// runs synchronously on the test thread and waits for those publishes.
+    /// </summary>
+    private async Task<VrchatLogService> StartLogViewerAsync(
+        IVrchatLogReader reader, ILogger<VrchatLogService>? logger, CancellationToken stoppingToken)
+    {
+        var service = new VrchatLogService(
+            Microsoft.Extensions.Options.Options.Create(Options([0, 1], retainBuilds: 10)),
+            reader,
+            _logNotice,
+            logger ?? NullLogger<VrchatLogService>.Instance,
+            TimeSpan.FromHours(1));
+        await Task.Run(() => service.StartAsync(stoppingToken));
+        return service;
+    }
+
+    /// <summary>Option C verification item 9: the closed first client's log stayed 3.6 s after the new one started.</summary>
+    [Fact]
+    public async Task The_share_shows_the_relaunch_notice_from_closing_until_the_first_new_client_is_recorded()
+    {
+        var watcher = CreateWatcher();
+        WriteIncomingBuild("b1");
+        await watcher.RunOnceAsync(CancellationToken.None);
+        var reader = new FakeVrchatLogReader { ResultToReturn = LogSnapshotResult.Success("b1 first client's log") };
+        using var cts = new CancellationTokenSource();
+        var service = await StartLogViewerAsync(reader, logger: null, cts.Token);
+        SpinWait.SpinUntil(() => Published() == "b1 first client's log", PublishWait).Should().BeTrue();
+
+        var noticeWhileClosing = false;
+        RunningProcesses()[0].OnCloseMainWindow = () => noticeWhileClosing =
+            SpinWait.SpinUntil(() => Published() == VrchatRelaunchCoordinator.RelaunchNotice, PublishWait);
+        var onShareAtLaunch = new List<string?>();
+        _launcher.OnLaunch = pid =>
+        {
+            onShareAtLaunch.Add(Published());
+            reader.ResultToReturn = LogSnapshotResult.Success("b2 first client's log");
+            Running(pid, _launcher.Launched[^1].CreationTimeUtc);
+        };
+
+        WriteIncomingBuild("b2");
+        await watcher.RunOnceAsync(CancellationToken.None);
+        var newLogShown = SpinWait.SpinUntil(() => Published() == "b2 first client's log", PublishWait);
+        cts.Cancel();
+        await service.StopAsync(CancellationToken.None);
+
+        ReadResult("b2").Status.Should().Be("deployed");
+        noticeWhileClosing.Should().BeTrue("the notice replaces the closing clients' log at once");
+        onShareAtLaunch.First().Should().Be(VrchatRelaunchCoordinator.RelaunchNotice);
+        newLogShown.Should().BeTrue("the log is read again as soon as the first client is recorded");
+        reader.ReadSnapshotCallCount.Should().Be(2, "once before the relaunch and once after the first launch");
+        _logNotice.Message.Should().BeNull();
+    }
+
+    /// <summary>
+    /// Windows verification of PR #19, item 4: the Bridge was stopped while closing, its
+    /// clients exited on the close requests already sent, and the build it recovered after
+    /// its restart had nothing to close. The closed first client's log then stayed 5.2 s
+    /// after the new first client started.
+    /// </summary>
+    [Fact]
+    public async Task A_recovered_build_whose_recorded_clients_already_exited_shows_the_notice_until_the_first_client_is_recorded()
+    {
+        var watcher = CreateWatcher();
+        WriteIncomingBuild("b1");
+        await watcher.RunOnceAsync(CancellationToken.None);
+        var firstBatch = RunningProcesses();
+        using var stop = new CancellationTokenSource();
+        var stopping = CreateWatcher(delay: (wait, token) =>
+        {
+            _now += wait;
+            stop.Cancel();
+            token.ThrowIfCancellationRequested();
+            return Task.CompletedTask;
+        });
+        WriteIncomingBuild("b2");
+        var act = async () => await stopping.RunOnceAsync(stop.Token);
+        await act.Should().ThrowAsync<OperationCanceledException>();
+        _now += TimeSpan.FromSeconds(5);
+        RunningProcesses().Should().BeEmpty("the close requests sent before the stop took effect");
+        Record().Should().NotBeEmpty();
+        var closeRequests = firstBatch.Sum(p => p.CloseCalls);
+
+        var reader = new FakeVrchatLogReader { ResultToReturn = LogSnapshotResult.Success("b1 first client's log") };
+        using var cts = new CancellationTokenSource();
+        var service = await StartLogViewerAsync(reader, logger: null, cts.Token);
+        SpinWait.SpinUntil(() => Published() == "b1 first client's log", PublishWait).Should().BeTrue();
+        var noticeAtInstall = false;
+        _installer.OnInstall = () => noticeAtInstall =
+            SpinWait.SpinUntil(() => Published() == VrchatRelaunchCoordinator.RelaunchNotice, PublishWait);
+        var onShareAtLaunch = new List<string?>();
+        _launcher.OnLaunch = pid =>
+        {
+            onShareAtLaunch.Add(Published());
+            reader.ResultToReturn = LogSnapshotResult.Success("b2 first client's log");
+            Running(pid, _launcher.Launched[^1].CreationTimeUtc);
+        };
+
+        await CreateWatcher().RecoverProcessingAsync(CancellationToken.None);
+        var newLogShown = SpinWait.SpinUntil(() => Published() == "b2 first client's log", PublishWait);
+        cts.Cancel();
+        await service.StopAsync(CancellationToken.None);
+
+        ReadResult("b2").Status.Should().Be("deployed");
+        firstBatch.Sum(p => p.CloseCalls).Should().Be(closeRequests, "the recovered build had nothing left to close");
+        noticeAtInstall.Should().BeTrue("the newest log is still the closed first client's");
+        onShareAtLaunch.First().Should().Be(VrchatRelaunchCoordinator.RelaunchNotice);
+        newLogShown.Should().BeTrue();
+        _logNotice.Message.Should().BeNull();
+    }
+
+    [Fact]
+    public async Task A_relaunch_whose_install_fails_leaves_no_notice()
+    {
+        var watcher = CreateWatcher();
+        WriteIncomingBuild("b1");
+        await watcher.RunOnceAsync(CancellationToken.None);
+        string? atInstall = null;
+        _installer.OnInstall = () =>
+        {
+            atInstall = _logNotice.Message;
+            throw new IOException("simulated install failure");
+        };
+
+        WriteIncomingBuild("b2");
+        await watcher.RunOnceAsync(CancellationToken.None);
+
+        ReadResult("b2").ErrorCode.Should().Be(ErrorCode.DeployFailed);
+        RunningProcesses().Should().BeEmpty();
+        _launcher.Requests.Should().HaveCount(2);
+        atInstall.Should().Be(VrchatRelaunchCoordinator.RelaunchNotice);
+        _logNotice.Message.Should().BeNull("nothing is launched, so the newest log is shown as with no VRChat running");
+    }
+
+    [Fact]
+    public async Task A_Log_Viewer_that_cannot_write_the_share_does_not_stop_the_relaunch()
+    {
+        // A file where the logs directory should be: every publish throws.
+        Directory.CreateDirectory(_stagingDir);
+        File.WriteAllText(Path.Combine(_stagingDir, "logs"), "not a directory");
+        var logger = new ListLogger<VrchatLogService>();
+        int Errors() => logger.Entries.Count(e => e.Level == LogLevel.Error);
+        using var cts = new CancellationTokenSource();
+        var service = await StartLogViewerAsync(
+            new FakeVrchatLogReader { ResultToReturn = LogSnapshotResult.Success("log") }, logger, cts.Token);
+        SpinWait.SpinUntil(() => Errors() == 1, PublishWait).Should().BeTrue();
+        var watcher = CreateWatcher();
+        WriteIncomingBuild("b1");
+        await watcher.RunOnceAsync(CancellationToken.None);
+        var failedWhileClosing = false;
+        RunningProcesses()[0].OnCloseMainWindow = () => failedWhileClosing = SpinWait.SpinUntil(() => Errors() == 2, PublishWait);
+
+        WriteIncomingBuild("b2");
+        await watcher.RunOnceAsync(CancellationToken.None);
+        cts.Cancel();
+        await service.StopAsync(CancellationToken.None);
+
+        failedWhileClosing.Should().BeTrue("the notice was published, and failed, while the clients closed");
+        ReadResult("b2").Status.Should().Be("deployed");
+        _launcher.Requests.Should().HaveCount(4);
+        RunningProcesses().Should().HaveCount(2);
+        Record().Select(c => c.ProcessId).Should().Equal(_launcher.Launched.Skip(2).Select(l => l.ProcessId));
     }
 
     /// <summary>Records install order; runs <see cref="OnInstall"/> once the file is in place.</summary>

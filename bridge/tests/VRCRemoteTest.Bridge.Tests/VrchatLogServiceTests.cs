@@ -26,12 +26,17 @@ public class VrchatLogServiceTests : IDisposable
         try { Directory.Delete(_tempDir, recursive: true); } catch (IOException) { }
     }
 
-    private VrchatLogService CreateService(FakeVrchatLogReader logReader, ILogger<VrchatLogService>? logger = null) =>
+    private VrchatLogService CreateService(
+        FakeVrchatLogReader logReader,
+        ILogger<VrchatLogService>? logger = null,
+        VrchatLogNotice? notice = null,
+        TimeSpan? pollInterval = null) =>
         new(
             Options.Create(new BridgeOptions { StagingDirectory = _tempDir }),
             logReader,
+            notice ?? new VrchatLogNotice(),
             logger ?? NullLogger<VrchatLogService>.Instance,
-            TimeSpan.FromMilliseconds(10));
+            pollInterval ?? TimeSpan.FromMilliseconds(10));
 
     [Fact]
     public async Task Writes_available_snapshots_to_logs_vrchat_latest_log()
@@ -118,6 +123,118 @@ public class VrchatLogServiceTests : IDisposable
         logger.Entries.Should().NotBeEmpty()
             .And.NotContain(e => e.Level >= LogLevel.Warning)
             .And.OnlyContain(e => e.Exception == null, "being held open is expected, not an error worth a stack trace");
+    }
+
+    // ---- VrchatLogNotice (Relaunch) ----
+
+    /// <summary>Long enough that only a wake from the notice can explain a publish within a test.</summary>
+    private static readonly TimeSpan NoPollDuringTest = TimeSpan.FromHours(1);
+
+    private string PublishedPath => Path.Combine(_tempDir, "logs", "vrchat-latest.log");
+
+    private string? Published() => PublishedFile.TryRead(PublishedPath);
+
+    [Fact]
+    public async Task Publishes_the_notice_instead_of_reading_the_log_while_one_is_shown()
+    {
+        var notice = new VrchatLogNotice();
+        notice.Show("relaunching");
+        var logReader = new FakeVrchatLogReader { ResultToReturn = LogSnapshotResult.Success("closed client's log") };
+        var service = CreateService(logReader, notice: notice);
+
+        using var cts = new CancellationTokenSource();
+        await service.StartAsync(cts.Token);
+        await WaitUntil(() => Published() == "relaunching", TimeSpan.FromSeconds(2));
+        await Task.Delay(50); // several 10 ms polls
+        cts.Cancel();
+        await service.StopAsync(CancellationToken.None);
+
+        Published().Should().Be("relaunching");
+        logReader.ReadSnapshotCallCount.Should().Be(0);
+    }
+
+    [Fact]
+    public async Task Showing_the_notice_replaces_the_published_log_without_waiting_for_the_next_poll()
+    {
+        var notice = new VrchatLogNotice();
+        var logReader = new FakeVrchatLogReader { ResultToReturn = LogSnapshotResult.Success("closed client's log") };
+        var service = CreateService(logReader, notice: notice, pollInterval: NoPollDuringTest);
+
+        using var cts = new CancellationTokenSource();
+        await service.StartAsync(cts.Token);
+        await WaitUntil(() => Published() == "closed client's log", TimeSpan.FromSeconds(2));
+        notice.Show("relaunching");
+        await WaitUntil(() => Published() == "relaunching", TimeSpan.FromSeconds(2));
+        cts.Cancel();
+        await service.StopAsync(CancellationToken.None);
+
+        Published().Should().Be("relaunching");
+        logReader.ReadSnapshotCallCount.Should().Be(1);
+    }
+
+    [Fact]
+    public async Task Clearing_the_notice_publishes_the_log_again_without_waiting_for_the_next_poll()
+    {
+        var notice = new VrchatLogNotice();
+        notice.Show("relaunching");
+        var logReader = new FakeVrchatLogReader { ResultToReturn = LogSnapshotResult.Success("new client's log") };
+        var service = CreateService(logReader, notice: notice, pollInterval: NoPollDuringTest);
+
+        using var cts = new CancellationTokenSource();
+        await service.StartAsync(cts.Token);
+        await WaitUntil(() => Published() == "relaunching", TimeSpan.FromSeconds(2));
+        notice.Clear();
+        await WaitUntil(() => Published() == "new client's log", TimeSpan.FromSeconds(2));
+        cts.Cancel();
+        await service.StopAsync(CancellationToken.None);
+
+        Published().Should().Be("new client's log");
+        logReader.ReadSnapshotCallCount.Should().Be(1);
+    }
+
+    [Fact]
+    public async Task Clearing_a_notice_that_is_not_shown_does_not_wake_the_Log_Viewer()
+    {
+        // Every build clears it when it ends (StagingWatcher), Reload mode included.
+        var notice = new VrchatLogNotice();
+        var logReader = new FakeVrchatLogReader { ResultToReturn = LogSnapshotResult.Success("log") };
+        var service = CreateService(logReader, notice: notice, pollInterval: NoPollDuringTest);
+
+        using var cts = new CancellationTokenSource();
+        await service.StartAsync(cts.Token);
+        await WaitUntil(() => logReader.ReadSnapshotCallCount == 1, TimeSpan.FromSeconds(2));
+        notice.Clear();
+        notice.Clear();
+        await Task.Delay(100);
+        cts.Cancel();
+        await service.StopAsync(CancellationToken.None);
+
+        logReader.ReadSnapshotCallCount.Should().Be(1);
+    }
+
+    [Fact]
+    public async Task Showing_and_clearing_the_notice_keep_working_while_the_share_cannot_be_written()
+    {
+        // A file where the logs directory should be: every publish throws.
+        File.WriteAllText(Path.Combine(_tempDir, "logs"), "not a directory");
+        var notice = new VrchatLogNotice();
+        var logger = new ListLogger<VrchatLogService>();
+        var logReader = new FakeVrchatLogReader { ResultToReturn = LogSnapshotResult.Success("log") };
+        var service = CreateService(logReader, logger, notice, NoPollDuringTest);
+
+        using var cts = new CancellationTokenSource();
+        await service.StartAsync(cts.Token);
+        await WaitUntil(() => logger.Entries.Count(e => e.Level == LogLevel.Error) == 1, TimeSpan.FromSeconds(2));
+        var show = () => notice.Show("relaunching");
+        show.Should().NotThrow();
+        await WaitUntil(() => logger.Entries.Count(e => e.Level == LogLevel.Error) == 2, TimeSpan.FromSeconds(2));
+        notice.Clear();
+        await WaitUntil(() => logger.Entries.Count(e => e.Level == LogLevel.Error) == 3, TimeSpan.FromSeconds(2));
+        cts.Cancel();
+        await service.StopAsync(CancellationToken.None);
+
+        logger.Entries.Count(e => e.Level == LogLevel.Error).Should().Be(3, "the loop keeps running and waking");
+        logReader.ReadSnapshotCallCount.Should().Be(2, "once before the notice and once after it");
     }
 
     private static async Task WaitUntil(Func<bool> condition, TimeSpan timeout)
