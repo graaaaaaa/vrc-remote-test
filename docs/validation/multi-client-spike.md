@@ -158,47 +158,67 @@ vrc-remote-testはMac側でSDKの `Build()` だけを呼ぶので、SDKパネル
 
 | 項目 | 値 |
 |------|-----|
-| 実施日時 | |
-| VRChatバージョン（build） | |
-| Windowsバージョン | |
-| GPU | |
-| PowerShellバージョン | |
-| ビルドに使ったVRChat Worlds SDK | |
-| Logging設定（ケース6以外） | |
-| アカウント構成（profile 0 / 1） | |
+| 実施日時 | 2026-10-17 12:07〜12:18（ケース1〜3・6・7） |
+| VRChatバージョン（build） | 2026.3.3p2-1921-15c4a824b2-Release（build 1921） |
+| Windowsバージョン | Windows 11 Home（build 26300） |
+| GPU | NVIDIA GeForce RTX 5080（16GB）。表示は 3840x2160 のモニター |
+| PowerShellバージョン | 7.6.7 |
+| ビルドに使ったVRChat Worlds SDK | `watch-worlds-spike.md`（2026-09-02）のビルドを流用。build-A＝空のシーン、build-B＝キューブを置いたシーン。SDKのバージョンは未記録（Unity 2022.3.22f1）。同期ボタンは無い |
+| Logging設定（ケース6以外） | 完全（Full） |
+| アカウント構成（profile 0 / 1） | profile 0 = 普段のアカウント / profile 1 = 未ログイン（ケース4・5は未実施） |
+
+同期ボタンが無いため、同じインスタンスにいるかは、各台の `output_log` の `Destination set` と `OnPlayerJoined` の件数、画面に他の台のアバターが映るかで判断した。ログの `usr_` は伏せてある。
 
 ### ケース1: 同じprofileの2台を `--url` で起動
 
 | 項目 | 結果 |
 |------|------|
-| 実行コマンド | |
-| roomId | |
-| PID（1台目 / 2台目） | |
-| 同じインスタンスか | |
-| Master（owner）になった台 | |
-| 観察事項 | |
-| output_log 関連行（取得できた場合） | |
+| 実行コマンド | `.\start-vrchat-dev.ps1 -Clients 2 -WorldPath C:\VRCRemoteTest\spike\build-A.vrcw` |
+| roomId | 7535294232 |
+| PID（1台目 / 2台目） | 7052 / 29764 |
+| 同じインスタンスか | はい。2台とも同じ `local:dab8e4…:1` に入り、各台のログに `OnPlayerJoined` が2件ずつ出た。2台目の画面に1台目のアバターが映った |
+| Master（owner）になった台 | 2台目（先にロードを終えた台。ログに `I am MASTER`） |
+| 観察事項 | roomId はインスタンスIDに使われていない。ログに roomId が出るのは `Arg: --url=...` の行だけで、行き先は `local:<64桁の16進>:1` になる。roomId を変えて起動した計4回（ケース1・6・7）とも、行き先は同じ `local:dab8e4…:1` だった。起動から入室完了まで約16秒 |
+| output_log 関連行（取得できた場合） | 下記 |
+
+```
+（1台目）12:07:09 [Behaviour] Destination set: local:dab8e405667a4de729f91623db09e31f57071efe70ea4b1ee764bd3563dd5383:1
+（1台目）12:07:10 [Behaviour] Joining local:dab8e405667a4de729f91623db09e31f57071efe70ea4b1ee764bd3563dd5383
+（1台目）12:07:21 [Behaviour] OnPlayerJoined <表示名> (usr_***)   ← 2件
+（2台目）12:07:10 [Behaviour] Destination set: local:dab8e405667a4de729f91623db09e31f57071efe70ea4b1ee764bd3563dd5383:1
+（2台目）12:07:20 [Behaviour] I am MASTER
+（2台目）12:07:21 / 12:07:23 [Behaviour] OnPlayerJoined <表示名> (usr_***)   ← 2件
+```
 
 ### ケース2: 同じprofileの2台で配置
 
 | 項目 | 結果 |
 |------|------|
-| 1回目（build-B）: 2台ともリロードしたか | |
-| 1回目: リロード後も同じインスタンスか | |
-| 1回目: リロード所要時間（概算） | |
-| 2回目（build-A）: 2台ともリロードしたか | |
-| 2回目: リロード後も同じインスタンスか | |
-| 2回目: リロード所要時間（概算） | |
-| 観察事項 | |
-| output_log 関連行（取得できた場合） | |
+| 1回目（build-B）: 2台ともリロードしたか | はい（画面で2台ともキューブのシーンに変わった） |
+| 1回目: リロード後も同じインスタンスか | はい。2台とも `local:ce318f…:1` に入り、`OnPlayerJoined` が2件ずつ |
+| 1回目: リロード所要時間（概算） | 約8秒（12:08:16 配置 → 12:08:24 `Finished entering world`） |
+| 2回目（build-A）: 2台ともリロードしたか | はい |
+| 2回目: リロード後も同じインスタンスか | はい（同じ `local:ce318f…:1`、`OnPlayerJoined` 2件ずつ） |
+| 2回目: リロード所要時間（概算） | 約2〜4秒（12:08:52 配置 → 12:08:54 / 12:08:56） |
+| 観察事項 | watch-worlds のリロード先は、配置したワールドにも起動時の `--url` にも関係なく、常に `local:ce318f…:1` だった。同じ日の 03:03 以降に1台で起動し、Bridge で配置したときのログでも同じIDになっている。Master はリロードのたびに入り直した順で決まり、1回目は1台目、2回目は2台目だった。リロード時に画面に「パブリック インスタンスに入りました」のトーストが出た。同じアカウントの2台なので `Ignoring TrySetOwner attempt on Player Data Object [n] because <表示名> already owner` の Warning が出た |
+| output_log 関連行（取得できた場合） | 下記 |
+
+```
+（2台とも）12:08:16 World Updated: ...\Worlds\vrc-test-20261017T120816344.vrcw // 1
+（2台とも）12:08:16 [Behaviour] Destination set: local:ce318f3e82d614028e1b7fd1c58e2dc69783d28f221338974d3230b42f743c4a:1
+（2台とも）12:08:16 [Behaviour] Resetting game flow because "Destination instance set": [SkipLogin, RemainInNetworkRoom]
+（2台とも）12:08:17 [Behaviour] Joining local:ce318f3e82d614028e1b7fd1c58e2dc69783d28f221338974d3230b42f743c4a
+（1台目）12:08:24 [Behaviour] I am MASTER
+（2台とも）12:08:24〜25 [Behaviour] OnPlayerJoined <表示名> (usr_***)   ← 2件
+```
 
 ### ケース3: 同じprofileの2台を `--url` なしで起動
 
 | 項目 | 結果 |
 |------|------|
-| 起動直後の各台の状態 | |
-| 配置後、同じローカルインスタンスに入ったか | |
-| 観察事項 | |
+| 起動直後の各台の状態 | 2台ともホームワールド（private インスタンス、台ごとに別の番号）へ行こうとして `Failed to join instance ... オフラインテストモードでいる間は、オンラインのワールドに移動することはできません` で失敗した。約20秒後に、台ごとに別の Error World（`local:error_<乱数>:1`、各台1人、画面は "WE'RE SORRY! SOMETHING WENT WRONG"）に入った。起動から Error World まで約25秒 |
+| 配置後、同じローカルインスタンスに入ったか | はい。build-A の配置から約7秒で、2台とも `local:ce318f…:1` に入り、`OnPlayerJoined` が2件ずつ出た |
+| 観察事項 | 同じアカウントなら、`--url` が無くても最初の配置で全台がそろう。`--url` で起動する利点は、インスタンスをそろえることではなく、起動直後からテストワールドに入れて Error World を経由しないこと |
 
 ### ケース4: 別profileの2台を `--url` で起動
 
@@ -221,27 +241,31 @@ vrc-remote-testはMac側でSDKの `Build()` だけを呼ぶので、SDKパネル
 
 | Logging設定 | 2台目以降の状態 | 備考 |
 |------|------|------|
-| None | | |
-| Errors Only | | |
-| profileごとに別設定か | | |
+| None | 黒画面にならず、build-A に入った。2台目の画面に1台目のアバターが映った | `output_log` は2台とも0バイトで、何も書かれなかった |
+| Errors Only | 黒画面にならず、build-A に入った | `output_log` は Error の行だけ（25〜31行）。`World Updated`・`Destination set`・`OnPlayerJoined` は出ないので、ログでは同じインスタンスかを判断できない |
+| profileごとに別設定か | 未確認（profile 1 が未ログイン） | profile 0 の設定は `HKCU\Software\VRChat\VRChat` の `LOGGING_ENABLED_h120798204` に、変えた時点で保存される（オフ = -1、エラーのみ = 0、完全 = 1） |
+
+報告されている黒画面は、build 1921 では None でも再現しなかった。確認後、profile 0 は元の「完全」に戻した。
 
 ### ケース7: 3台と4台
 
 | 台数 | 全台が同じインスタンスか | 配置後のリロード | "Can't Travel" や追い出し | 備考 |
 |------|------|------|------|------|
-| 3 | | | | |
-| 4 | | | | |
+| 3 | はい（`local:dab8e4…:1`、各台 `OnPlayerJoined` 3件） | はい。build-B の配置から約8秒で全台が `local:ce318f…:1` に入った | なし | 2台目以降に `VRCNP: Failed to create server: System.IO.IOException: すべてのパイプ インスタンスがビジーです。` が出る（名前付きパイプのサーバーは1台目だけが作れる）。起動から全台の入室まで約16秒 |
+| 4 | はい（各台 `OnPlayerJoined` 4件） | はい。約8秒で全台そろった。配置後もしばらく退室は起きなかった | なし | 2〜4台目で `LoadItemsAsync, Exception: "whatever it is that you are doing, you are doing it too quickly. slow down!"`（APIのレート制限）が1台あたり7〜13回出た。入室には影響しなかった。起動から全台の入室まで約21秒 |
 
 ### ケース8: Moonlight越しの操作と負荷
 
+Moonlight 越しの確認は未実施。Windows 上で見られた範囲だけを記録する。
+
 | 項目 | 結果 |
 |------|------|
-| 台数 | |
-| 全台を1画面で見られたか | |
-| 台の切り替え方法と操作感 | |
-| GPU使用率 | |
-| 各台のFPS | |
-| 観察事項 | |
+| 台数 | 4（3台でも計測） |
+| 全台を1画面で見られたか | 3840x2160 のモニターに 2x2 で並べて、全台を表示できた。起動直後は全台が同じ位置・同じ大きさ（前回終了時の 3840x2080 のウィンドウ）で重なるので、検証用に `SetWindowPos` で並べ直した（起動引数は変えていない） |
+| 台の切り替え方法と操作感 | クリックした台がマウスカーソルをロックするので、別の台をクリックしても入力が移らないことがある。Esc でメニューを開いてカーソルを解放するか、ウィンドウを前面に出す必要があった |
+| GPU使用率 | 3台: 25%（nvidia-smi）、4台: 29%・約100W、VRAM 5.5GB / 16GB。空に近いシーンでの値 |
+| 各台のFPS | 未計測（2台のとき、Settings のデバッグ欄で 60） |
+| 観察事項 | メモリは4台で約10.8GB（1台あたり2.6〜2.9GB のワーキングセット）。終了時に各台が自分のウィンドウ位置と大きさをレジストリに保存するので、並べ直すと次回の起動時の大きさも変わる（検証後に元へ戻した） |
 
 ### オプションテスト結果（実施した場合のみ）
 
@@ -270,8 +294,31 @@ vrc-remote-testはMac側でSDKの `Build()` だけを呼ぶので、SDKパネル
 判定結果:
 
 ```
-判定:
+判定: 案B Go（同じprofileのN台）。案Cの要否はケース4・5が未実施のため未判定
 理由:
+  ケース1で2台が同じローカルインスタンスに入り、ケース2の2回の配置で、
+  2台ともそろって同じインスタンスにリロードした（約8秒・約2〜4秒）。
+  ケース7で3台・4台でも同じ結果になり、"Can't Travel" や追い出しは起きなかった。
+  ケース6では、None でも黒画面は再現しなかった。
 
 Bridge実装への申し送り事項:
+  - 同じアカウントのN台は、watch-worlds のリロードで常に同じ固定のインスタンス
+    （local:ce318f…:1）に入る。配置したワールドや起動時の --url によらない。
+    そのため、初回の配置だけで全台がそろう（ケース3）。
+  - それでも初回は --url で起動するのがよい。--url が無いと、各台がホームワールドへ
+    行こうとして失敗し、約25秒後に台ごとに別の Error World に入る。--url なら
+    起動直後からテストワールドに入れる。
+  - --url の roomId はインスタンスIDに使われない（roomId を変えても local:dab8e4…:1）。
+    インスタンスの同一性を roomId で確かめる設計にしない。
+  - ログで入室を確かめるなら Logging は「完全」が必要。None では output_log が空、
+    Errors Only では Destination set・OnPlayerJoined・World Updated が出ない。
+    今の readiness 判定は output_log を使わないので影響しないが、Log Viewer も
+    ほぼ空になる。setup-windows.md には「完全」を勧めると書く。
+  - 4台では API のレート制限エラーが出る。起動間隔の3秒は縮めない
+    （オプションB「同時起動」は未実施）。
+  - 2台目以降は VRCNP の名前付きパイプを作れない。外部ツールとの連携は1台目だけになる。
+  - 全台が前回終了時と同じウィンドウ位置・大きさで重なって開く。Bridge で並べるか、
+    ウィンドウサイズの起動引数を付けるかを検討する。
+  - 未実施: ケース4・5（profile 1 へのログインが必要）、ケース6の profile ごとの設定、
+    ケース8の Moonlight 越しの確認、オプションA〜D。
 ```
