@@ -32,10 +32,24 @@ public sealed class VrchatClientCoordinator : IVrchatClientCoordinator
     private const int RequiredStablePolls = 2;
 
     /// <summary>
-    /// Same interval as the SDK. Clients started within the same second write to one
-    /// output_log file (spike option B), and their logs could not be told apart.
+    /// The SDK's interval, kept as the shortest one. Clients whose logging starts within
+    /// the same second write to one output_log file (spike option B), so each launch
+    /// also waits for the previous client's file (<see cref="WaitBeforeNextLaunchAsync"/>).
     /// </summary>
     internal static readonly TimeSpan LaunchInterval = TimeSpan.FromSeconds(3);
+
+    /// <summary>
+    /// The most a cold start waits for output_log files in total, counted from just
+    /// before the first launch. VRChat created its file 0.70-0.84 s after the process
+    /// start without load, but 11-22 s after it with the CPU at about 100%
+    /// (docs/validation/multi-client-spike.md, PR #2 verification, item 12). The same
+    /// length as <see cref="VrchatLogMatcher.MaxRangeLength"/>: a first client's file that
+    /// appears in time can still be matched. It also bounds how much the waiting delays
+    /// the cold start's result.
+    /// </summary>
+    internal static readonly TimeSpan LogWaitBudget = VrchatLogMatcher.MaxRangeLength;
+
+    internal static readonly TimeSpan LogPollInterval = TimeSpan.FromMilliseconds(500);
 
     private static readonly TimeSpan DefaultPollInterval = TimeSpan.FromSeconds(1);
 
@@ -46,6 +60,9 @@ public sealed class VrchatClientCoordinator : IVrchatClientCoordinator
     private readonly TimeSpan _startupSettleDelay;
     private readonly TimeSpan _pollInterval;
     private readonly Func<TimeSpan, CancellationToken, Task> _launchDelay;
+    private readonly Func<IReadOnlyList<VrchatLogMatcher.Candidate>?> _listLogFiles;
+    private readonly Func<DateTime> _utcNow;
+    private readonly TimeZoneInfo _timeZone;
 
     /// <summary>
     /// Last client mix reported by <see cref="ReportClientMix"/>. Only StagingWatcher's
@@ -65,11 +82,19 @@ public sealed class VrchatClientCoordinator : IVrchatClientCoordinator
             logger,
             TimeSpan.FromSeconds(options.Value.VrchatStartupSettleDelaySeconds),
             DefaultPollInterval,
-            Task.Delay)
+            Task.Delay,
+            () => ListLogFiles(options.Value),
+            () => DateTime.UtcNow,
+            TimeZoneInfo.Local)
     {
     }
 
-    /// <summary>Test-only seam: tiny TimeSpans and a recording delay keep unit tests fast without a full clock abstraction.</summary>
+    /// <summary>
+    /// Test-only seam: tiny TimeSpans and a recording delay keep unit tests fast without a
+    /// full clock abstraction. The launch pacing reads the time only through
+    /// <paramref name="utcNow"/> and waits only through <paramref name="launchDelay"/>, so a
+    /// test can drive it with a fake clock and a fake log directory.
+    /// </summary>
     internal VrchatClientCoordinator(
         IOptions<BridgeOptions> options,
         IVrchatProcessMonitor processMonitor,
@@ -77,7 +102,10 @@ public sealed class VrchatClientCoordinator : IVrchatClientCoordinator
         ILogger<VrchatClientCoordinator> logger,
         TimeSpan startupSettleDelay,
         TimeSpan pollInterval,
-        Func<TimeSpan, CancellationToken, Task> launchDelay)
+        Func<TimeSpan, CancellationToken, Task> launchDelay,
+        Func<IReadOnlyList<VrchatLogMatcher.Candidate>?> listLogFiles,
+        Func<DateTime> utcNow,
+        TimeZoneInfo timeZone)
     {
         _options = options.Value;
         _processMonitor = processMonitor;
@@ -86,6 +114,9 @@ public sealed class VrchatClientCoordinator : IVrchatClientCoordinator
         _startupSettleDelay = startupSettleDelay;
         _pollInterval = pollInterval;
         _launchDelay = launchDelay;
+        _listLogFiles = listLogFiles;
+        _utcNow = utcNow;
+        _timeZone = timeZone;
     }
 
     /// <summary>
@@ -143,11 +174,15 @@ public sealed class VrchatClientCoordinator : IVrchatClientCoordinator
         var roomId = VrchatLaunchRequest.NewRoomId();
         var vrMode = string.Equals(_options.VrchatMode, "VR", StringComparison.OrdinalIgnoreCase);
 
+        var logWatch = count > 1 ? StartLogWatch() : null;
+        var previousLaunchUtc = DateTime.MinValue;
+
         for (var i = 0; i < count; i++)
         {
             if (i > 0)
             {
-                await _launchDelay(LaunchInterval, cancellationToken).ConfigureAwait(false);
+                await WaitBeforeNextLaunchAsync(logWatch, i, count, previousLaunchUtc, cancellationToken)
+                    .ConfigureAwait(false);
             }
 
             // Only one client can use the HMD, so later ones always run on the desktop.
@@ -156,6 +191,7 @@ public sealed class VrchatClientCoordinator : IVrchatClientCoordinator
 
             cancellationToken.ThrowIfCancellationRequested();
 
+            previousLaunchUtc = _utcNow();
             LaunchResult result;
             try
             {
@@ -181,6 +217,145 @@ public sealed class VrchatClientCoordinator : IVrchatClientCoordinator
 
         cancellationToken.ThrowIfCancellationRequested();
         return VrchatLaunchOutcome.Success();
+    }
+
+    /// <summary>
+    /// Lists the files that already exist, so files created after the first launch can
+    /// be told apart. Null (no waiting for files, only the fixed interval) when the
+    /// directory cannot be listed.
+    /// </summary>
+    private LogWatch? StartLogWatch()
+    {
+        var deadlineUtc = _utcNow() + LogWaitBudget;
+        var existing = _listLogFiles();
+        if (existing is null)
+        {
+            _logger.LogWarning(
+                "Could not list the VRChat log directory; launching VRChat clients {Interval}s apart without waiting " +
+                "for their output_log files. The Log Viewer may not be able to tell their logs apart.",
+                LaunchInterval.TotalSeconds);
+            return null;
+        }
+
+        return new LogWatch(existing.Select(c => c.Path).ToHashSet(StringComparer.OrdinalIgnoreCase), deadlineUtc);
+    }
+
+    /// <summary>
+    /// Waits <see cref="LaunchInterval"/> after the previous launch, as before, and then
+    /// until every client launched so far has created an output_log file that did not
+    /// exist before the batch, and until the next client's start is late enough that the
+    /// newest of those files stays out of its matching range
+    /// (<see cref="VrchatLogMatcher.EarliestNextStartUtc"/>). Each client's logging then
+    /// starts in a later second than the previous one's, so every client gets its own file
+    /// and the first client's file can be matched (multi-client plan section 13.2).
+    ///
+    /// This only spaces the launches: it never decides which file is whose, so a file
+    /// that appears for another reason (e.g. a VRChat started by hand meanwhile) can at
+    /// worst end the wait early, and <see cref="VrchatLogMatcher"/> still refuses any file
+    /// it cannot attribute. Without load the files exist by the end of the interval, so
+    /// the clients start 3 s apart as before. The total wait is bounded by
+    /// <see cref="LogWaitBudget"/>; past it, the remaining clients start 3 s apart.
+    /// </summary>
+    private async Task WaitBeforeNextLaunchAsync(
+        LogWatch? watch, int launched, int count, DateTime previousLaunchUtc, CancellationToken cancellationToken)
+    {
+        await DelayUntilAsync(previousLaunchUtc + LaunchInterval, cancellationToken).ConfigureAwait(false);
+        cancellationToken.ThrowIfCancellationRequested();
+        if (watch is null || watch.GaveUp)
+        {
+            return;
+        }
+
+        var reportedWait = false;
+        while (true)
+        {
+            var newFiles = _listLogFiles()?.Where(c => !watch.Existing.Contains(c.Path)).ToList();
+            if (newFiles is not null && newFiles.Count >= launched)
+            {
+                var newest = newFiles
+                    .Select(c => (File: c, Time: VrchatLogMatcher.TrustedNameUtc(c, _timeZone) ?? c.CreationTimeUtc))
+                    .MaxBy(c => c.Time);
+
+                // Logged for every client, so the Bridge log records how long VRChat took.
+                _logger.LogInformation(
+                    "New output_log {File} (created {CreationTimeUtc:O}, {Seconds:F1}s after VRChat client " +
+                    "{Index}/{Count} was launched); launching the next client.",
+                    Path.GetFileName(newest.File.Path),
+                    newest.File.CreationTimeUtc,
+                    (newest.File.CreationTimeUtc - previousLaunchUtc).TotalSeconds,
+                    launched,
+                    count);
+
+                // A name time from a wrong clock must not hold the batch past its deadline.
+                var earliest = VrchatLogMatcher.EarliestNextStartUtc(newest.Time);
+                await DelayUntilAsync(earliest < watch.DeadlineUtc ? earliest : watch.DeadlineUtc, cancellationToken)
+                    .ConfigureAwait(false);
+                return;
+            }
+
+            var now = _utcNow();
+            if (now >= watch.DeadlineUtc)
+            {
+                watch.GaveUp = true;
+                _logger.LogWarning(
+                    "VRChat client {Index}/{Count} has not created an output_log file within {Budget}s of the first " +
+                    "launch; launching the remaining clients {Interval}s apart. Their logs may end up in one shared " +
+                    "file, which the Log Viewer does not show as the first client's log.",
+                    launched, count, LogWaitBudget.TotalSeconds, LaunchInterval.TotalSeconds);
+                return;
+            }
+
+            if (!reportedWait)
+            {
+                _logger.LogInformation(
+                    "Waiting for VRChat client {Index}/{Count} to create its output_log file before launching the next " +
+                    "client (up to {Remaining:F0}s more), so that their logs stay apart.",
+                    launched, count, (watch.DeadlineUtc - now).TotalSeconds);
+                reportedWait = true;
+            }
+
+            var remaining = watch.DeadlineUtc - now;
+            await _launchDelay(remaining < LogPollInterval ? remaining : LogPollInterval, cancellationToken)
+                .ConfigureAwait(false);
+            cancellationToken.ThrowIfCancellationRequested();
+        }
+    }
+
+    private async Task DelayUntilAsync(DateTime utc, CancellationToken cancellationToken)
+    {
+        var wait = utc - _utcNow();
+        if (wait > TimeSpan.Zero)
+        {
+            await _launchDelay(wait, cancellationToken).ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>
+    /// Null when the directory cannot be listed or holds too many files to list. A
+    /// directory that does not exist yet is empty: VRChat creates it on its first start.
+    /// </summary>
+    private static IReadOnlyList<VrchatLogMatcher.Candidate>? ListLogFiles(BridgeOptions options)
+    {
+        var directory = VrchatLogDirectory.Resolve(options);
+        if (directory is null)
+        {
+            return null;
+        }
+
+        try
+        {
+            if (!Directory.Exists(directory))
+            {
+                return [];
+            }
+
+            var (candidates, scanCapped) = VrchatLogDirectory.ListCandidates(directory, File.GetCreationTimeUtc);
+            return scanCapped ? null : candidates;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return null;
+        }
     }
 
     /// <summary>
@@ -361,6 +536,17 @@ public sealed class VrchatClientCoordinator : IVrchatClientCoordinator
     }
 
     private readonly record struct ClientKey(int ProcessId, DateTime? CreationTimeUtc);
+
+    /// <summary>One launch batch's files from before its first launch, and its deadline for waiting on new ones.</summary>
+    private sealed class LogWatch(HashSet<string> existing, DateTime deadlineUtc)
+    {
+        public HashSet<string> Existing { get; } = existing;
+
+        public DateTime DeadlineUtc { get; } = deadlineUtc;
+
+        /// <summary>Set once the deadline passes; the rest of the batch then uses the fixed interval.</summary>
+        public bool GaveUp { get; set; }
+    }
 
     private sealed record ClientMix(int WatchWorlds, int WithoutWatchWorlds, int Unverified)
     {

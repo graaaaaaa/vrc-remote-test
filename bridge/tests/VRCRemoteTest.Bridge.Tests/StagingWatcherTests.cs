@@ -74,7 +74,11 @@ public class StagingWatcherTests : IDisposable
             clientCoordinator ?? new FakeVrchatClientCoordinator(),
             NullLogger<StagingWatcher>.Instance);
 
-    /// <summary>The real coordinator over fake processes, for the multi-client integration tests.</summary>
+    /// <summary>
+    /// The real coordinator over fake processes, for the multi-client integration tests.
+    /// The log directory is reported as unreadable, so launches keep the fixed interval
+    /// without waiting for output_log files (VrchatClientCoordinatorTests covers that).
+    /// </summary>
     private VrchatClientCoordinator CreateCoordinator(
         FakeVrchatProcessMonitor monitor,
         FakeVrchatLauncher launcher,
@@ -90,7 +94,10 @@ public class StagingWatcherTests : IDisposable
             NullLogger<VrchatClientCoordinator>.Instance,
             settleDelay ?? TimeSpan.FromSeconds(30),
             TimeSpan.FromMilliseconds(5),
-            launchDelay ?? ((_, _) => Task.CompletedTask));
+            launchDelay ?? ((_, _) => Task.CompletedTask),
+            () => null,
+            () => DateTime.UtcNow,
+            TimeZoneInfo.Utc);
 
     private static void WriteIncomingBuild(string stagingDir, string buildId, byte[] artifactBytes)
     {

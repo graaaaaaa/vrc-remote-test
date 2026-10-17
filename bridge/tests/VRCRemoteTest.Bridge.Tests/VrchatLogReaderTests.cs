@@ -214,27 +214,48 @@ public class VrchatLogReaderTests : IDisposable
         result.Content.Should().NotContain("some other session");
     }
 
-    [Fact]
-    public void ReadSnapshot_publishes_nothing_while_a_just_started_client_has_no_log_yet()
+    [Theory]
+    [InlineData(0)]
+    [InlineData(30)]
+    public void ReadSnapshot_replaces_the_previous_sessions_log_while_the_first_client_has_no_log_yet(int secondsAgo)
     {
-        var previous = WriteLogFor(T0, "previous session line\n");
-        _monitor.AddClient(100, DateTime.UtcNow);
-
-        var result = CreateReader().ReadSnapshot();
-
-        result.IsAvailable.Should().BeFalse("the share keeps its last log instead of a diagnostic");
-        File.Exists(previous).Should().BeTrue();
-    }
-
-    [Fact]
-    public void ReadSnapshot_reports_the_diagnostic_once_the_client_is_past_the_grace_period()
-    {
-        _monitor.AddClient(100, DateTime.UtcNow.AddSeconds(-11));
+        // Publishing nothing here would leave the closed client's log on the share, shown
+        // as if it were the first client's (a9292a1 re-verification on real hardware).
+        var previous = WriteLogFor(DateTime.UtcNow.AddMinutes(-5), "previous session line\n");
+        _monitor.AddClient(100, DateTime.UtcNow.AddSeconds(-secondsAgo));
 
         var result = CreateReader().ReadSnapshot();
 
         result.IsAvailable.Should().BeTrue();
-        result.Content.Should().Contain("Could not match");
+        result.Content.Should().Contain("has not created its output_log_*.txt file yet").And.Contain("PID 100")
+            .And.Contain("heavy CPU load").And.NotContain("previous session line").And.NotContain("Could not match");
+        File.Exists(previous).Should().BeTrue();
+    }
+
+    [Fact]
+    public void ReadSnapshot_stops_saying_not_yet_once_no_file_can_be_named_in_the_clients_range()
+    {
+        _monitor.AddClient(100, DateTime.UtcNow.AddSeconds(-61));
+
+        var result = CreateReader().ReadSnapshot();
+
+        result.Content.Should().Contain("Could not match").And.NotContain("yet");
+    }
+
+    [Fact]
+    public void ReadSnapshot_matches_a_log_created_seconds_after_the_time_in_its_name()
+    {
+        // Under heavy load VRChat created output_log_..._18-04-10.txt at 18:04:11.
+        var path = WriteLogFor(T0.AddSeconds(20), "first client line\n");
+        _monitor.AddClient(100, T0);
+        var reader = new VrchatLogReader(
+            Options.Create(new BridgeOptions { VrchatWorldsDirectory = _worldsDir }),
+            _monitor,
+            NullLogger<VrchatLogReader>.Instance,
+            p => CreationTimeFromName(p).AddSeconds(5));
+
+        reader.ReadSnapshot().Content.Should().Contain("first client line");
+        File.Exists(path).Should().BeTrue();
     }
 
     [Fact]

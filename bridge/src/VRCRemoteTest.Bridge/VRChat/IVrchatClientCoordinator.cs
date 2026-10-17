@@ -15,7 +15,8 @@ public interface IVrchatClientCoordinator
     Task<VrchatPreparation> PrepareAsync(CancellationToken cancellationToken);
 
     /// <summary>
-    /// Launches VrchatClientCount clients, a few seconds apart, all opening
+    /// Launches VrchatClientCount clients, at least 3 seconds apart and each after the
+    /// previous one's output_log file has appeared (within a bounded wait), all opening
     /// <paramref name="deployedWorldPath"/> in one shared instance via --url.
     /// </summary>
     Task<VrchatLaunchOutcome> LaunchClientsAsync(string deployedWorldPath, CancellationToken cancellationToken);
