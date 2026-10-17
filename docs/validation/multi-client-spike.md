@@ -548,6 +548,37 @@ PR #5（Log Viewer が、1台目だけが開いている output_log を Windows 
 
 **後片付け**: VRChat を閉じ、`config.json` と Bridge の exe を確認前のもの（PR #5 のビルド、SHA-256 `16135507…`）に戻した。`managed-clients.json` は最後の2台（終了済み）の記録のまま残っている。記録の台はもう動いていないので、Relaunch に戻したときもそれらを閉じようとはしない。
 
+### PR #19 の実機確認（2026-10-17 23:38〜23:44）
+
+PR #19（Relaunch の起動し直しのあいだ、Log Viewer の写しを「The Bridge is relaunching its VRChat clients ...」の1行に置き換える）の `a316877` を Windows で確かめた。上の案C の確認の項目9（前のセッションの1台目のログが、新しい1台目の起動から 3.6 秒残った）を受けた変更。このビルドは PR #5 と案C（PR #7）を含む。
+
+**準備**: Windows の `dotnet test` は 505 件中 501 件成功。落ちたのはシンボリックリンクの3件と、下の「気づいたこと」1のテスト。手順1-B と同じ `dotnet publish` で作った exe（SHA-256 `09D970410BFE6EA0B4B7D7BBB62C08AA3AA874C3B6AFF9185BBDB65BA35E930C`）を入れた。`config.json` は案C の確認と同じ（`AutoLaunchVrchat: true`、`VrchatClientMode: "Relaunch"`、`VrchatProfiles: [0, 1]`）。Logging は「完全」。ビルドは前回までと同じ模擬のアップロードで送った。写しは別のプロセスで 0.25 秒ごとに読み、中身が変わった時刻を記録した。Unity の Log Viewer は見ていない（Mac が要る）。
+
+| 確認 | 結果 | 記録 |
+|------|------|------|
+| 0. 初回の配置（閉じる台なし） | 合格（1行は出ない） | `Launched VRChat client 1/2`（23:38:28.367）の 0.08 秒後に `has not created ...` の1行になり、`Showing ...`（23:38:33.627）で1台目のログになった |
+| 1. 起動し直し | 合格 | `Closing`（23:38:56.467）と同時（56.461）に写しが1行になった。`Closed`（57.989）から `Launched VRChat client 1/2`（58.009）まで1行のまま。起動の 0.04 秒後（58.047）に `has not created ... PID 3264`、`Showing ... client 3264 (the only VRChat process ...)`（23:39:03.172）でそのログになった。前のセッションのログは一度も出なかった |
+| 2. 続けて送る | 合格 | 3回とも 1. と同じ順だった。前の結果の直後に送った回は、`Closing` 23:39:26.101 と写しの書き換え 26.101 が同時で、`Launched` 27.645 の 0.05 秒後に `has not created`、32.836 に `Showing`。2つ続けて送った回の1つ目は、`Closing` 40.723 と書き換え 40.724、`Launched` 42.797 の 0.05 秒後に `has not created`。2つ目は、`Closing` 45.847（起動の 0.02 秒後の台）と書き換えが同時で、`Closed` までの 8.7 秒（0 forced）も1行のまま、`Launched` 54.530 の 0.07 秒後に `has not created`、59.761 に `Showing` |
+| 3a. 手で起動した台だけ | 合格 | `VRCHAT_UNMANAGED_RUNNING`。1行は出ず、写しは手で起動した台のログ（`Showing ... client 31492, the only ...`）のままだった |
+| 3b. Bridge の起動の間に手で1台（案C の 3c） | 合格 | `Closing`（23:41:15.765）で1行、`Launched 1/2`（18.327）の 0.05 秒後に `has not created`、21.337 に `Launched 1 of 2 ... then stopped ... (PID 33044)`。23:41:23.484 に写しが `output_log_2026-10-17_23-41-18.txt, the output_log_*.txt file of the first VRChat client (PID 2412 ...) is or was also open by other VRChat clients ...` になり、1行は残らなかった（手で起動した台が1台目の 0.17 秒後に起動し、同じファイルに書いた） |
+| 3c. 閉じられない台 | 未実施 | プロセスの中断にはリソースモニター（昇格）が要り、ゲームのプロセスを中断するのも避けた |
+| 4. 終了の途中の強制終了 | 一部不合格 | `Closing`（23:42:21.547）の 0.14 秒後に `Stop-Process -Force`。写しは1行のまま残った（想定どおり）。Bridge を起動し直すと（23:42:30.090）、0.14 秒後（30.228）に写しが今の状態に戻り、`Recovering unfinished build` のあと、やり直した配置は `deployed` になった。ただし古い2台は、強制終了の前に送られていた終了の要求で、起動し直す前に終わっていた。やり直しの配置には閉じる台が無く、`a316877` の規則（閉じる台が無ければ出さない）どおり1行は出なかった。その結果、30.228 に書かれた前のセッションのログ（閉じた台の `23-42-11`）が、新しい1台目の起動（30.294）から `Showing`（35.444）まで 5.2 秒残った |
+| 5. 写しを書けないとき | 合格 | `C:\VRCRemoteTest\logs` に `icacls /deny <ユーザー>:(OI)(CI)(W)`。`Unhandled error while polling the VRChat log.`（`UnauthorizedAccessException`: `...\vrchat-latest.log.tmp` is denied）が5回出て、うち1回は `Closing` の時刻のもの。それでも `deployed` になり、2台が起動し直した。拒否を外すと ACL は元に戻り、次の読み取りで新しい1台目のログになった |
+| 6. Reload に戻す（`VrchatClientCount: 2`） | 合格（1行は出ない） | コールドスタートでは写しに前のログが残り、1台目の起動（23:43:52.720）から 5.15 秒後（57.872）の `Showing` でそのログになった。起動済みの台への配置は、settle の 30 秒を待って `deployed`。1行は出なかった |
+
+気づいたこと:
+
+1. `StagingWatcherRelaunchTests.The_share_shows_the_relaunch_notice_from_closing_until_the_first_new_client_is_recorded` は、Windows で全体を流すと6回中3回落ちた（`Expected noticeWhileClosing to be True ...`、5秒の待ちの時間切れ）。このクラスだけを流すと3回とも通った。原因はテストの読み方と見ている。テストは写しを `File.ReadAllText`（削除を共有しない `FileShare.Read`）で途切れなく読む。Windows では、そのハンドルがあると `SharedFileWriter` の置き換えが POSIX の置き換えでも共有違反になり（`DestinationBusy`）、書き込みを見送る。テストは読み取りの間隔を1時間にしているので書き直されない。負荷が高いと、ちょうど読んでいる最中に書くことが増える。実機では、Mac の SMB クライアントは削除も共有して開いており（PR #1）、見送っても5秒後に書き直されるので、1・2 の結果に遅れは出なかった。
+2. 4. の経路（記録の台がもう終了している配置）では、直す前と同じ症状が残る。記録に台が載っていれば、動いていなくても最新のログはその台のもの。
+
+これを受けて、次のように直した（直したあとの Windows での再確認は未実施）:
+
+- 1行を出す条件を「閉じる台がある」から「管理下でない台が無いと確かめて、記録に台が載っている」に変えた。記録が空の配置（初回など）では今までどおり出さず、管理下でない台のために何もせず止まる配置では一瞬も出さない（3a のとおり）
+- テストは、写しを `FileShare.ReadWrite | FileShare.Delete` で読む（Mac の SMB クライアントと同じ共有）。4. の経路の結合テストも足した
+- Reload のコールドスタートの「次の更新（5秒以内）」は、6. の 5.15 秒に合わせて「約5秒後」にした
+
+後片付け: VRChat を全部閉じ、写しの観察も止めた。`config.json` は確認前の値（Reload、`VrchatClientCount` なし）に戻した。Bridge の exe は、確認前の PR #5 のビルドには戻さず、main `c9b1cd1` のビルド（SHA-256 `210804F9C8839A7B85104B15021EFF8E328CCFEFD844119A3175634C40B4F68D`、Windows の `dotnet test` は 488 件中 485 件成功）にした。PR #5 と案C が main に入ったら main のビルドに入れ替える、というユーザーの決定による。
+
 ---
 
 ## Go/No-Go 判定テーブル
