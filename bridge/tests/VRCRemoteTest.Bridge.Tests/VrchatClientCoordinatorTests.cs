@@ -164,6 +164,60 @@ public class VrchatClientCoordinatorTests
         _launcher.Requests.Should().ContainSingle();
     }
 
+    [Theory]
+    [InlineData(1)]
+    [InlineData(3)]
+    public async Task A_stop_requested_before_the_first_launch_launches_nothing(int clientCount)
+    {
+        var coordinator = CreateCoordinator(clientCount: clientCount);
+        using var cts = new CancellationTokenSource();
+        cts.Cancel();
+
+        var act = async () => await coordinator.LaunchClientsAsync(WorldPath, cts.Token);
+
+        await act.Should().ThrowAsync<OperationCanceledException>();
+        _launcher.Requests.Should().BeEmpty();
+    }
+
+    [Theory]
+    [InlineData(1)]
+    [InlineData(3)]
+    public async Task A_stop_requested_during_the_last_launch_is_not_reported_as_success(int clientCount)
+    {
+        using var cts = new CancellationTokenSource();
+        _launcher.OnLaunch = _ =>
+        {
+            if (_launcher.Requests.Count == clientCount)
+            {
+                cts.Cancel();
+            }
+        };
+        var coordinator = CreateCoordinator(clientCount: clientCount);
+
+        var act = async () => await coordinator.LaunchClientsAsync(WorldPath, cts.Token);
+
+        await act.Should().ThrowAsync<OperationCanceledException>();
+        _launcher.Requests.Should().HaveCount(clientCount, "clients that already started are left running");
+    }
+
+    [Fact]
+    public async Task A_stop_requested_during_the_interval_launches_no_further_client_even_if_the_wait_returns()
+    {
+        using var cts = new CancellationTokenSource();
+        var coordinator = CreateCoordinator(
+            clientCount: 3,
+            launchDelay: (_, _) =>
+            {
+                cts.Cancel();
+                return Task.CompletedTask;
+            });
+
+        var act = async () => await coordinator.LaunchClientsAsync(WorldPath, cts.Token);
+
+        await act.Should().ThrowAsync<OperationCanceledException>();
+        _launcher.Requests.Should().ContainSingle();
+    }
+
     [Fact]
     public async Task Running_watch_worlds_clients_that_settled_long_ago_deploy_without_launching()
     {
@@ -270,15 +324,46 @@ public class VrchatClientCoordinatorTests
     public async Task Waits_until_every_client_is_past_the_settle_delay()
     {
         var settleDelay = TimeSpan.FromMilliseconds(300);
+        var justLaunched = DateTime.UtcNow; // e.g. by a cold start
         _monitor.AddClient(1234, LongAgo);
-        _monitor.AddClient(1235, DateTime.UtcNow); // just launched, e.g. by a cold start
+        _monitor.AddClient(1235, justLaunched);
         var coordinator = CreateCoordinator(clientCount: 2, settleDelay: settleDelay);
-        var started = DateTime.UtcNow;
 
         var preparation = await coordinator.PrepareAsync(CancellationToken.None);
 
         preparation.Kind.Should().Be(VrchatPreparationKind.DeployOnly);
-        (DateTime.UtcNow - started).Should().BeGreaterThan(settleDelay - TimeSpan.FromMilliseconds(50));
+        (DateTime.UtcNow - justLaunched).Should().BeGreaterThanOrEqualTo(settleDelay);
+    }
+
+    [Fact]
+    public async Task A_stable_client_that_has_not_settled_never_becomes_ready()
+    {
+        // Without the settle check, two identical polls would already be enough.
+        _monitor.AddClient(1234, DateTime.UtcNow.AddHours(1));
+        var coordinator = CreateCoordinator(startupTimeoutSeconds: 1);
+
+        var preparation = await coordinator.PrepareAsync(CancellationToken.None);
+
+        preparation.ErrorCode.Should().Be(ErrorCode.VrchatStartTimeout);
+        _monitor.GetClientsCallCount.Should().BeGreaterThan(3, "the same set was observed many times");
+    }
+
+    [Fact]
+    public async Task An_observation_that_returns_after_the_deadline_is_not_ready()
+    {
+        _monitor.AddClient(1234, LongAgo);
+        _monitor.OnGetClients = call =>
+        {
+            if (call == 3) // the second poll of the wait, which would otherwise make it ready
+            {
+                Thread.Sleep(TimeSpan.FromMilliseconds(1200));
+            }
+        };
+        var coordinator = CreateCoordinator(startupTimeoutSeconds: 1);
+
+        var preparation = await coordinator.PrepareAsync(CancellationToken.None);
+
+        preparation.ErrorCode.Should().Be(ErrorCode.VrchatStartTimeout);
     }
 
     [Fact]
@@ -292,6 +377,7 @@ public class VrchatClientCoordinatorTests
 
         preparation.Kind.Should().Be(VrchatPreparationKind.Failed);
         preparation.ErrorCode.Should().Be(ErrorCode.VrchatStartTimeout);
+        _monitor.GetClientsCallCount.Should().BeGreaterThan(3, "the set was observed changing, not observed once");
     }
 
     [Fact]
@@ -307,6 +393,7 @@ public class VrchatClientCoordinatorTests
         var preparation = await coordinator.PrepareAsync(CancellationToken.None);
 
         preparation.ErrorCode.Should().Be(ErrorCode.VrchatStartTimeout);
+        _monitor.GetClientsCallCount.Should().BeGreaterThan(3);
     }
 
     [Fact]

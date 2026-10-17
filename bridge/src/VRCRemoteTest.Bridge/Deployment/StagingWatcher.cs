@@ -580,6 +580,10 @@ public sealed class StagingWatcher : BackgroundService, IBridgeWatcher
             outcome = VrchatLaunchOutcome.Failure(ex.Message);
         }
 
+        // A Bridge that is stopping publishes neither outcome: the build stays archived
+        // and Unity reports RESULT_TIMEOUT, the same as a stop between two launches.
+        cancellationToken.ThrowIfCancellationRequested();
+
         if (outcome.Succeeded)
         {
             _resultWriter.WriteSuccess(manifest.BuildId, deployedFileName, manifest.Sha256, ResultsDir);

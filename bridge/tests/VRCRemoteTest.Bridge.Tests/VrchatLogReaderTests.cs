@@ -36,17 +36,27 @@ public class VrchatLogReaderTests : IDisposable
         try { Directory.Delete(_tempDir, recursive: true); } catch (IOException) { }
     }
 
+    /// <summary>A start time that is not near a daylight saving transition in common time zones.</summary>
+    private static readonly DateTime T0 = new(2026, 10, 17, 6, 0, 0, 100, DateTimeKind.Utc);
+
+    /// <summary>
+    /// Each file's creation time is read from its name, as if VRChat had just created
+    /// it, so matching depends neither on the clock nor on whether the filesystem can
+    /// record or set creation times.
+    /// </summary>
     private VrchatLogReader CreateReader() =>
         new(
             Options.Create(new BridgeOptions { VrchatWorldsDirectory = _worldsDir }),
             _monitor,
-            NullLogger<VrchatLogReader>.Instance);
+            NullLogger<VrchatLogReader>.Instance,
+            CreationTimeFromName);
 
-    /// <summary>
-    /// Writes an output_log named after <paramref name="startedUtc"/> in the machine's
-    /// time zone, as VRChat does. The file is created now, so its creation time only
-    /// matches a name within a second or two of now.
-    /// </summary>
+    private static DateTime CreationTimeFromName(string path) =>
+        VrchatLogMatcher.ParseNameTime(Path.GetFileName(path)) is { } local
+            ? TimeZoneInfo.ConvertTimeToUtc(DateTime.SpecifyKind(local, DateTimeKind.Unspecified), TimeZoneInfo.Local)
+            : DateTime.MinValue;
+
+    /// <summary>Writes an output_log named after <paramref name="startedUtc"/> in the machine's time zone, as VRChat does.</summary>
     private string WriteLogFor(DateTime startedUtc, string content)
     {
         var path = Path.Combine(_logDir, $"output_log_{startedUtc.ToLocalTime():yyyy-MM-dd_HH-mm-ss}.txt");
@@ -178,12 +188,11 @@ public class VrchatLogReaderTests : IDisposable
     [Fact]
     public void ReadSnapshot_shows_the_first_clients_log_rather_than_the_newest_file()
     {
-        var startedUtc = DateTime.UtcNow;
-        WriteLogFor(startedUtc, "first client line\n");
-        var other = WriteLogFor(startedUtc.AddSeconds(5), "second client line\n");
-        File.SetLastWriteTimeUtc(other, DateTime.UtcNow.AddMinutes(1));
-        _monitor.AddClient(100, startedUtc);
-        _monitor.AddClient(200, startedUtc.AddSeconds(5));
+        WriteLogFor(T0, "first client line\n");
+        var second = WriteLogFor(T0.AddSeconds(3), "second client line\n");
+        File.SetLastWriteTimeUtc(second, DateTime.UtcNow.AddMinutes(1));
+        _monitor.AddClient(100, T0);
+        _monitor.AddClient(200, T0.AddSeconds(3));
 
         var result = CreateReader().ReadSnapshot();
 
@@ -195,8 +204,8 @@ public class VrchatLogReaderTests : IDisposable
     [Fact]
     public void ReadSnapshot_reports_a_diagnostic_instead_of_another_clients_log_when_nothing_matches()
     {
-        WriteLogFor(DateTime.UtcNow, "some other session\n");
-        _monitor.AddClient(100, DateTime.UtcNow.AddMinutes(-10));
+        WriteLogFor(T0.AddMinutes(10), "some other session\n");
+        _monitor.AddClient(100, T0);
 
         var result = CreateReader().ReadSnapshot();
 
@@ -205,28 +214,116 @@ public class VrchatLogReaderTests : IDisposable
         result.Content.Should().NotContain("some other session");
     }
 
-    [Fact]
-    public void ReadSnapshot_keeps_the_matched_file_until_the_first_client_changes()
+    /// <summary>Clients 100 (first) and 200 with their own logs; the reader has pinned 100's.</summary>
+    private VrchatLogReader CreatePinnedReader()
     {
-        var startedUtc = DateTime.UtcNow;
-        WriteLogFor(startedUtc, "pinned line\n");
-        _monitor.AddClient(100, startedUtc);
+        WriteLogFor(T0, "first client line\n");
+        WriteLogFor(T0.AddSeconds(3), "second client line\n");
+        _monitor.AddClient(100, T0);
+        _monitor.AddClient(200, T0.AddSeconds(3));
         var reader = CreateReader();
-        reader.ReadSnapshot().Content.Should().Contain("pinned line");
+        reader.ReadSnapshot().Content.Should().Contain("first client line");
+        return reader;
+    }
 
-        // A second file in the same range would make a fresh match ambiguous.
-        WriteLogFor(startedUtc.AddSeconds(1), "later line\n");
-        reader.ReadSnapshot().Content.Should().Contain("pinned line");
+    [Fact]
+    public void The_pin_stays_while_its_client_runs_even_when_another_client_would_be_chosen_now()
+    {
+        var reader = CreatePinnedReader();
 
-        _monitor.Clients.Clear();
-        _monitor.AddClient(300, startedUtc.AddSeconds(1));
+        _monitor.Clients[0] = new VrchatClientInfo(100, T0, WatchWorldsDetected: false);
+
+        reader.ReadSnapshot().Content.Should().Contain("first client line");
+    }
+
+    [Fact]
+    public void The_pin_stays_when_its_client_cannot_be_checked_for_a_poll()
+    {
+        var reader = CreatePinnedReader();
+
+        _monitor.Clients.RemoveAt(0);
+        _monitor.UnverifiedCount = 1;
+        var whileUnverified = reader.ReadSnapshot();
+
+        _monitor.Clients.Insert(0, new VrchatClientInfo(100, T0, true));
+        _monitor.UnverifiedCount = 0;
+        var afterwards = reader.ReadSnapshot();
+
+        whileUnverified.Content.Should().Contain("could not be checked").And.NotContain("second client line");
+        afterwards.Content.Should().Contain("first client line");
+    }
+
+    [Fact]
+    public void The_pin_stays_when_the_process_list_cannot_be_read_for_a_poll()
+    {
+        var reader = CreatePinnedReader();
+
+        _monitor.EnumerationError = "transient failure";
+        var whileFailing = reader.ReadSnapshot();
+        _monitor.EnumerationError = null;
+        var afterwards = reader.ReadSnapshot();
+
+        whileFailing.Content.Should().Contain("could not be checked").And.NotContain("client line");
+        afterwards.Content.Should().Contain("first client line");
+    }
+
+    [Fact]
+    public void The_pin_is_still_read_when_only_another_process_cannot_be_checked()
+    {
+        var reader = CreatePinnedReader();
+
+        _monitor.UnverifiedCount = 1;
+
+        reader.ReadSnapshot().Content.Should().Contain("first client line");
+    }
+
+    [Fact]
+    public void A_confirmed_exit_moves_the_log_to_the_next_client()
+    {
+        var reader = CreatePinnedReader();
+
+        _monitor.Clients.RemoveAt(0);
+
+        reader.ReadSnapshot().Content.Should().Contain("second client line");
+    }
+
+    [Fact]
+    public void A_reused_PID_releases_the_pin()
+    {
+        var reader = CreatePinnedReader();
+
+        // PID 100 now belongs to a process started 30 s later, which has no log yet.
+        _monitor.Clients[0] = new VrchatClientInfo(100, T0.AddSeconds(30), true);
+        _monitor.Clients.RemoveAt(1);
+
+        reader.ReadSnapshot().Content.Should().Contain("Could not match").And.NotContain("first client line");
+    }
+
+    [Fact]
+    public void A_deleted_log_releases_the_pin()
+    {
+        var reader = CreatePinnedReader();
+
+        File.Delete(Path.Combine(_logDir, $"output_log_{T0.ToLocalTime():yyyy-MM-dd_HH-mm-ss}.txt"));
+
         reader.ReadSnapshot().Content.Should().Contain("Could not match");
+    }
+
+    [Fact]
+    public void A_second_log_in_the_same_range_does_not_unpin_the_first()
+    {
+        var reader = CreatePinnedReader();
+
+        // A fresh match would now be ambiguous; the pinned file keeps being read.
+        WriteLogFor(T0.AddSeconds(1), "later line\n");
+
+        reader.ReadSnapshot().Content.Should().Contain("first client line");
     }
 
     [Fact]
     public void ReadSnapshot_reports_a_diagnostic_when_the_running_VRChat_cannot_be_checked()
     {
-        WriteLogFor(DateTime.UtcNow, "unknown owner\n");
+        WriteLogFor(T0, "unknown owner\n");
         _monitor.UnverifiedCount = 1;
 
         var result = CreateReader().ReadSnapshot();
@@ -238,7 +335,7 @@ public class VrchatLogReaderTests : IDisposable
     [Fact]
     public void ReadSnapshot_reports_a_diagnostic_when_the_process_list_cannot_be_read()
     {
-        WriteLogFor(DateTime.UtcNow, "unknown owner\n");
+        WriteLogFor(T0, "unknown owner\n");
         _monitor.EnumerationError = "access denied";
 
         var result = CreateReader().ReadSnapshot();

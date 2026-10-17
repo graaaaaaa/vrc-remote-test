@@ -129,6 +129,12 @@ public sealed class VrchatClientCoordinator : IVrchatClientCoordinator
     /// One room id for the whole batch, so the clients ask for the same instance like
     /// the SDK's Build &amp; Test. Stops at the first client that fails to start: the
     /// build is already installed and archived, so the result reports how many started.
+    /// A stop request is honoured before every launch, the first one included (the
+    /// install and archive before it are synchronous and never look at the token), and
+    /// once more before reporting success, so a stopping Bridge launches nothing more
+    /// and StagingWatcher writes no result (multi-client plan section 11.3). The check
+    /// is cooperative: a request that arrives during Process.Start still lets that
+    /// client start.
     /// </summary>
     public async Task<VrchatLaunchOutcome> LaunchClientsAsync(
         string deployedWorldPath, CancellationToken cancellationToken)
@@ -147,6 +153,8 @@ public sealed class VrchatClientCoordinator : IVrchatClientCoordinator
             // Only one client can use the HMD, so later ones always run on the desktop.
             var request = new VrchatLaunchRequest(
                 _options.VrchatExecutable, deployedWorldPath, roomId, NoVr: !(vrMode && i == 0));
+
+            cancellationToken.ThrowIfCancellationRequested();
 
             LaunchResult result;
             try
@@ -171,13 +179,17 @@ public sealed class VrchatClientCoordinator : IVrchatClientCoordinator
                 i + 1, count, result.ProcessId, result.CreationTimeUtc, roomId);
         }
 
+        cancellationToken.ThrowIfCancellationRequested();
         return VrchatLaunchOutcome.Success();
     }
 
     /// <summary>
     /// stablePolls/previous/firstObservedUtc are local to this call, not mutable fields
     /// on this (singleton) service -- sequential builds must not leak state between
-    /// waits (Codex plan review Phase 4.1, Round 3, Scenario B).
+    /// waits (Codex plan review Phase 4.1, Round 3, Scenario B). GetClients is
+    /// synchronous and neither the deadline nor a stop request can interrupt it, so
+    /// both are checked again after every observation: a slow observation that returns
+    /// past the deadline never counts as ready.
     /// </summary>
     private async Task<VrchatPreparation> WaitUntilClientsReadyAsync(CancellationToken cancellationToken)
     {
@@ -194,6 +206,12 @@ public sealed class VrchatClientCoordinator : IVrchatClientCoordinator
         {
             var now = DateTimeOffset.UtcNow;
             var snapshot = _processMonitor.GetClients();
+            cancellationToken.ThrowIfCancellationRequested();
+            if (timeoutCts.IsCancellationRequested)
+            {
+                break;
+            }
+
             if (snapshot.EnumerationError is not null)
             {
                 return Unmanaged($"the VRChat process list could not be read: {snapshot.EnumerationError}");

@@ -14,7 +14,14 @@ namespace VRCRemoteTest.Bridge.VRChat;
 /// gap means the time zone or the clock changed after the file was created, and the
 /// name can no longer be trusted. A client is matched only when exactly one file falls
 /// in its range and that file falls in no other client's range; anything else is "no
-/// match", never a guess, so another client's log is never shown as the first one's.
+/// match" rather than a pick between candidates.
+///
+/// The ranges also assume that VRChat names its file within about a second of the
+/// process start, which has not been measured (Codex code review round 2, S4). A
+/// larger delay can leave a client unmatched even with clients 3 s apart (started at
+/// x.8 s, a 1.5 s delay puts the first file in both ranges), and a delay beyond the
+/// launch interval can match a file left by an earlier client that has exited to the
+/// next client. Windows hardware verification records the actual delays.
 /// </summary>
 internal static class VrchatLogMatcher
 {

@@ -39,7 +39,11 @@ public class StagingWatcherTests : IDisposable
     }
 
     private BridgeOptions CreateOptions(
-        long maxSize = 1024, int retainBuilds = 10, bool autoLaunchVrchat = false, int? clientCount = null) => new()
+        long maxSize = 1024,
+        int retainBuilds = 10,
+        bool autoLaunchVrchat = false,
+        int? clientCount = null,
+        int startupTimeoutSeconds = 60) => new()
     {
         StagingDirectory = _stagingDir,
         StateDirectory = _stateDir,
@@ -49,6 +53,7 @@ public class StagingWatcherTests : IDisposable
         AutoLaunchVrchat = autoLaunchVrchat,
         VrchatExecutable = @"C:\VRChat\VRChat.exe",
         VrchatClientCount = clientCount,
+        VrchatStartupTimeoutSeconds = startupTimeoutSeconds,
     };
 
     private StagingWatcher CreateWatcher(
@@ -75,9 +80,11 @@ public class StagingWatcherTests : IDisposable
         FakeVrchatLauncher launcher,
         int? clientCount,
         TimeSpan? settleDelay = null,
-        Func<TimeSpan, CancellationToken, Task>? launchDelay = null) =>
+        Func<TimeSpan, CancellationToken, Task>? launchDelay = null,
+        int startupTimeoutSeconds = 60) =>
         new(
-            Options.Create(CreateOptions(autoLaunchVrchat: true, clientCount: clientCount)),
+            Options.Create(CreateOptions(
+                autoLaunchVrchat: true, clientCount: clientCount, startupTimeoutSeconds: startupTimeoutSeconds)),
             monitor,
             launcher,
             NullLogger<VrchatClientCoordinator>.Instance,
@@ -989,16 +996,42 @@ public class StagingWatcherTests : IDisposable
 
         await watcher.RunOnceAsync(CancellationToken.None);
 
+        // Directory enumeration order decides which build cold-starts.
         launcher.Requests.Should().HaveCount(2, "only the first build cold-starts");
-        installer.InstalledAtUtc.Should().HaveCount(2);
-        var secondInstall = installer.InstalledAtUtc.Values.Max();
-        (secondInstall - lastLaunchUtc!.Value).Should().BeGreaterThan(settleDelay - TimeSpan.FromMilliseconds(50));
+        installer.Installs.Select(i => i.BuildId).Should().BeEquivalentTo("build-a", "build-b");
+        (installer.Installs[1].AtUtc - lastLaunchUtc!.Value).Should().BeGreaterThanOrEqualTo(settleDelay);
         ReadResult("build-a").Status.Should().Be("deployed");
         ReadResult("build-b").Status.Should().Be("deployed");
     }
 
     [Fact]
-    public async Task Running_clients_reload_without_any_launch()
+    public async Task A_build_right_after_a_cold_start_is_not_deployed_before_the_new_clients_settle()
+    {
+        // Clients that never settle within the timeout: without the settle check the second
+        // build would be deployed after two identical polls.
+        var monitor = new FakeVrchatProcessMonitor();
+        var launcher = new FakeVrchatLauncher();
+        launcher.OnLaunch = pid => monitor.AddClient(pid, DateTime.UtcNow.AddHours(1));
+        var installer = new RecordingWorldInstaller();
+        var watcher = CreateWatcher(
+            autoLaunchVrchat: true,
+            installer: installer,
+            clientCoordinator: CreateCoordinator(monitor, launcher, clientCount: 2, startupTimeoutSeconds: 1));
+        WriteIncomingBuild(_stagingDir, "build-a", Encoding.UTF8.GetBytes("bundle-a"));
+        WriteIncomingBuild(_stagingDir, "build-b", Encoding.UTF8.GetBytes("bundle-b"));
+
+        await watcher.RunOnceAsync(CancellationToken.None);
+
+        // Directory enumeration order decides which build cold-starts.
+        var coldStarted = installer.Installs.Should().ContainSingle().Subject.BuildId;
+        var other = coldStarted == "build-a" ? "build-b" : "build-a";
+        ReadResult(coldStarted).Status.Should().Be("deployed");
+        ReadResult(other).ErrorCode.Should().Be(ErrorCode.VrchatStartTimeout);
+        launcher.Requests.Should().HaveCount(2);
+    }
+
+    [Fact]
+    public async Task Running_clients_get_the_build_without_any_launch()
     {
         var monitor = new FakeVrchatProcessMonitor();
         monitor.AddClient(1234, DateTime.UtcNow.AddMinutes(-5));
@@ -1195,8 +1228,63 @@ public class StagingWatcherTests : IDisposable
         await restarted.RecoverProcessingAsync(CancellationToken.None);
         await restarted.RunOnceAsync(CancellationToken.None);
 
-        installer.InstalledAtUtc.Should().ContainSingle("the archived build is not deployed again");
+        installer.Installs.Should().ContainSingle("the archived build is not deployed again");
         launcher.Requests.Should().ContainSingle("the client that did start is left as it is");
+    }
+
+    [Fact]
+    public async Task Stopping_during_the_install_launches_nothing_and_never_redeploys_after_a_restart()
+    {
+        using var cts = new CancellationTokenSource();
+        var launcher = new FakeVrchatLauncher();
+        var installer = new RecordingWorldInstaller { OnInstall = cts.Cancel };
+        var watcher = CreateWatcher(
+            autoLaunchVrchat: true,
+            installer: installer,
+            clientCoordinator: CreateCoordinator(new FakeVrchatProcessMonitor(), launcher, clientCount: 1));
+        WriteIncomingBuild(_stagingDir, "build-stop-install", Encoding.UTF8.GetBytes("fake-world-bundle"));
+
+        var act = async () => await watcher.RunOnceAsync(cts.Token);
+
+        await act.Should().ThrowAsync<OperationCanceledException>();
+        launcher.LaunchCalled.Should().BeFalse("the install and archive do not look at the token, the launch does");
+        File.Exists(ArchivedManifest("build-stop-install")).Should().BeTrue();
+        Directory.GetFiles(Path.Combine(_stagingDir, "results")).Should().BeEmpty("neither a result nor its .tmp");
+
+        var restarted = CreateWatcher(
+            autoLaunchVrchat: true,
+            installer: installer,
+            clientCoordinator: CreateCoordinator(new FakeVrchatProcessMonitor(), launcher, clientCount: 1));
+        await restarted.RecoverProcessingAsync(CancellationToken.None);
+        await restarted.RunOnceAsync(CancellationToken.None);
+
+        installer.Installs.Should().ContainSingle();
+        launcher.LaunchCalled.Should().BeFalse();
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task A_Bridge_stopping_after_the_launch_publishes_no_result(bool launchSucceeded)
+    {
+        using var cts = new CancellationTokenSource();
+        var coordinator = new FakeVrchatClientCoordinator
+        {
+            PreparationToReturn = VrchatPreparation.ColdStart(),
+            LaunchOutcomeToReturn = launchSucceeded
+                ? VrchatLaunchOutcome.Success()
+                : VrchatLaunchOutcome.Failure("simulated launch failure"),
+            OnLaunch = cts.Cancel,
+        };
+        var watcher = CreateWatcher(autoLaunchVrchat: true, clientCoordinator: coordinator);
+        WriteIncomingBuild(_stagingDir, "build-stop-publish", Encoding.UTF8.GetBytes("fake-world-bundle"));
+
+        var act = async () => await watcher.RunOnceAsync(cts.Token);
+
+        await act.Should().ThrowAsync<OperationCanceledException>();
+        File.Exists(Path.Combine(_stagingDir, "results", "build-stop-publish.json")).Should().BeFalse();
+        File.Exists(ArchivedManifest("build-stop-publish")).Should().BeTrue();
+        Directory.GetFiles(Path.Combine(_stateDir, "failed")).Should().BeEmpty();
     }
 
     [Fact]
@@ -1205,28 +1293,33 @@ public class StagingWatcherTests : IDisposable
         var newerLooking = Path.Combine(_worldsDir, "vrc-remote-other.vrcw");
         File.WriteAllText(newerLooking, "other");
         File.SetLastWriteTimeUtc(newerLooking, DateTime.UtcNow.AddDays(1));
-        var watcher = CreateWatcher(
-            retainBuilds: 1,
-            autoLaunchVrchat: true,
-            clientCoordinator: new FakeVrchatClientCoordinator { PreparationToReturn = VrchatPreparation.ColdStart() });
+        var coordinator = new FakeVrchatClientCoordinator { PreparationToReturn = VrchatPreparation.ColdStart() };
+        var watcher = CreateWatcher(retainBuilds: 1, autoLaunchVrchat: true, clientCoordinator: coordinator);
         WriteIncomingBuild(_stagingDir, "build-keep", Encoding.UTF8.GetBytes("fake-world-bundle"));
 
         await watcher.RunOnceAsync(CancellationToken.None);
 
-        File.Exists(DeployedPath("build-keep")).Should().BeTrue();
+        var passedToUrl = coordinator.LaunchedWorldPaths.Should().ContainSingle().Subject;
+        passedToUrl.Should().Be(Path.GetFullPath(DeployedPath("build-keep")));
+        File.Exists(passedToUrl).Should().BeTrue();
         File.Exists(newerLooking).Should().BeFalse();
     }
 
+    /// <summary>Records every install in order, so installing the same build twice shows up.</summary>
     private sealed class RecordingWorldInstaller : IWorldInstaller
     {
         private readonly WorldInstaller _inner = new();
 
-        public Dictionary<string, DateTime> InstalledAtUtc { get; } = [];
+        public List<(string BuildId, DateTime AtUtc)> Installs { get; } = [];
+
+        /// <summary>Runs after the file is in place, before StagingWatcher continues.</summary>
+        public Action? OnInstall { get; set; }
 
         public string Install(string validatedArtifactPath, string buildId, string worldsDirectory)
         {
             var name = _inner.Install(validatedArtifactPath, buildId, worldsDirectory);
-            InstalledAtUtc[buildId] = DateTime.UtcNow;
+            Installs.Add((buildId, DateTime.UtcNow));
+            OnInstall?.Invoke();
             return name;
         }
     }

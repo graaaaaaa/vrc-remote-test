@@ -389,9 +389,9 @@ VRChatのホーム画面到達を確認したら準備完了。以降はUnity側
 - 有効化するとBridgeは、VRChatが1台も起動していない状態でビルドを受け取ると、**先にWorldsディレクトリへ配置してから**、そのファイルを`--url`に渡してVRChatを起動する（コールドスタート）。VRChatは起動時にそのワールドへ直接入るので、ホーム画面に着くのを待つ時間は無い。結果は、全台のプロセスを起動できた時点で書かれる（ワールドへの入室までは確かめない）
 - VRChatが起動済みなら、配置するだけで`--watch-worlds`付きの全台がリロードする。ただし、起動から`VrchatStartupSettleDelaySeconds`たっていない台があれば、その時間まで待ってから配置する。VRChatはログインが済むまで配置を拾わないため（コールドスタートの直後に続けて送ったビルドも、この待ちになる）
 - **既に`--watch-worlds`無しでVRChatが起動中の場合、Bridgeは自動的に再起動・終了させない**（`VRCHAT_WATCH_WORLDS_MISSING`でビルド失敗となる）。この場合は手動でVRChatを終了させるか、手順8の通り`--watch-worlds`付きで起動し直す
-- Bridgeが状態を確かめられないVRChat（プロセスの一覧を取れない、セッションを読めない、など）が動いているときも、何も起動せず、何も終了させずに`VRCHAT_UNMANAGED_RUNNING`でビルドが失敗する。そのVRChatを手で閉じてから、もう一度ビルドを送る。Unity v0.3.0 にはこのコードの案内文がまだ無く、コードとメッセージだけが表示される。別のユーザーのセッション（別の Windows アカウントやリモートデスクトップ）で動いている VRChat は数えない
+- Bridgeが状態を確かめられないVRChat（プロセスの一覧を取れない、セッションを読めない、WMI がコマンドラインを返さない・時間内に答えない、など）が動いているときも、何も起動せず、何も終了させずに`VRCHAT_UNMANAGED_RUNNING`でビルドが失敗する。そのVRChatを手で閉じてから、もう一度ビルドを送る。Unity v0.3.0 にはこのコードの案内文がまだ無く、コードとメッセージだけが表示される。別のユーザーのセッション（別の Windows アカウントやリモートデスクトップ）で動いている VRChat は数えない
 - **`VrchatStartupSettleDelaySeconds`（起動済みの台へ配置するまでの最低待機時間）は環境によって調整が必要**。デフォルト30秒でも短すぎる場合、ファイル配置は成功してもリロードされないことがある。手で起動したVRChatがホーム画面へ到達するまでの体感時間を確認し、それに応じて値を調整すること（`--url`で起動した台は、実測では起動の10秒後から配置を拾った）
-- Bridgeは同時に1つしか動かない。`%LOCALAPPDATA%\VRCRemoteTest\state\bridge.lock`を開いたままにしておき、2つ目のBridgeは「Another VRC Remote Test Bridge is already running」とログに出して起動を拒否する
+- 同じ Windows アカウントでは、Bridge は1つしか動かない。`%LOCALAPPDATA%\VRCRemoteTest\state\bridge.lock`を開いたままにしておき、2つ目のBridgeは「Another VRC Remote Test Bridge is already running」とログに出して起動を拒否する。ロックはアカウントごとなので、共有と Worlds は Bridge 用のアカウント（U）1つだけで使う
 
 **Unity側のResult Timeout推奨値**: 結果が書かれるまでの時間は、「前に並んでいるビルドの残り ＋ このビルドのコピー・検証・配置 ＋ 準備待ち（起動直後の台があれば最大`VrchatStartupTimeoutSeconds`、デフォルト60秒）＋ コールドスタートでの起動の間隔（(台数−1)×3秒、4台で9秒）＋ 余裕」になる。Unity側の `VRC Remote Test` ウィンドウ設定foldoutにある `Result Timeout (s)` はデフォルトの60秒だと足りないことがあるので、**90秒以上、ビルドを続けて送るなら120秒から**にする。120秒でも、ビルドがいくつ並んでも間に合うという保証ではない。
 
@@ -417,14 +417,29 @@ VRChatのホーム画面到達を確認したら準備完了。以降はUnity側
 **注意**: 「完全」にすると、ログに出る自分の表示名・ユーザー ID・訪れたワールド・同じインスタンスにいた他プレイヤーの表示名などが増え、Bridge はその直近200行を共有の `logs\vrchat-latest.log` に書き出す（手順11）。共有に読み取り権限を持つ人はこれを読める。検証が終わったら、次の順で戻す。
 
 1. ゲーム内の Settings > Debug > Logging を元の値（「エラーのみ」など）に戻す（全 profile に効く）
-2. VRChat を全部閉じる
-3. 元のログを消す（U の PowerShell）:
+2. VRChat を全部閉じる。作業が終わるまでビルドを送らない。手で起動した Bridge があれば閉じる
+3. Bridge を止める。動いたままだと、読み込み済みのログを、消したあとの共有へ書き直すことがある。U の PowerShell 7 で実行し、エラーが出たら次へ進まない:
    ```powershell
-   Remove-Item "$env:USERPROFILE\AppData\LocalLow\VRChat\VRChat\output_log_*.txt"
+   $ErrorActionPreference = 'Stop'
+   Disable-ScheduledTask -TaskName 'VRCRemoteTestBridge' -TaskPath '\' | Out-Null
+   Stop-ScheduledTask -TaskName 'VRCRemoteTestBridge' -TaskPath '\'
+   Get-Process -Name 'VRCRemoteTest.Bridge' -ErrorAction SilentlyContinue | Wait-Process -Timeout 15
    ```
-4. 共有の写しを消す。元のログが無ければ、Bridge は書き直さない:
+4. 元のログを消す:
    ```powershell
-   Remove-Item C:\VRCRemoteTest\logs\vrchat-latest.log
+   Get-ChildItem -LiteralPath "$env:USERPROFILE\AppData\LocalLow\VRChat\VRChat" -Filter 'output_log_*.txt' -File |
+       ForEach-Object { Remove-Item -LiteralPath $_.FullName }
+   ```
+5. 共有の写しと、書き込み途中のファイルを消す:
+   ```powershell
+   foreach ($path in 'C:\VRCRemoteTest\logs\vrchat-latest.log', 'C:\VRCRemoteTest\logs\vrchat-latest.log.tmp') {
+       if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path }
+   }
+   ```
+6. Bridge を有効に戻して起動する。元のログが無ければ共有の写しは作られず、次に VRChat がログを作ると公開が再開する:
+   ```powershell
+   Enable-ScheduledTask -TaskName 'VRCRemoteTestBridge' -TaskPath '\' | Out-Null
+   Start-ScheduledTask -TaskName 'VRCRemoteTestBridge' -TaskPath '\'
    ```
 
 ---
@@ -442,7 +457,9 @@ Moonlight（NVIDIA GameStream/Sunshine互換のリモートデスクトップク
 
 `RemoteBuildCommand`が使う同じSMB共有経由で、BridgeがVRChatの`output_log_*.txt`（最新200行、直近ウィンドウのスナップショット）を5秒間隔で配信する。Windows側の追加設定は不要 — `VrchatWorldsDirectory`が正しく設定済みであれば自動的に有効になる。Unity側の `VRC Remote Test` ウィンドウの `VRChat Log` foldoutから、カテゴリフィルタ（All/Error/Exception/Udon/Shader/Warning）付きで閲覧できる。表示専用で、readiness判定やビルドの成否には一切影響しない。
 
-VRChat が動いている間は、最新のファイルではなく1台目（`--watch-worlds` 付きの台のうち最も早く起動した台）のログを表示する。output_log には PID が出ないので、ファイル名の時刻と台の起動時刻で対応付ける。同じ秒に起動した台がある、ログを作ったあとに時計やタイムゾーンが変わった、などで対応付けられないときは、別の台のログを見せる代わりに「Could not match an output_log_*.txt file to the first VRChat client ...」という1行を表示する。VRChat が1台も動いていないときは、今までどおり最新のファイル（前回のセッションのログ）を表示する。Logging の設定は手順9-2を参照。
+VRChat が動いている間は、最新のファイルではなく1台目（`--watch-worlds` 付きの台のうち最も早く起動した台）のログを表示する。output_log には PID が出ないので、ファイル名の時刻と台の起動時刻で対応付け、その台が動いている間は同じファイルを表示し続ける。同じ秒に起動した台がある、ログを作ったあとに時計やタイムゾーンが変わった、などで対応付けられないときは、ログの代わりに「Could not match an output_log_*.txt file to the first VRChat client ...」という1行を表示する。VRChat が1台も動いていないときは、今までどおり最新のファイル（前回のセッションのログ）を表示する。Logging の設定は手順9-2を参照。
+
+この対応付けは、VRChat が起動から1秒ほどのうちにログファイルを作ることを前提にしている（実機ではまだ測っていない）。それより遅いと対応付けられないことがあり、起動の間隔（3秒）を超えて遅れると、終了した台のログを次の台のものとして表示することもありうる。
 
 VRChat のログには、自分の表示名やユーザー ID、訪れたワールドの情報、同じインスタンスにいた他プレイヤーの表示名が含まれる。共有に読み取り権限を持つ人はこれを読めるので、共有の資格情報は他人に渡さないこと。
 

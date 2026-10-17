@@ -13,8 +13,10 @@ internal static class WindowsCommandLine
         commandLine is not null && Split(commandLine).Skip(1).Contains(argument, StringComparer.Ordinal);
 
     /// <summary>
-    /// argv[0] ends at the first whitespace, or at the closing quote when it starts with
-    /// one, with no escape processing. After that: whitespace outside quotes separates
+    /// argv[0] ends at the first whitespace outside quotes; quotes anywhere in it only
+    /// toggle quoting and are dropped, and backslashes are literal (so both
+    /// "C:\VR Chat\VRChat.exe" and C:\"VR Chat"\VRChat.exe are one argument, and
+    /// "VRChat.exe"--x is too). After that: whitespace outside quotes separates
     /// arguments; 2n backslashes before a quote become n backslashes and the quote toggles
     /// quoting; 2n+1 backslashes before a quote become n backslashes and a literal quote;
     /// "" inside quotes is a literal quote; other backslashes are literal.
@@ -25,22 +27,19 @@ internal static class WindowsCommandLine
         var i = 0;
 
         var program = new StringBuilder();
-        if (i < commandLine.Length && commandLine[i] == '"')
+        var programInQuotes = false;
+        while (i < commandLine.Length && (programInQuotes || !IsWhitespace(commandLine[i])))
         {
-            i++;
-            while (i < commandLine.Length && commandLine[i] != '"')
+            if (commandLine[i] == '"')
             {
-                program.Append(commandLine[i++]);
+                programInQuotes = !programInQuotes;
+            }
+            else
+            {
+                program.Append(commandLine[i]);
             }
 
-            i++; // closing quote, if any
-        }
-        else
-        {
-            while (i < commandLine.Length && !IsWhitespace(commandLine[i]))
-            {
-                program.Append(commandLine[i++]);
-            }
+            i++;
         }
 
         arguments.Add(program.ToString());
