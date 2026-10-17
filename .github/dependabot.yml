@@ -1,0 +1,47 @@
+# Dependabot は GitHub Actions の更新だけを PR で知らせる。
+#
+# ワークフローの action は `@<commit SHA> # vX.Y.Z` の形で固定している。
+# Dependabot はタグから新しい版を探し、SHA と同じ行のバージョンコメントを
+# まとめて書き換えるので、この形式のまま更新できる。SHA 固定の action には
+# Dependabot alerts / security updates が出ないため、v4.4.0 のような
+# セキュリティ backport もこの version updates でしか届かない。
+#
+# PR を開くだけで、自動マージはしない。Dependabot の PR では bridge-tests.yml
+# が read-only のトークン・シークレットなしで走るが、release-package.yml は
+# タグ push でしか動かず、PR の CI では一度も実行されない。release-package.yml
+# の SHA 更新（特に attest-build-provenance / upload-artifact /
+# download-artifact）は、OIDC attestation と contents: write を持つジョブで
+# 使われるので、リリースノートと差分をレビューしてからマージすること。
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    # "/" で .github/workflows/ 以下をすべて見る。同じ action は全ワークフロー
+    # で 1 つの PR にまとめて更新されるので、bridge-tests.yml と
+    # release-package.yml の SHA がずれない。
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "09:00"
+      timezone: Asia/Tokyo
+    # 公開から 3 日経っていない版は提案しない。タグの付け替えや壊れた
+    # リリースが見つかるまでの猶予で、security updates には効かない。
+    cooldown:
+      default-days: 3
+    # actions/* のマイナー・パッチ更新は 1 つの PR にまとめる。メジャー更新は
+    # Node ランタイムや入力の既定値が変わるので、action ごとに別の PR にして
+    # 1 つずつレビュー・revert できるようにする。actions/* 以外の action を
+    # 足した場合も、グループに入らず個別の PR になる。
+    groups:
+      actions-minor-patch:
+        patterns:
+          - "actions/*"
+        update-types:
+          - minor
+          - patch
+    # グループ 1 件とメジャー更新数件が同時に並んでも収まる数。
+    open-pull-requests-limit: 5
+    # 例: "ci(deps): bump actions/checkout from 5.1.0 to 5.2.0"
+    commit-message:
+      prefix: ci
+      include: scope
