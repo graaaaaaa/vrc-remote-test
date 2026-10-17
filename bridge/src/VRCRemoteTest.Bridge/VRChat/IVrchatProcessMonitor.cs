@@ -10,5 +10,12 @@ namespace VRCRemoteTest.Bridge.VRChat;
 /// </summary>
 public interface IVrchatProcessMonitor
 {
+    /// <summary>Enumerates once; never throws (failures are reported in the snapshot).</summary>
+    VrchatClientSnapshot GetClients();
+
+    /// <summary>
+    /// The status-file view of one enumeration: the representative client only, in the
+    /// shape Unity already reads. Throws when the process list cannot be read.
+    /// </summary>
     VrchatStatus GetStatus();
 }

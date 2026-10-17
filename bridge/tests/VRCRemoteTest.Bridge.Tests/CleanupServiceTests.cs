@@ -35,7 +35,7 @@ public class CleanupServiceTests : IDisposable
             CreateFile($"vrc-remote-build-{i:D2}.vrcw", now.AddMinutes(-i));
         }
 
-        _cleanup.Cleanup(_tempDir, retainBuilds: 10);
+        _cleanup.Cleanup(_tempDir, retainBuilds: 10, keepFileName: "vrc-remote-build-00.vrcw");
 
         Directory.GetFiles(_tempDir, "vrc-remote-*.vrcw").Should().HaveCount(10);
         File.Exists(Path.Combine(_tempDir, "vrc-remote-build-00.vrcw")).Should().BeTrue();
@@ -51,7 +51,7 @@ public class CleanupServiceTests : IDisposable
             CreateFile($"vrc-remote-build-{i:D2}.vrcw", DateTime.UtcNow.AddMinutes(-i));
         }
 
-        _cleanup.Cleanup(_tempDir, retainBuilds: 10);
+        _cleanup.Cleanup(_tempDir, retainBuilds: 10, keepFileName: "vrc-remote-build-00.vrcw");
 
         File.Exists(Path.Combine(_tempDir, "some-other-world.vrcw")).Should().BeTrue();
     }
@@ -61,7 +61,7 @@ public class CleanupServiceTests : IDisposable
     {
         CreateFile("vrc-remote-build-01.vrcw", DateTime.UtcNow);
 
-        _cleanup.Cleanup(_tempDir, retainBuilds: 0);
+        _cleanup.Cleanup(_tempDir, retainBuilds: 0, keepFileName: "vrc-remote-build-01.vrcw");
 
         File.Exists(Path.Combine(_tempDir, "vrc-remote-build-01.vrcw")).Should().BeTrue();
     }
@@ -69,9 +69,40 @@ public class CleanupServiceTests : IDisposable
     [Fact]
     public void Does_nothing_when_directory_does_not_exist()
     {
-        var act = () => _cleanup.Cleanup(Path.Combine(_tempDir, "missing"), retainBuilds: 10);
+        var act = () => _cleanup.Cleanup(Path.Combine(_tempDir, "missing"), retainBuilds: 10, keepFileName: "vrc-remote-x.vrcw");
 
         act.Should().NotThrow();
+    }
+
+    [Fact]
+    public void Never_deletes_the_file_just_deployed_even_when_its_timestamp_is_the_oldest()
+    {
+        // e.g. other files copied in with a clock that runs ahead.
+        var now = DateTime.UtcNow;
+        CreateFile("vrc-remote-current.vrcw", now.AddDays(-1));
+        for (var i = 0; i < 5; i++)
+        {
+            CreateFile($"vrc-remote-build-{i:D2}.vrcw", now.AddMinutes(-i));
+        }
+
+        _cleanup.Cleanup(_tempDir, retainBuilds: 3, keepFileName: "vrc-remote-current.vrcw");
+
+        Directory.GetFiles(_tempDir, "vrc-remote-*.vrcw").Select(Path.GetFileName)
+            .Should().BeEquivalentTo("vrc-remote-current.vrcw", "vrc-remote-build-00.vrcw", "vrc-remote-build-01.vrcw");
+    }
+
+    [Fact]
+    public void The_kept_file_counts_toward_RetainBuilds_only_when_it_exists()
+    {
+        var now = DateTime.UtcNow;
+        for (var i = 0; i < 3; i++)
+        {
+            CreateFile($"vrc-remote-build-{i:D2}.vrcw", now.AddMinutes(-i));
+        }
+
+        _cleanup.Cleanup(_tempDir, retainBuilds: 2, keepFileName: "vrc-remote-missing.vrcw");
+
+        Directory.GetFiles(_tempDir, "vrc-remote-*.vrcw").Should().HaveCount(2);
     }
 
     [Fact]

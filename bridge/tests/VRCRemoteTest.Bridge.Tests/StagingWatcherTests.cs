@@ -38,28 +38,52 @@ public class StagingWatcherTests : IDisposable
         try { Directory.Delete(_tempDir, recursive: true); } catch (IOException) { }
     }
 
+    private BridgeOptions CreateOptions(
+        long maxSize = 1024, int retainBuilds = 10, bool autoLaunchVrchat = false, int? clientCount = null) => new()
+    {
+        StagingDirectory = _stagingDir,
+        StateDirectory = _stateDir,
+        VrchatWorldsDirectory = _worldsDir,
+        MaxArtifactSizeBytes = maxSize,
+        RetainBuilds = retainBuilds,
+        AutoLaunchVrchat = autoLaunchVrchat,
+        VrchatExecutable = @"C:\VRChat\VRChat.exe",
+        VrchatClientCount = clientCount,
+    };
+
     private StagingWatcher CreateWatcher(
         long maxSize = 1024,
         int retainBuilds = 10,
         bool autoLaunchVrchat = false,
-        IVrchatReadinessCoordinator? readinessCoordinator = null,
-        IPackageValidator? validator = null) =>
+        IVrchatClientCoordinator? clientCoordinator = null,
+        IPackageValidator? validator = null,
+        IWorldInstaller? installer = null,
+        IResultWriter? resultWriter = null,
+        int? clientCount = null) =>
         new(
-            Options.Create(new BridgeOptions
-            {
-                StagingDirectory = _stagingDir,
-                StateDirectory = _stateDir,
-                VrchatWorldsDirectory = _worldsDir,
-                MaxArtifactSizeBytes = maxSize,
-                RetainBuilds = retainBuilds,
-                AutoLaunchVrchat = autoLaunchVrchat,
-            }),
+            Options.Create(CreateOptions(maxSize, retainBuilds, autoLaunchVrchat, clientCount)),
             validator ?? new PackageValidator(),
-            new WorldInstaller(),
-            new ResultWriter(),
+            installer ?? new WorldInstaller(),
+            resultWriter ?? new ResultWriter(),
             new CleanupService(),
-            readinessCoordinator ?? new FakeVrchatReadinessCoordinator(),
+            clientCoordinator ?? new FakeVrchatClientCoordinator(),
             NullLogger<StagingWatcher>.Instance);
+
+    /// <summary>The real coordinator over fake processes, for the multi-client integration tests.</summary>
+    private VrchatClientCoordinator CreateCoordinator(
+        FakeVrchatProcessMonitor monitor,
+        FakeVrchatLauncher launcher,
+        int? clientCount,
+        TimeSpan? settleDelay = null,
+        Func<TimeSpan, CancellationToken, Task>? launchDelay = null) =>
+        new(
+            Options.Create(CreateOptions(autoLaunchVrchat: true, clientCount: clientCount)),
+            monitor,
+            launcher,
+            NullLogger<VrchatClientCoordinator>.Instance,
+            settleDelay ?? TimeSpan.FromSeconds(30),
+            TimeSpan.FromMilliseconds(5),
+            launchDelay ?? ((_, _) => Task.CompletedTask));
 
     private static void WriteIncomingBuild(string stagingDir, string buildId, byte[] artifactBytes)
     {
@@ -325,39 +349,41 @@ public class StagingWatcherTests : IDisposable
     }
 
     [Fact]
-    public async Task AutoLaunchVrchat_disabled_never_calls_the_readiness_coordinator()
+    public async Task AutoLaunchVrchat_disabled_never_calls_the_client_coordinator()
     {
-        var readiness = new FakeVrchatReadinessCoordinator();
-        var watcher = CreateWatcher(autoLaunchVrchat: false, readinessCoordinator: readiness);
+        var coordinator = new FakeVrchatClientCoordinator();
+        var watcher = CreateWatcher(autoLaunchVrchat: false, clientCoordinator: coordinator);
         WriteIncomingBuild(_stagingDir, "build-no-autolaunch", Encoding.UTF8.GetBytes("fake-world-bundle"));
 
         await watcher.RunOnceAsync(CancellationToken.None);
 
-        readiness.EnsureReadyCalled.Should().BeFalse();
+        coordinator.PrepareCalled.Should().BeFalse();
+        coordinator.LaunchedWorldPaths.Should().BeEmpty();
         File.Exists(Path.Combine(_worldsDir, "vrc-remote-build-no-autolaunch.vrcw")).Should().BeTrue();
     }
 
     [Fact]
-    public async Task AutoLaunchVrchat_enabled_calls_the_readiness_coordinator_before_deploying()
+    public async Task AutoLaunchVrchat_enabled_calls_the_client_coordinator_before_deploying()
     {
-        var readiness = new FakeVrchatReadinessCoordinator { ResultToReturn = ReadinessResult.Ready() };
-        var watcher = CreateWatcher(autoLaunchVrchat: true, readinessCoordinator: readiness);
+        var coordinator = new FakeVrchatClientCoordinator { PreparationToReturn = VrchatPreparation.DeployOnly() };
+        var watcher = CreateWatcher(autoLaunchVrchat: true, clientCoordinator: coordinator);
         WriteIncomingBuild(_stagingDir, "build-autolaunch-ok", Encoding.UTF8.GetBytes("fake-world-bundle"));
 
         await watcher.RunOnceAsync(CancellationToken.None);
 
-        readiness.EnsureReadyCalled.Should().BeTrue();
+        coordinator.PrepareCalled.Should().BeTrue();
+        coordinator.LaunchedWorldPaths.Should().BeEmpty("a deploy to running clients launches nothing");
         File.Exists(Path.Combine(_worldsDir, "vrc-remote-build-autolaunch-ok.vrcw")).Should().BeTrue();
     }
 
     [Fact]
     public async Task AutoLaunchVrchat_enabled_and_readiness_failure_quarantines_the_build_without_deploying()
     {
-        var readiness = new FakeVrchatReadinessCoordinator
+        var coordinator = new FakeVrchatClientCoordinator
         {
-            ResultToReturn = ReadinessResult.Failure(ErrorCode.VrchatStartTimeout, "Timed out waiting for VRChat."),
+            PreparationToReturn = VrchatPreparation.Failure(ErrorCode.VrchatStartTimeout, "Timed out waiting for VRChat."),
         };
-        var watcher = CreateWatcher(autoLaunchVrchat: true, readinessCoordinator: readiness);
+        var watcher = CreateWatcher(autoLaunchVrchat: true, clientCoordinator: coordinator);
         WriteIncomingBuild(_stagingDir, "build-autolaunch-timeout", Encoding.UTF8.GetBytes("fake-world-bundle"));
 
         await watcher.RunOnceAsync(CancellationToken.None);
@@ -376,11 +402,11 @@ public class StagingWatcherTests : IDisposable
     [Fact]
     public async Task AutoLaunchVrchat_enabled_and_readiness_throws_writes_VrchatStartFailed_without_crashing()
     {
-        var readiness = new FakeVrchatReadinessCoordinator
+        var coordinator = new FakeVrchatClientCoordinator
         {
-            ThrowOnEnsureReady = new InvalidOperationException("simulated WMI failure"),
+            ThrowOnPrepare = new InvalidOperationException("simulated WMI failure"),
         };
-        var watcher = CreateWatcher(autoLaunchVrchat: true, readinessCoordinator: readiness);
+        var watcher = CreateWatcher(autoLaunchVrchat: true, clientCoordinator: coordinator);
         WriteIncomingBuild(_stagingDir, "build-autolaunch-throws", Encoding.UTF8.GetBytes("fake-world-bundle"));
 
         var act = async () => await watcher.RunOnceAsync(CancellationToken.None);
@@ -420,17 +446,17 @@ public class StagingWatcherTests : IDisposable
         // The installed bytes must come from the validated private snapshot, not from
         // anything an SMB writer can still reach (security review S15).
         var original = Encoding.UTF8.GetBytes("validated-world-bundle");
-        var readiness = new FakeVrchatReadinessCoordinator
+        var coordinator = new FakeVrchatClientCoordinator
         {
-            OnEnsureReady = () => File.WriteAllText(
+            OnPrepare = () => File.WriteAllText(
                 Path.Combine(_stagingDir, "incoming", "build-swap.vrcw"), "attacker-world-bundle"),
         };
-        var watcher = CreateWatcher(autoLaunchVrchat: true, readinessCoordinator: readiness);
+        var watcher = CreateWatcher(autoLaunchVrchat: true, clientCoordinator: coordinator);
         WriteIncomingBuild(_stagingDir, "build-swap", original);
 
         await watcher.RunOnceAsync(CancellationToken.None);
 
-        readiness.EnsureReadyCalled.Should().BeTrue();
+        coordinator.PrepareCalled.Should().BeTrue();
         File.ReadAllBytes(Path.Combine(_worldsDir, "vrc-remote-build-swap.vrcw")).Should().Equal(original);
     }
 
@@ -891,5 +917,335 @@ public class StagingWatcherTests : IDisposable
         Directory.GetFiles(processing).Should().BeEmpty("the stranded claim is resumed without a restart");
         File.ReadAllBytes(Path.Combine(_worldsDir, "vrc-remote-build-dup.vrcw")).Should().Equal(bytes);
         ReadResult("build-dup").Status.Should().Be("deployed");
+    }
+
+    // === Multi-client launch (multi-client plan sections 8, 11.3 and 13.4) ===
+
+    private string DeployedPath(string buildId) => Path.Combine(_worldsDir, $"vrc-remote-{buildId}.vrcw");
+
+    private string ArchivedManifest(string buildId) => Path.Combine(_stateDir, "archive", $"{buildId}.ready.json");
+
+    [Fact]
+    public async Task Cold_start_deploys_and_archives_before_launching_every_client_with_the_deployed_file()
+    {
+        var monitor = new FakeVrchatProcessMonitor();
+        var launcher = new FakeVrchatLauncher();
+        var stateAtEachLaunch = new List<(bool Deployed, bool Archived, bool ResultWritten)>();
+        launcher.OnLaunch = _ => stateAtEachLaunch.Add((
+            File.Exists(DeployedPath("build-cold")),
+            File.Exists(ArchivedManifest("build-cold")),
+            File.Exists(Path.Combine(_stagingDir, "results", "build-cold.json"))));
+        var watcher = CreateWatcher(
+            autoLaunchVrchat: true, clientCoordinator: CreateCoordinator(monitor, launcher, clientCount: 2));
+        WriteIncomingBuild(_stagingDir, "build-cold", Encoding.UTF8.GetBytes("fake-world-bundle"));
+
+        await watcher.RunOnceAsync(CancellationToken.None);
+
+        stateAtEachLaunch.Should().Equal((true, true, false), (true, true, false));
+        launcher.Requests.Should().AllSatisfy(r => r.WorldPath.Should().Be(Path.GetFullPath(DeployedPath("build-cold"))));
+        launcher.Requests.Select(r => r.RoomId).Distinct().Should().ContainSingle();
+        ReadResult("build-cold").Status.Should().Be("deployed");
+        Directory.GetFiles(Path.Combine(_stateDir, "processing")).Should().BeEmpty();
+    }
+
+    [Fact]
+    public async Task A_single_client_cold_start_does_not_wait_for_the_settle_delay()
+    {
+        var monitor = new FakeVrchatProcessMonitor();
+        var launcher = new FakeVrchatLauncher();
+        var coordinator = CreateCoordinator(monitor, launcher, clientCount: null, settleDelay: TimeSpan.FromMinutes(5));
+        var watcher = CreateWatcher(autoLaunchVrchat: true, clientCoordinator: coordinator);
+        WriteIncomingBuild(_stagingDir, "build-one", Encoding.UTF8.GetBytes("fake-world-bundle"));
+
+        var runTask = watcher.RunOnceAsync(CancellationToken.None);
+        var finished = await Task.WhenAny(runTask, Task.Delay(TimeSpan.FromSeconds(10)));
+
+        finished.Should().BeSameAs(runTask, "the clients open the deployed world through --url");
+        launcher.Requests.Should().ContainSingle();
+        ReadResult("build-one").Status.Should().Be("deployed");
+    }
+
+    [Fact]
+    public async Task A_build_right_after_a_cold_start_waits_for_the_new_clients_and_launches_nothing()
+    {
+        var settleDelay = TimeSpan.FromMilliseconds(400);
+        var monitor = new FakeVrchatProcessMonitor();
+        var launcher = new FakeVrchatLauncher();
+        DateTime? lastLaunchUtc = null;
+        launcher.OnLaunch = pid =>
+        {
+            lastLaunchUtc = DateTime.UtcNow;
+            monitor.AddClient(pid, lastLaunchUtc);
+        };
+        var installer = new RecordingWorldInstaller();
+        var watcher = CreateWatcher(
+            autoLaunchVrchat: true,
+            installer: installer,
+            clientCoordinator: CreateCoordinator(monitor, launcher, clientCount: 2, settleDelay: settleDelay));
+
+        // Both builds are picked up by the same scan, as in StagingWatcher.RunOnceAsync.
+        WriteIncomingBuild(_stagingDir, "build-a", Encoding.UTF8.GetBytes("bundle-a"));
+        WriteIncomingBuild(_stagingDir, "build-b", Encoding.UTF8.GetBytes("bundle-b"));
+
+        await watcher.RunOnceAsync(CancellationToken.None);
+
+        launcher.Requests.Should().HaveCount(2, "only the first build cold-starts");
+        installer.InstalledAtUtc.Should().HaveCount(2);
+        var secondInstall = installer.InstalledAtUtc.Values.Max();
+        (secondInstall - lastLaunchUtc!.Value).Should().BeGreaterThan(settleDelay - TimeSpan.FromMilliseconds(50));
+        ReadResult("build-a").Status.Should().Be("deployed");
+        ReadResult("build-b").Status.Should().Be("deployed");
+    }
+
+    [Fact]
+    public async Task Running_clients_reload_without_any_launch()
+    {
+        var monitor = new FakeVrchatProcessMonitor();
+        monitor.AddClient(1234, DateTime.UtcNow.AddMinutes(-5));
+        monitor.AddClient(1235, DateTime.UtcNow.AddMinutes(-5));
+        var launcher = new FakeVrchatLauncher();
+        var watcher = CreateWatcher(
+            autoLaunchVrchat: true, clientCoordinator: CreateCoordinator(monitor, launcher, clientCount: 2));
+        WriteIncomingBuild(_stagingDir, "build-warm", Encoding.UTF8.GetBytes("fake-world-bundle"));
+
+        await watcher.RunOnceAsync(CancellationToken.None);
+
+        launcher.LaunchCalled.Should().BeFalse();
+        File.Exists(DeployedPath("build-warm")).Should().BeTrue();
+        ReadResult("build-warm").Status.Should().Be("deployed");
+    }
+
+    [Fact]
+    public async Task A_VRChat_that_cannot_be_checked_fails_the_build_without_deploying_or_launching()
+    {
+        var monitor = new FakeVrchatProcessMonitor { EnumerationError = "access denied" };
+        var launcher = new FakeVrchatLauncher();
+        var watcher = CreateWatcher(
+            autoLaunchVrchat: true, clientCoordinator: CreateCoordinator(monitor, launcher, clientCount: 2));
+        WriteIncomingBuild(_stagingDir, "build-unmanaged", Encoding.UTF8.GetBytes("fake-world-bundle"));
+
+        await watcher.RunOnceAsync(CancellationToken.None);
+
+        launcher.LaunchCalled.Should().BeFalse();
+        Directory.GetFiles(_worldsDir).Should().BeEmpty();
+        File.Exists(Path.Combine(_stateDir, "failed", "build-unmanaged.ready.json")).Should().BeTrue();
+        ReadResult("build-unmanaged").ErrorCode.Should().Be(ErrorCode.VrchatUnmanagedRunning);
+    }
+
+    [Fact]
+    public async Task A_build_that_fails_validation_neither_deploys_nor_launches()
+    {
+        var launcher = new FakeVrchatLauncher();
+        var watcher = CreateWatcher(
+            autoLaunchVrchat: true,
+            clientCoordinator: CreateCoordinator(new FakeVrchatProcessMonitor(), launcher, clientCount: 2));
+        var bytes = Encoding.UTF8.GetBytes("fake-world-bundle");
+        var incoming = Path.Combine(_stagingDir, "incoming");
+        Directory.CreateDirectory(incoming);
+        File.WriteAllBytes(Path.Combine(incoming, "build-badhash.vrcw"), bytes);
+        var manifest = ManifestFor("build-badhash", bytes);
+        File.WriteAllText(
+            Path.Combine(incoming, "build-badhash.ready.json"),
+            JsonSerializer.Serialize(new BuildManifest
+            {
+                ProtocolVersion = manifest.ProtocolVersion,
+                BuildId = manifest.BuildId,
+                FileName = manifest.FileName,
+                Size = manifest.Size,
+                Sha256 = new string('0', 64),
+                CreatedAtUtc = manifest.CreatedAtUtc,
+            }));
+
+        await watcher.RunOnceAsync(CancellationToken.None);
+
+        launcher.LaunchCalled.Should().BeFalse();
+        Directory.GetFiles(_worldsDir).Should().BeEmpty();
+        ReadResult("build-badhash").ErrorCode.Should().Be(ErrorCode.HashMismatch);
+    }
+
+    [Fact]
+    public async Task A_failed_install_launches_nothing()
+    {
+        var launcher = new FakeVrchatLauncher();
+        var watcher = CreateWatcher(
+            autoLaunchVrchat: true,
+            installer: new ThrowingWorldInstaller(),
+            clientCoordinator: CreateCoordinator(new FakeVrchatProcessMonitor(), launcher, clientCount: 2));
+        WriteIncomingBuild(_stagingDir, "build-noinstall", Encoding.UTF8.GetBytes("fake-world-bundle"));
+
+        await watcher.RunOnceAsync(CancellationToken.None);
+
+        launcher.LaunchCalled.Should().BeFalse();
+        File.Exists(Path.Combine(_stateDir, "failed", "build-noinstall.ready.json")).Should().BeTrue();
+        ReadResult("build-noinstall").ErrorCode.Should().Be(ErrorCode.DeployFailed);
+    }
+
+    [Fact]
+    public async Task A_failed_launch_reports_VrchatStartFailed_and_keeps_the_build_archived()
+    {
+        var launcher = new FakeVrchatLauncher { FailingLaunchIndexes = [1] };
+        var watcher = CreateWatcher(
+            autoLaunchVrchat: true,
+            clientCoordinator: CreateCoordinator(new FakeVrchatProcessMonitor(), launcher, clientCount: 3));
+        var bytes = Encoding.UTF8.GetBytes("fake-world-bundle");
+        WriteIncomingBuild(_stagingDir, "build-halfstart", bytes);
+
+        await watcher.RunOnceAsync(CancellationToken.None);
+
+        var result = ReadResult("build-halfstart");
+        result.ErrorCode.Should().Be(ErrorCode.VrchatStartFailed);
+        result.ErrorMessage.Should().Contain("Launched 1 of 3");
+        File.Exists(ArchivedManifest("build-halfstart")).Should().BeTrue();
+        Directory.GetFiles(Path.Combine(_stateDir, "failed")).Should().BeEmpty("an archived build is never quarantined");
+        File.Exists(DeployedPath("build-halfstart")).Should().BeTrue();
+
+        // Sending the same build again does not deploy it again.
+        WriteIncomingBuild(_stagingDir, "build-halfstart", bytes);
+        await watcher.RunOnceAsync(CancellationToken.None);
+
+        ReadResult("build-halfstart").ErrorCode.Should().Be(ErrorCode.BuildAlreadyProcessed);
+        launcher.Requests.Should().HaveCount(2);
+    }
+
+    [Fact]
+    public async Task An_exception_while_launching_reports_VrchatStartFailed_and_keeps_the_build_archived()
+    {
+        var coordinator = new FakeVrchatClientCoordinator
+        {
+            PreparationToReturn = VrchatPreparation.ColdStart(),
+            ThrowOnLaunch = new InvalidOperationException("simulated launcher bug"),
+        };
+        var watcher = CreateWatcher(autoLaunchVrchat: true, clientCoordinator: coordinator);
+        WriteIncomingBuild(_stagingDir, "build-launchthrows", Encoding.UTF8.GetBytes("fake-world-bundle"));
+
+        await watcher.RunOnceAsync(CancellationToken.None);
+
+        ReadResult("build-launchthrows").ErrorCode.Should().Be(ErrorCode.VrchatStartFailed);
+        File.Exists(ArchivedManifest("build-launchthrows")).Should().BeTrue();
+        Directory.GetFiles(Path.Combine(_stateDir, "failed")).Should().BeEmpty();
+    }
+
+    [Fact]
+    public async Task An_archive_that_cannot_be_written_launches_nothing()
+    {
+        // A directory where the archived manifest belongs makes the move fail on every OS.
+        Directory.CreateDirectory(ArchivedManifest("build-noarchive"));
+        var coordinator = new FakeVrchatClientCoordinator { PreparationToReturn = VrchatPreparation.ColdStart() };
+        var watcher = CreateWatcher(autoLaunchVrchat: true, clientCoordinator: coordinator);
+        WriteIncomingBuild(_stagingDir, "build-noarchive", Encoding.UTF8.GetBytes("fake-world-bundle"));
+
+        await watcher.RunOnceAsync(CancellationToken.None);
+
+        coordinator.LaunchedWorldPaths.Should().BeEmpty();
+        ReadResult("build-noarchive").ErrorCode.Should().Be(ErrorCode.UnknownError);
+        File.Exists(Path.Combine(_stateDir, "failed", "build-noarchive.ready.json")).Should().BeTrue();
+        Directory.GetFiles(Path.Combine(_stateDir, "processing")).Should().BeEmpty();
+    }
+
+    [Fact]
+    public async Task A_result_that_cannot_be_written_after_the_archive_never_quarantines_the_build()
+    {
+        var coordinator = new FakeVrchatClientCoordinator { PreparationToReturn = VrchatPreparation.ColdStart() };
+        var watcher = CreateWatcher(
+            autoLaunchVrchat: true,
+            clientCoordinator: coordinator,
+            resultWriter: new FailingSuccessResultWriter());
+        WriteIncomingBuild(_stagingDir, "build-noresult", Encoding.UTF8.GetBytes("fake-world-bundle"));
+
+        var act = async () => await watcher.RunOnceAsync(CancellationToken.None);
+
+        await act.Should().NotThrowAsync();
+        coordinator.LaunchedWorldPaths.Should().ContainSingle();
+        File.Exists(ArchivedManifest("build-noresult")).Should().BeTrue();
+        Directory.GetFiles(Path.Combine(_stateDir, "failed")).Should().BeEmpty();
+        ReadResult("build-noresult").ErrorCode.Should().Be(ErrorCode.UnknownError);
+    }
+
+    [Fact]
+    public async Task Stopping_during_the_launch_interval_never_redeploys_the_build_after_a_restart()
+    {
+        using var cts = new CancellationTokenSource();
+        var monitor = new FakeVrchatProcessMonitor();
+        var launcher = new FakeVrchatLauncher();
+        launcher.OnLaunch = pid => monitor.AddClient(pid, DateTime.UtcNow.AddMinutes(-5));
+        var installer = new RecordingWorldInstaller();
+        var coordinator = CreateCoordinator(
+            monitor,
+            launcher,
+            clientCount: 2,
+            launchDelay: (_, token) =>
+            {
+                cts.Cancel(); // the Bridge is stopped between the first and second client
+                return Task.Delay(Timeout.Infinite, token);
+            });
+        var watcher = CreateWatcher(autoLaunchVrchat: true, installer: installer, clientCoordinator: coordinator);
+        WriteIncomingBuild(_stagingDir, "build-stopped", Encoding.UTF8.GetBytes("fake-world-bundle"));
+
+        var act = async () => await watcher.RunOnceAsync(cts.Token);
+
+        await act.Should().ThrowAsync<OperationCanceledException>();
+        launcher.Requests.Should().ContainSingle();
+        File.Exists(Path.Combine(_stagingDir, "results", "build-stopped.json")).Should().BeFalse(
+            "no result is written; Unity reports RESULT_TIMEOUT");
+
+        var restarted = CreateWatcher(
+            autoLaunchVrchat: true,
+            installer: installer,
+            clientCoordinator: CreateCoordinator(monitor, launcher, clientCount: 2));
+        await restarted.RecoverProcessingAsync(CancellationToken.None);
+        await restarted.RunOnceAsync(CancellationToken.None);
+
+        installer.InstalledAtUtc.Should().ContainSingle("the archived build is not deployed again");
+        launcher.Requests.Should().ContainSingle("the client that did start is left as it is");
+    }
+
+    [Fact]
+    public async Task Cleanup_after_a_cold_start_never_removes_the_world_passed_to_url()
+    {
+        var newerLooking = Path.Combine(_worldsDir, "vrc-remote-other.vrcw");
+        File.WriteAllText(newerLooking, "other");
+        File.SetLastWriteTimeUtc(newerLooking, DateTime.UtcNow.AddDays(1));
+        var watcher = CreateWatcher(
+            retainBuilds: 1,
+            autoLaunchVrchat: true,
+            clientCoordinator: new FakeVrchatClientCoordinator { PreparationToReturn = VrchatPreparation.ColdStart() });
+        WriteIncomingBuild(_stagingDir, "build-keep", Encoding.UTF8.GetBytes("fake-world-bundle"));
+
+        await watcher.RunOnceAsync(CancellationToken.None);
+
+        File.Exists(DeployedPath("build-keep")).Should().BeTrue();
+        File.Exists(newerLooking).Should().BeFalse();
+    }
+
+    private sealed class RecordingWorldInstaller : IWorldInstaller
+    {
+        private readonly WorldInstaller _inner = new();
+
+        public Dictionary<string, DateTime> InstalledAtUtc { get; } = [];
+
+        public string Install(string validatedArtifactPath, string buildId, string worldsDirectory)
+        {
+            var name = _inner.Install(validatedArtifactPath, buildId, worldsDirectory);
+            InstalledAtUtc[buildId] = DateTime.UtcNow;
+            return name;
+        }
+    }
+
+    private sealed class ThrowingWorldInstaller : IWorldInstaller
+    {
+        public string Install(string validatedArtifactPath, string buildId, string worldsDirectory) =>
+            throw new IOException("simulated disk full");
+    }
+
+    /// <summary>Fails every success result, as a share that refuses writes would.</summary>
+    private sealed class FailingSuccessResultWriter : IResultWriter
+    {
+        private readonly ResultWriter _inner = new();
+
+        public void WriteSuccess(string buildId, string deployedFileName, string sha256, string resultsDirectory) =>
+            throw new IOException("simulated share failure");
+
+        public void WriteFailure(string buildId, string errorCode, string errorMessage, string resultsDirectory) =>
+            _inner.WriteFailure(buildId, errorCode, errorMessage, resultsDirectory);
     }
 }

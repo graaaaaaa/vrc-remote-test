@@ -1,3 +1,4 @@
+using System.ComponentModel;
 using System.Diagnostics;
 using System.Management;
 using Microsoft.Extensions.Logging;
@@ -13,6 +14,11 @@ namespace VRCRemoteTest.Bridge.VRChat;
 /// spike plus a win-x64 self-contained single-file publish spike (Codex plan review
 /// Phase 4a). Real WMI runtime behavior on Windows is confirmed during the real-hardware
 /// verification step, not by this class's own design.
+///
+/// Only VRChat in the Bridge's own interactive session counts, and the session is
+/// checked before anything else is read about a process: another session's VRChat is
+/// neither a client to deploy to nor a reason to skip a cold start, and its command
+/// line is never queried (multi-client plan sections 11.7 and 13.1).
 /// </summary>
 public sealed class VrchatProcessMonitor : IVrchatProcessMonitor
 {
@@ -20,45 +26,121 @@ public sealed class VrchatProcessMonitor : IVrchatProcessMonitor
     private const string WatchWorldsArgument = "--watch-worlds";
 
     private readonly ILogger<VrchatProcessMonitor> _logger;
+    private readonly int? _currentSessionId;
 
     public VrchatProcessMonitor(ILogger<VrchatProcessMonitor> logger)
     {
         _logger = logger;
+        _currentSessionId = TryGetCurrentSessionId();
+    }
+
+    public VrchatClientSnapshot GetClients()
+    {
+        var first = Enumerate(out var vanished);
+        if (first.EnumerationError is not null || vanished == 0)
+        {
+            return first;
+        }
+
+        // A process that exited between enumeration and reading its details is simply
+        // gone after a fresh enumeration; one that vanishes again is reported as
+        // unverified rather than as "not running".
+        var second = Enumerate(out vanished);
+        return vanished == 0
+            ? second
+            : new VrchatClientSnapshot(second.Clients, second.UnverifiedCount + vanished, second.EnumerationError);
     }
 
     public VrchatStatus GetStatus()
     {
-        var processes = Process.GetProcessesByName(ProcessName);
-
-        try
+        var snapshot = GetClients();
+        if (snapshot.EnumerationError is not null)
         {
-            if (processes.Length == 0)
-            {
-                return new VrchatStatus
-                {
-                    IsRunning = false,
-                    WatchWorldsDetected = false,
-                    UpdatedAtUtc = DateTimeOffset.UtcNow,
-                };
-            }
+            throw new InvalidOperationException($"Could not enumerate VRChat processes: {snapshot.EnumerationError}");
+        }
 
-            if (processes.Length > 1)
-            {
-                _logger.LogWarning(
-                    "Multiple VRChat processes detected (PIDs: {Pids}). Selecting the most relevant one.",
-                    string.Join(", ", Array.ConvertAll(processes, p => p.Id)));
-            }
+        return BuildStatus(snapshot, DateTimeOffset.UtcNow);
+    }
 
-            var selected = SelectProcess(processes);
+    /// <summary>
+    /// The first client: the oldest one with --watch-worlds, since it is the one a cold
+    /// start launched first (multi-client plan section 11.6). Without any --watch-worlds
+    /// client, the oldest client. Unknown creation times sort last; the PID breaks ties so
+    /// the choice never depends on enumeration order.
+    /// </summary>
+    internal static VrchatClientInfo? SelectRepresentative(IReadOnlyList<VrchatClientInfo> clients) =>
+        clients
+            .OrderByDescending(c => c.WatchWorldsDetected)
+            .ThenBy(c => c.CreationTimeUtc is null)
+            .ThenBy(c => c.CreationTimeUtc)
+            .ThenBy(c => c.ProcessId)
+            .FirstOrDefault();
 
+    /// <summary>
+    /// Same fields and meaning as before multi-client support. A VRChat that could not
+    /// be checked still shows as running (without --watch-worlds), never as stopped.
+    /// </summary>
+    internal static VrchatStatus BuildStatus(VrchatClientSnapshot snapshot, DateTimeOffset now)
+    {
+        var representative = SelectRepresentative(snapshot.Clients);
+        if (representative is null)
+        {
             return new VrchatStatus
             {
-                IsRunning = true,
-                WatchWorldsDetected = selected.WatchWorldsDetected,
-                ProcessId = selected.Process.Id,
-                StartTimeUtc = TryGetStartTime(selected.Process),
-                UpdatedAtUtc = DateTimeOffset.UtcNow,
+                IsRunning = snapshot.UnverifiedCount > 0,
+                WatchWorldsDetected = false,
+                UpdatedAtUtc = now,
             };
+        }
+
+        return new VrchatStatus
+        {
+            IsRunning = true,
+            WatchWorldsDetected = representative.WatchWorldsDetected,
+            ProcessId = representative.ProcessId,
+            StartTimeUtc = representative.CreationTimeUtc is { } created
+                ? new DateTimeOffset(created, TimeSpan.Zero)
+                : null,
+            UpdatedAtUtc = now,
+        };
+    }
+
+    private VrchatClientSnapshot Enumerate(out int vanished)
+    {
+        vanished = 0;
+
+        Process[] processes;
+        try
+        {
+            processes = Process.GetProcessesByName(ProcessName);
+        }
+        catch (Exception ex) when (ex is InvalidOperationException or Win32Exception or NotSupportedException)
+        {
+            _logger.LogWarning(ex, "Failed to enumerate VRChat processes.");
+            return VrchatClientSnapshot.Failed(ex.Message);
+        }
+
+        var clients = new List<VrchatClientInfo>();
+        var unverified = 0;
+        try
+        {
+            foreach (var process in processes)
+            {
+                switch (TryReadClient(process, out var client))
+                {
+                    case ReadOutcome.Client:
+                        clients.Add(client!);
+                        break;
+                    case ReadOutcome.Vanished:
+                        vanished++;
+                        break;
+                    case ReadOutcome.Unverified:
+                        unverified++;
+                        break;
+                    case ReadOutcome.OtherSession:
+                        break;
+                }
+            }
         }
         finally
         {
@@ -67,57 +149,93 @@ public sealed class VrchatProcessMonitor : IVrchatProcessMonitor
                 process.Dispose();
             }
         }
+
+        return new VrchatClientSnapshot(clients, unverified);
     }
 
-    /// <summary>
-    /// Multiple VRChat.exe instances are possible (zombie process, manual double
-    /// launch). Array order from GetProcessesByName is undefined, so this picks
-    /// deterministically: prefer a process confirmed to have --watch-worlds, then
-    /// the most recently started (Codex plan review Phase 4a, Round 3, confidence 0.90).
-    /// </summary>
-    private (Process Process, bool WatchWorldsDetected) SelectProcess(Process[] processes)
+    private enum ReadOutcome
     {
-        (Process Process, bool WatchWorldsDetected, DateTimeOffset? StartTime)? best = null;
+        Client,
+        OtherSession,
+        Unverified,
+        Vanished,
+    }
 
-        foreach (var process in processes)
+    private ReadOutcome TryReadClient(Process process, out VrchatClientInfo? client)
+    {
+        client = null;
+
+        int sessionId;
+        try
         {
-            var watchWorlds = TryDetectWatchWorlds(process.Id);
-            var startTime = TryGetStartTime(process);
-
-            if (best is null
-                || (watchWorlds && !best.Value.WatchWorldsDetected)
-                || (watchWorlds == best.Value.WatchWorldsDetected && startTime > best.Value.StartTime))
-            {
-                best = (process, watchWorlds, startTime);
-            }
+            sessionId = process.SessionId;
+        }
+        catch (InvalidOperationException)
+        {
+            return ReadOutcome.Vanished; // exited after enumeration
+        }
+        catch (Exception ex) when (ex is Win32Exception or NotSupportedException)
+        {
+            _logger.LogWarning(ex, "Could not read the session of VRChat process {ProcessId}.", process.Id);
+            return ReadOutcome.Unverified;
         }
 
-        return (best!.Value.Process, best.Value.WatchWorldsDetected);
+        if (_currentSessionId is null)
+        {
+            return ReadOutcome.Unverified;
+        }
+
+        if (sessionId != _currentSessionId)
+        {
+            return ReadOutcome.OtherSession;
+        }
+
+        DateTime? creationTimeUtc;
+        try
+        {
+            // Process.StartTime is local time; converting keeps the full tick precision.
+            creationTimeUtc = process.StartTime.ToUniversalTime();
+        }
+        catch (InvalidOperationException)
+        {
+            return ReadOutcome.Vanished;
+        }
+        catch (Exception ex) when (ex is Win32Exception or NotSupportedException)
+        {
+            // Readiness then counts from when it first observed this client.
+            creationTimeUtc = null;
+        }
+
+        var watchWorlds = WindowsCommandLine.ContainsArgument(TryReadCommandLine(process.Id), WatchWorldsArgument);
+        client = new VrchatClientInfo(process.Id, creationTimeUtc, watchWorlds);
+        return ReadOutcome.Client;
     }
 
-    private static DateTimeOffset? TryGetStartTime(Process process)
+    private int? TryGetCurrentSessionId()
     {
         try
         {
-            return process.StartTime;
+            using var current = Process.GetCurrentProcess();
+            return current.SessionId;
         }
-        catch (Exception ex) when (ex is InvalidOperationException or System.ComponentModel.Win32Exception)
+        catch (Exception ex) when (ex is InvalidOperationException or Win32Exception or NotSupportedException)
         {
+            _logger.LogWarning(ex, "Could not read the Bridge's own session; every VRChat process will count as unverified.");
             return null;
         }
     }
 
     /// <summary>
     /// WMI query failure (permissions, WMI service unavailable, transient COM error)
-    /// collapses to "not detected" rather than a distinct third state -- Phase 4a's
-    /// VrchatStatus model is deliberately two-valued (Codex plan review, Round 3,
-    /// confidence 0.88). A richer diagnostic state can be added later if actually needed.
+    /// collapses to "no command line", i.e. "--watch-worlds not detected" -- the status
+    /// model is deliberately two-valued (Codex plan review Phase 4a, Round 3, confidence
+    /// 0.88).
     /// </summary>
-    private bool TryDetectWatchWorlds(int processId)
+    private string? TryReadCommandLine(int processId)
     {
         if (!OperatingSystem.IsWindows())
         {
-            return false;
+            return null;
         }
 
         try
@@ -129,9 +247,7 @@ public sealed class VrchatProcessMonitor : IVrchatProcessMonitor
             foreach (var resultObj in results)
             {
                 using var managementObject = (ManagementBaseObject)resultObj;
-                var commandLine = managementObject["CommandLine"] as string;
-                return commandLine is not null
-                    && commandLine.Contains(WatchWorldsArgument, StringComparison.Ordinal);
+                return managementObject["CommandLine"] as string;
             }
         }
         catch (Exception ex)
@@ -140,6 +256,6 @@ public sealed class VrchatProcessMonitor : IVrchatProcessMonitor
                 ex, "Failed to query command line for VRChat process {ProcessId} via WMI.", processId);
         }
 
-        return false;
+        return null;
     }
 }

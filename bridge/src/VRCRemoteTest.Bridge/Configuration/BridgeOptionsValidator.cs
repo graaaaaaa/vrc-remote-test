@@ -65,6 +65,15 @@ public sealed class BridgeOptionsValidator : IValidateOptions<BridgeOptions>
                 $"VrchatMode '{options.VrchatMode}' is invalid. Must be 'Desktop' or 'VR' (case-insensitive).");
         }
 
+        // Checked even when AutoLaunchVrchat is false (where the count is unused), so a
+        // bad value is reported before auto-launch is ever turned on.
+        if (options.VrchatClientCount is { } clientCount
+            && (clientCount < 1 || clientCount > BridgeOptions.MaxVrchatClientCount))
+        {
+            failures.Add(
+                $"VrchatClientCount must be between 1 and {BridgeOptions.MaxVrchatClientCount} (was {clientCount}).");
+        }
+
         if (options.VrchatStartupSettleDelaySeconds <= 0)
         {
             failures.Add("VrchatStartupSettleDelaySeconds must be positive.");

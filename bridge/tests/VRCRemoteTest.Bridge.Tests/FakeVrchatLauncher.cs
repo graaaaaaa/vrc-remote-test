@@ -4,25 +4,43 @@ namespace VRCRemoteTest.Bridge.Tests;
 
 internal sealed class FakeVrchatLauncher : IVrchatLauncher
 {
+    private int _nextProcessId = 5000;
+
     public bool ShouldSucceed { get; set; } = true;
-    public bool LaunchCalled { get; private set; }
-    public string? LastExecutablePath { get; private set; }
-    public string? LastMode { get; private set; }
 
-    /// <summary>Lets a test simulate side effects of a successful launch (e.g. the process monitor starting to see the process).</summary>
-    public Action? OnLaunch { get; set; }
+    /// <summary>When set, only launches with these zero-based indexes fail.</summary>
+    public HashSet<int>? FailingLaunchIndexes { get; set; }
 
-    public Task<bool> LaunchAsync(string executablePath, string mode)
+    public Exception? ThrowOnLaunch { get; set; }
+
+    public List<VrchatLaunchRequest> Requests { get; } = [];
+
+    public bool LaunchCalled => Requests.Count > 0;
+
+    /// <summary>
+    /// Lets a test simulate side effects of a successful launch (e.g. the process
+    /// monitor starting to see the process). Receives the launched PID.
+    /// </summary>
+    public Action<int>? OnLaunch { get; set; }
+
+    public Task<LaunchResult> LaunchAsync(VrchatLaunchRequest request)
     {
-        LaunchCalled = true;
-        LastExecutablePath = executablePath;
-        LastMode = mode;
+        var index = Requests.Count;
+        Requests.Add(request);
 
-        if (ShouldSucceed)
+        if (ThrowOnLaunch is not null)
         {
-            OnLaunch?.Invoke();
+            throw ThrowOnLaunch;
         }
 
-        return Task.FromResult(ShouldSucceed);
+        var succeeds = FailingLaunchIndexes is null ? ShouldSucceed : !FailingLaunchIndexes.Contains(index);
+        if (!succeeds)
+        {
+            return Task.FromResult(LaunchResult.Failure("simulated launch failure"));
+        }
+
+        var processId = _nextProcessId++;
+        OnLaunch?.Invoke(processId);
+        return Task.FromResult(LaunchResult.Success(processId, DateTime.UtcNow));
     }
 }

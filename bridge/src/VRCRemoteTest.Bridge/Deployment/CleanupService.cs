@@ -6,13 +6,13 @@ public sealed class CleanupService : ICleanupService
 
     private const string FailedArtifactPattern = "*.vrcw";
 
-    public void Cleanup(string worldsDirectory, int retainBuilds) =>
-        RetainNewest(worldsDirectory, ToolOwnedFilePattern, retainBuilds);
+    public void Cleanup(string worldsDirectory, int retainBuilds, string keepFileName) =>
+        RetainNewest(worldsDirectory, ToolOwnedFilePattern, retainBuilds, keepFileName);
 
     public void CleanupFailedArtifacts(string failedDirectory, int retainBuilds) =>
-        RetainNewest(failedDirectory, FailedArtifactPattern, retainBuilds);
+        RetainNewest(failedDirectory, FailedArtifactPattern, retainBuilds, keepFileName: null);
 
-    private static void RetainNewest(string directory, string pattern, int retainBuilds)
+    private static void RetainNewest(string directory, string pattern, int retainBuilds, string? keepFileName)
     {
         if (retainBuilds <= 0 || !Directory.Exists(directory))
         {
@@ -25,10 +25,20 @@ public sealed class CleanupService : ICleanupService
         FileInfo[] staleFiles;
         try
         {
-            staleFiles = Directory.GetFiles(directory, pattern)
-                .Select(path => new FileInfo(path))
+            var files = Directory.GetFiles(directory, pattern).Select(path => new FileInfo(path)).ToList();
+
+            // Ordering by timestamp alone could select the file just deployed when other
+            // files carry later timestamps (e.g. copied in with a skewed clock).
+            var retainOthers = retainBuilds;
+            if (keepFileName is not null
+                && files.RemoveAll(f => string.Equals(f.Name, keepFileName, StringComparison.OrdinalIgnoreCase)) > 0)
+            {
+                retainOthers--;
+            }
+
+            staleFiles = files
                 .OrderByDescending(fileInfo => fileInfo.LastWriteTimeUtc)
-                .Skip(retainBuilds)
+                .Skip(retainOthers)
                 .ToArray();
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)

@@ -12,8 +12,9 @@ namespace VRCRemoteTest.Bridge.Deployment;
 /// <summary>
 /// The Bridge's core loop. Deliberately a "file promoter", not an orchestration
 /// service: watch a staging directory, validate, atomically install into VRChat's
-/// Worlds directory, write one result file, archive or quarantine. No heartbeat, no
-/// VRChat process interaction (deferred to Phase 4). Uses periodic polling as the
+/// Worlds directory, write one result file, archive or quarantine. No heartbeat; with
+/// AutoLaunchVrchat, the VRChat side of a deploy is delegated to
+/// <see cref="IVrchatClientCoordinator"/>. Uses periodic polling as the
 /// source of truth per spec section 51; a FileSystemWatcher can be layered on later
 /// purely as a wake-up optimization without changing correctness.
 ///
@@ -53,7 +54,7 @@ public sealed class StagingWatcher : BackgroundService, IBridgeWatcher
     private readonly IWorldInstaller _installer;
     private readonly IResultWriter _resultWriter;
     private readonly ICleanupService _cleanupService;
-    private readonly IVrchatReadinessCoordinator _readinessCoordinator;
+    private readonly IVrchatClientCoordinator _clientCoordinator;
     private readonly ILogger<StagingWatcher> _logger;
 
     public StagingWatcher(
@@ -62,7 +63,7 @@ public sealed class StagingWatcher : BackgroundService, IBridgeWatcher
         IWorldInstaller installer,
         IResultWriter resultWriter,
         ICleanupService cleanupService,
-        IVrchatReadinessCoordinator readinessCoordinator,
+        IVrchatClientCoordinator clientCoordinator,
         ILogger<StagingWatcher> logger)
     {
         _options = options.Value;
@@ -70,7 +71,7 @@ public sealed class StagingWatcher : BackgroundService, IBridgeWatcher
         _installer = installer;
         _resultWriter = resultWriter;
         _cleanupService = cleanupService;
-        _readinessCoordinator = readinessCoordinator;
+        _clientCoordinator = clientCoordinator;
         _logger = logger;
     }
 
@@ -265,7 +266,9 @@ public sealed class StagingWatcher : BackgroundService, IBridgeWatcher
     /// unexpected throws (e.g. an access error hashing the snapshot): a claim stranded
     /// in processing/ is never retried by the normal scan, and an exception escaping
     /// recovery would stop the Bridge from scanning at all (Codex code review Phase 0,
-    /// Round 2). Cancellation keeps the claim for recovery at the next start.
+    /// Round 2). Cancellation keeps the claim for recovery at the next start. Once a
+    /// cold start has archived the build, the manifest stays in archive/ whatever fails
+    /// next, so the build is never deployed again.
     /// </summary>
     private async Task ProcessClaimedManifestSafelyAsync(string claimedManifestPath, CancellationToken cancellationToken)
     {
@@ -276,8 +279,15 @@ public sealed class StagingWatcher : BackgroundService, IBridgeWatcher
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
-            _logger.LogError(ex, "Unexpected error while processing {Path}; moving it to failed/.", claimedManifestPath);
-            MoveToFailed(claimedManifestPath, progress.ArtifactPath);
+            if (progress.Archived)
+            {
+                _logger.LogError(ex, "Unexpected error after archiving {Path}.", claimedManifestPath);
+            }
+            else
+            {
+                _logger.LogError(ex, "Unexpected error while processing {Path}; moving it to failed/.", claimedManifestPath);
+                MoveToFailed(claimedManifestPath, progress.ArtifactPath);
+            }
 
             const string message = "Unexpected error while processing the build.";
             try
@@ -305,6 +315,9 @@ public sealed class StagingWatcher : BackgroundService, IBridgeWatcher
         public string? BuildId { get; set; }
 
         public string? ArtifactPath { get; set; }
+
+        /// <summary>Set only once the move into archive/ is known to have succeeded.</summary>
+        public bool Archived { get; set; }
     }
 
     private async Task ProcessClaimedManifestAsync(
@@ -456,12 +469,12 @@ public sealed class StagingWatcher : BackgroundService, IBridgeWatcher
             return;
         }
 
+        var preparation = VrchatPreparation.DeployOnly();
         if (_options.AutoLaunchVrchat)
         {
-            ReadinessResult readiness;
             try
             {
-                readiness = await _readinessCoordinator.EnsureReadyAsync(cancellationToken);
+                preparation = await _clientCoordinator.PrepareAsync(cancellationToken);
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
@@ -477,24 +490,43 @@ public sealed class StagingWatcher : BackgroundService, IBridgeWatcher
                 return;
             }
 
-            if (!readiness.IsReady)
+            if (preparation.Kind == VrchatPreparationKind.Failed)
             {
                 _logger.LogWarning(
                     "Build {BuildId}: VRChat readiness check failed: {Code} {Message}",
-                    manifest.BuildId, readiness.ErrorCode, readiness.ErrorMessage);
+                    manifest.BuildId, preparation.ErrorCode, preparation.ErrorMessage);
                 MoveToFailed(claimedManifestPath, artifactPath);
                 _resultWriter.WriteFailure(
-                    manifest.BuildId, readiness.ErrorCode!, readiness.ErrorMessage!, ResultsDir);
+                    manifest.BuildId, preparation.ErrorCode!, preparation.ErrorMessage!, ResultsDir);
                 return;
             }
         }
 
+        string deployedFileName;
         try
         {
-            var deployedFileName = _installer.Install(artifactPath, manifest.BuildId, _options.VrchatWorldsDirectory);
+            deployedFileName = _installer.Install(artifactPath, manifest.BuildId, _options.VrchatWorldsDirectory);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            _logger.LogError(ex, "Deploy failed for build {BuildId}.", manifest.BuildId);
+            MoveToFailed(claimedManifestPath, artifactPath);
+            _resultWriter.WriteFailure(manifest.BuildId, ErrorCode.DeployFailed, ex.Message, ResultsDir);
+            return;
+        }
+
+        if (preparation.Kind == VrchatPreparationKind.ColdStart)
+        {
+            await LaunchAfterDeployAsync(
+                claimedManifestPath, artifactPath, manifest, deployedFileName, progress, cancellationToken);
+            return;
+        }
+
+        try
+        {
             _resultWriter.WriteSuccess(manifest.BuildId, deployedFileName, manifest.Sha256, ResultsDir);
-            ArchiveProcessed(claimedManifestPath, artifactPath, manifest.BuildId);
-            _cleanupService.Cleanup(_options.VrchatWorldsDirectory, _options.RetainBuilds);
+            TryArchiveProcessed(claimedManifestPath, artifactPath, manifest.BuildId);
+            _cleanupService.Cleanup(_options.VrchatWorldsDirectory, _options.RetainBuilds, deployedFileName);
             _logger.LogInformation("Build {BuildId} deployed as {DeployedFileName}.", manifest.BuildId, deployedFileName);
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
@@ -503,6 +535,64 @@ public sealed class StagingWatcher : BackgroundService, IBridgeWatcher
             MoveToFailed(claimedManifestPath, artifactPath);
             _resultWriter.WriteFailure(manifest.BuildId, ErrorCode.DeployFailed, ex.Message, ResultsDir);
         }
+    }
+
+    /// <summary>
+    /// Cold start: the build is installed, archived, and only then are the clients
+    /// launched with --url pointing at the installed file. Archiving first is what keeps
+    /// a Bridge that stops mid-launch from deploying the build again on restart (which
+    /// would reload the clients that did start); the result is then never written and
+    /// Unity reports RESULT_TIMEOUT. If the archive cannot be confirmed, nothing is
+    /// launched and the build fails the same way as an unexpected error (multi-client
+    /// plan section 13.1). The installed file stays in Worlds either way, and nothing
+    /// is reading it until a client starts.
+    /// </summary>
+    private async Task LaunchAfterDeployAsync(
+        string claimedManifestPath,
+        string artifactPath,
+        BuildManifest manifest,
+        string deployedFileName,
+        ClaimProgress progress,
+        CancellationToken cancellationToken)
+    {
+        if (!TryArchiveProcessed(claimedManifestPath, artifactPath, manifest.BuildId))
+        {
+            MoveToFailed(claimedManifestPath, artifactPath);
+            _resultWriter.WriteFailure(
+                manifest.BuildId,
+                ErrorCode.UnknownError,
+                "The build was installed but could not be recorded as processed, so VRChat was not launched.",
+                ResultsDir);
+            return;
+        }
+
+        progress.Archived = true;
+
+        var deployedWorldPath = Path.GetFullPath(Path.Combine(_options.VrchatWorldsDirectory, deployedFileName));
+        VrchatLaunchOutcome outcome;
+        try
+        {
+            outcome = await _clientCoordinator.LaunchClientsAsync(deployedWorldPath, cancellationToken);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _logger.LogError(ex, "Unexpected error while launching VRChat for build {BuildId}.", manifest.BuildId);
+            outcome = VrchatLaunchOutcome.Failure(ex.Message);
+        }
+
+        if (outcome.Succeeded)
+        {
+            _resultWriter.WriteSuccess(manifest.BuildId, deployedFileName, manifest.Sha256, ResultsDir);
+            _logger.LogInformation(
+                "Build {BuildId} deployed as {DeployedFileName} and VRChat launched with it.",
+                manifest.BuildId, deployedFileName);
+        }
+        else
+        {
+            _resultWriter.WriteFailure(manifest.BuildId, ErrorCode.VrchatStartFailed, outcome.ErrorMessage!, ResultsDir);
+        }
+
+        _cleanupService.Cleanup(_options.VrchatWorldsDirectory, _options.RetainBuilds, deployedFileName);
     }
 
     /// <summary>
@@ -660,13 +750,21 @@ public sealed class StagingWatcher : BackgroundService, IBridgeWatcher
     /// <summary>
     /// Only the manifest is needed for idempotency; the artifact already lives in the
     /// Worlds directory (bounded by RetainBuilds), so keeping a second copy here would
-    /// only grow private state without limit.
+    /// only grow private state without limit. The snapshot is only removed once the
+    /// manifest reached archive/ (otherwise recovery redeploys from it), and a failed
+    /// move is reported to the caller instead of only logged: a cold start must not
+    /// launch VRChat for a build that recovery would deploy again.
     /// </summary>
-    private void ArchiveProcessed(string manifestPath, string artifactPath, string buildId)
+    private bool TryArchiveProcessed(string manifestPath, string artifactPath, string buildId)
     {
         var archivedManifest = Path.Combine(ArchiveDir, $"{buildId}{ProtocolConstants.ManifestExtension}");
-        SafeMove(manifestPath, archivedManifest);
+        if (!SafeMove(manifestPath, archivedManifest))
+        {
+            return false;
+        }
+
         SafeDelete(artifactPath);
+        return true;
     }
 
     private void MoveToFailed(string manifestPath, string? artifactPath)
@@ -687,7 +785,8 @@ public sealed class StagingWatcher : BackgroundService, IBridgeWatcher
         }
     }
 
-    private void SafeMove(string source, string destination)
+    /// <summary>Returns false (after logging) when the move did not happen.</summary>
+    private bool SafeMove(string source, string destination)
     {
         try
         {
@@ -697,10 +796,12 @@ public sealed class StagingWatcher : BackgroundService, IBridgeWatcher
             }
 
             File.Move(source, destination);
+            return true;
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
             _logger.LogError(ex, "Failed to move {Source} to {Destination}.", source, destination);
+            return false;
         }
     }
 

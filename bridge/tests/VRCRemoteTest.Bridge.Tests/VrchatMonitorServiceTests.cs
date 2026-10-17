@@ -25,7 +25,8 @@ public class VrchatMonitorServiceTests
     [Fact]
     public async Task Writes_status_to_the_configured_staging_directorys_status_subfolder()
     {
-        var processMonitor = new FakeVrchatProcessMonitor { IsRunning = true, WatchWorldsDetected = true };
+        var processMonitor = new FakeVrchatProcessMonitor();
+        processMonitor.AddClient(1234, DateTime.UtcNow);
         var statusWriter = new FakeVrchatStatusWriter();
         var service = CreateService(processMonitor, statusWriter, @"C:\VRCRemoteTest");
 

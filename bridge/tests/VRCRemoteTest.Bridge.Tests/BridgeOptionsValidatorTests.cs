@@ -291,6 +291,53 @@ public class BridgeOptionsValidatorTests : IDisposable
     }
 
     [Theory]
+    [InlineData(1)]
+    [InlineData(4)]
+    public void VrchatClientCount_accepts_one_to_four(int clientCount)
+    {
+        var options = ValidBaseOptions();
+        options.VrchatClientCount = clientCount;
+
+        _validator.Validate(name: null, options).Succeeded.Should().BeTrue();
+        options.ResolvedVrchatClientCount.Should().Be(clientCount);
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(5)]
+    [InlineData(-1)]
+    public void VrchatClientCount_rejects_values_outside_one_to_four(int clientCount)
+    {
+        var options = ValidBaseOptions();
+        options.VrchatClientCount = clientCount;
+
+        var result = _validator.Validate(name: null, options);
+
+        result.Failed.Should().BeTrue();
+        result.Failures.Should().Contain(f => f.Contains("VrchatClientCount"));
+    }
+
+    [Fact]
+    public void An_omitted_VrchatClientCount_means_one_client()
+    {
+        var options = ValidBaseOptions();
+
+        _validator.Validate(name: null, options).Succeeded.Should().BeTrue();
+        options.VrchatClientCount.Should().BeNull();
+        options.ResolvedVrchatClientCount.Should().Be(1);
+    }
+
+    [Fact]
+    public void A_VrchatClientCount_above_one_is_allowed_without_AutoLaunchVrchat()
+    {
+        var options = ValidBaseOptions();
+        options.AutoLaunchVrchat = false;
+        options.VrchatClientCount = 2;
+
+        _validator.Validate(name: null, options).Succeeded.Should().BeTrue();
+    }
+
+    [Theory]
     [InlineData("")]
     [InlineData("   ")]
     public void Fails_when_StateDirectory_is_blank(string stateDirectory)
