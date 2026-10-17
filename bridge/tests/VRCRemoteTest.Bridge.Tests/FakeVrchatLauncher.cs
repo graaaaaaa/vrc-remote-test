@@ -15,6 +15,12 @@ internal sealed class FakeVrchatLauncher : IVrchatLauncher
 
     public List<VrchatLaunchRequest> Requests { get; } = [];
 
+    /// <summary>Source of the creation time reported for each started process.</summary>
+    public Func<DateTime> Clock { get; set; } = () => DateTime.UtcNow;
+
+    /// <summary>The processes that started, in launch order.</summary>
+    public List<(int ProcessId, DateTime CreationTimeUtc)> Launched { get; } = [];
+
     public bool LaunchCalled => Requests.Count > 0;
 
     /// <summary>
@@ -40,7 +46,9 @@ internal sealed class FakeVrchatLauncher : IVrchatLauncher
         }
 
         var processId = _nextProcessId++;
+        var creationTimeUtc = Clock();
+        Launched.Add((processId, creationTimeUtc));
         OnLaunch?.Invoke(processId);
-        return Task.FromResult(LaunchResult.Success(processId, DateTime.UtcNow));
+        return Task.FromResult(LaunchResult.Success(processId, creationTimeUtc));
     }
 }

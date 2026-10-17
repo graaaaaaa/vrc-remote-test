@@ -227,14 +227,43 @@ public class VrchatLogReaderTests : IDisposable
     }
 
     [Fact]
-    public void ReadSnapshot_reports_the_diagnostic_once_the_client_is_past_the_grace_period()
+    public void ReadSnapshot_says_the_log_is_not_there_yet_once_the_client_is_past_the_grace_period()
     {
+        var previous = WriteLogFor(DateTime.UtcNow.AddMinutes(-5), "previous session line\n");
         _monitor.AddClient(100, DateTime.UtcNow.AddSeconds(-11));
 
         var result = CreateReader().ReadSnapshot();
 
         result.IsAvailable.Should().BeTrue();
-        result.Content.Should().Contain("Could not match");
+        result.Content.Should().Contain("has not created its output_log_*.txt file yet").And.Contain("PID 100")
+            .And.Contain("heavy CPU load").And.NotContain("previous session line");
+        File.Exists(previous).Should().BeTrue();
+    }
+
+    [Fact]
+    public void ReadSnapshot_stops_saying_not_yet_once_no_file_can_be_named_in_the_clients_range()
+    {
+        _monitor.AddClient(100, DateTime.UtcNow.AddSeconds(-61));
+
+        var result = CreateReader().ReadSnapshot();
+
+        result.Content.Should().Contain("Could not match").And.NotContain("yet");
+    }
+
+    [Fact]
+    public void ReadSnapshot_matches_a_log_created_seconds_after_the_time_in_its_name()
+    {
+        // Under heavy load VRChat created output_log_..._18-04-10.txt at 18:04:11.
+        var path = WriteLogFor(T0.AddSeconds(20), "first client line\n");
+        _monitor.AddClient(100, T0);
+        var reader = new VrchatLogReader(
+            Options.Create(new BridgeOptions { VrchatWorldsDirectory = _worldsDir }),
+            _monitor,
+            NullLogger<VrchatLogReader>.Instance,
+            p => CreationTimeFromName(p).AddSeconds(5));
+
+        reader.ReadSnapshot().Content.Should().Contain("first client line");
+        File.Exists(path).Should().BeTrue();
     }
 
     [Fact]

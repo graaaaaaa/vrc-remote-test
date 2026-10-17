@@ -28,10 +28,8 @@ namespace VRCRemoteTest.Bridge.VRChat;
 /// </summary>
 public sealed class VrchatLogReader : IVrchatLogReader
 {
-    private const string OutputLogPattern = VrchatLogMatcher.FileNamePrefix + "*" + VrchatLogMatcher.FileNameSuffix;
-
-    /// <summary>Directory enumeration cap (Codex plan review Phase 5, Round 2, confidence 0.87).</summary>
-    private const int MaxDirectoryScan = 512;
+    private const string OutputLogPattern = VrchatLogDirectory.OutputLogPattern;
+    private const int MaxDirectoryScan = VrchatLogDirectory.MaxDirectoryScan;
 
     private const int SnapshotBytes = 256 * 1024;
     private const int PublishedLineLimit = 200;
@@ -51,7 +49,9 @@ public sealed class VrchatLogReader : IVrchatLogReader
     /// hardware without load (docs/validation/multi-client-spike.md, PR #2 verification),
     /// so the first 5-second poll after a cold start usually finds no file yet. Until
     /// the first client is this old, an unmatched log publishes nothing instead of a
-    /// diagnostic. Under heavy load the file took 11-22 s, and the diagnostic then shows.
+    /// diagnostic. Under heavy load the file took 11-22 s; past this grace, and while the
+    /// file could still be named in the client's range, the diagnostic says the log is
+    /// not there yet rather than that it cannot be matched.
     /// </summary>
     private static readonly TimeSpan LogCreationGrace = TimeSpan.FromSeconds(10);
 
@@ -87,16 +87,7 @@ public sealed class VrchatLogReader : IVrchatLogReader
         _creationTimeUtc = creationTimeUtc;
     }
 
-    /// <summary>
-    /// Derived from VrchatWorldsDirectory's parent (...\VRChat\VRChat\Worlds ->
-    /// ...\VRChat\VRChat, where output_log_*.txt lives), matching the derivation
-    /// approach considered (and left unimplemented) in Phase 4.1. No new
-    /// BridgeOptions property is added; failure to derive degrades gracefully.
-    /// </summary>
-    private string? LogDirectory =>
-        string.IsNullOrWhiteSpace(_options.VrchatWorldsDirectory)
-            ? null
-            : Directory.GetParent(_options.VrchatWorldsDirectory)?.FullName;
+    private string? LogDirectory => VrchatLogDirectory.Resolve(_options);
 
     public LogSnapshotResult ReadSnapshot()
     {
@@ -171,23 +162,36 @@ public sealed class VrchatLogReader : IVrchatLogReader
         }
 
         // A VRChat that could not be checked might own any file in the range.
-        var match = snapshot.UnverifiedCount == 0
-            ? VrchatLogMatcher.Match(client, snapshot.Clients, candidates, TimeZoneInfo.Local)
-            : null;
-        if (match is null)
+        var result = snapshot.UnverifiedCount == 0
+            ? VrchatLogMatcher.Evaluate(client, snapshot.Clients, candidates, TimeZoneInfo.Local)
+            : new VrchatLogMatcher.MatchResult(null, VrchatLogMatcher.MatchFailure.Ambiguous);
+        if (result.Path is not { } match)
         {
-            if (client.CreationTimeUtc is { } justStarted && DateTime.UtcNow - justStarted < LogCreationGrace)
+            var age = client.CreationTimeUtc is { } created ? DateTime.UtcNow - created : (TimeSpan?)null;
+            if (age < LogCreationGrace)
             {
                 return LogSnapshotResult.Empty();
             }
 
-            var started = client.CreationTimeUtc is { } created
-                ? $"started {created:yyyy-MM-dd HH:mm:ss}Z"
+            var started = client.CreationTimeUtc is { } startedUtc
+                ? $"started {startedUtc:yyyy-MM-dd HH:mm:ss}Z"
                 : "start time unknown";
+
+            // Past MaxRangeLength after the start, a new file can no longer be named in the
+            // client's range, so "not yet" would never end; the generic message applies.
+            if (result.Failure == VrchatLogMatcher.MatchFailure.NoFileYet && age < VrchatLogMatcher.MaxRangeLength)
+            {
+                return Unmatched(
+                    $"The first VRChat client (PID {client.ProcessId}, {started}) has not created its " +
+                    $"{OutputLogPattern} file yet; under heavy CPU load this can take 20 seconds or more. " +
+                    "Its log is shown once it appears.");
+            }
+
             return Unmatched(
                 $"Could not match an {OutputLogPattern} file to the first VRChat client " +
                 $"(PID {client.ProcessId}, {started}); " +
-                "not showing another client's log instead. This happens when clients start within the same second, " +
+                "not showing another client's log instead. This happens when clients start within the same second " +
+                "or write to one shared file, when VRChat created the log a minute or more after the client started, " +
                 "or when the clock or time zone changed after the log was created.");
         }
 
@@ -244,38 +248,8 @@ public sealed class VrchatLogReader : IVrchatLogReader
     }
 
     /// <summary>Same bounded scan as <see cref="FindNewestOutputLog"/>; unreadable files are skipped.</summary>
-    private (List<VrchatLogMatcher.Candidate> Candidates, bool ScanCapped) ListCandidates(string logDirectory)
-    {
-        var candidates = new List<VrchatLogMatcher.Candidate>();
-        var scanned = 0;
-
-        foreach (var path in Directory.EnumerateFiles(logDirectory, OutputLogPattern))
-        {
-            if (scanned == MaxDirectoryScan)
-            {
-                return ([], true);
-            }
-
-            scanned++;
-
-            var nameTime = VrchatLogMatcher.ParseNameTime(Path.GetFileName(path));
-            if (nameTime is null)
-            {
-                continue;
-            }
-
-            try
-            {
-                candidates.Add(new VrchatLogMatcher.Candidate(path, nameTime, _creationTimeUtc(path)));
-            }
-            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
-            {
-                // Unreadable now; the next poll looks again.
-            }
-        }
-
-        return (candidates, false);
-    }
+    private (List<VrchatLogMatcher.Candidate> Candidates, bool ScanCapped) ListCandidates(string logDirectory) =>
+        VrchatLogDirectory.ListCandidates(logDirectory, _creationTimeUtc);
 
     private readonly record struct ClientKey(int ProcessId, DateTime? CreationTimeUtc);
 

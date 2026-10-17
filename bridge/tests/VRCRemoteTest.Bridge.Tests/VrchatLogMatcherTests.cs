@@ -128,11 +128,11 @@ public class VrchatLogMatcherTests
     }
 
     [Theory]
-    [InlineData(-2, true)]
-    [InlineData(2, true)]
-    [InlineData(-3, false)]
-    [InlineData(3, false)]
-    public void A_file_whose_name_disagrees_with_its_creation_time_by_more_than_two_seconds_is_not_used(
+    [InlineData(-10, true)]
+    [InlineData(10, true)]
+    [InlineData(-11, false)]
+    [InlineData(11, false)]
+    public void A_file_whose_name_disagrees_with_its_creation_time_by_more_than_ten_seconds_is_not_used(
         int skewSeconds, bool used)
     {
         var client = Client(1, T0.AddMilliseconds(100));
@@ -166,6 +166,87 @@ public class VrchatLogMatcherTests
         var match = VrchatLogMatcher.Match(client, [client], [file], TimeZoneInfo.Utc);
 
         (match is not null).Should().Be(matched);
+    }
+
+    [Fact]
+    public void Evaluate_tells_a_file_not_created_yet_from_one_it_cannot_attribute()
+    {
+        var first = Client(1, T0.AddMilliseconds(100));
+        var second = Client(2, T0.AddMilliseconds(700));
+        var shared = File(T0, TimeZoneInfo.Utc);
+        var earlierSession = File(T0.AddMinutes(-5), TimeZoneInfo.Utc);
+
+        VrchatLogMatcher.Evaluate(first, [first], [earlierSession], TimeZoneInfo.Utc).Failure
+            .Should().Be(VrchatLogMatcher.MatchFailure.NoFileYet);
+        VrchatLogMatcher.Evaluate(first, [first, second], [shared], TimeZoneInfo.Utc).Failure
+            .Should().Be(VrchatLogMatcher.MatchFailure.NoFileInRange, "the shared file is named in the second's range only");
+        VrchatLogMatcher.Evaluate(first, [first], [shared, File(T0.AddSeconds(1), TimeZoneInfo.Utc)], TimeZoneInfo.Utc)
+            .Failure.Should().Be(VrchatLogMatcher.MatchFailure.Ambiguous);
+        VrchatLogMatcher.Evaluate(Client(3, null), [first], [shared], TimeZoneInfo.Utc).Failure
+            .Should().Be(VrchatLogMatcher.MatchFailure.StartTimeUnknown);
+        VrchatLogMatcher.Evaluate(first, [first], [shared], TimeZoneInfo.Utc)
+            .Should().Be(new VrchatLogMatcher.MatchResult(shared.Path, VrchatLogMatcher.MatchFailure.None));
+    }
+
+    [Theory]
+    [InlineData(0, true)]
+    [InlineData(999, true)]
+    [InlineData(-1, false)]
+    public void A_client_started_at_EarliestNextStartUtc_or_later_leaves_the_earlier_file_to_the_earlier_client(
+        int offsetMilliseconds, bool matched)
+    {
+        var first = Client(1, T0.AddMilliseconds(100));
+        var file = File(T0.AddSeconds(20), TimeZoneInfo.Utc, createdUtc: T0.AddSeconds(20.4));
+        var nextStart = VrchatLogMatcher.EarliestNextStartUtc(T0.AddSeconds(20)).AddMilliseconds(offsetMilliseconds);
+        var second = Client(2, nextStart);
+
+        var match = VrchatLogMatcher.Match(first, [first, second], [file], TimeZoneInfo.Utc);
+
+        (match is not null).Should().Be(matched);
+    }
+
+    /// <summary>Times from docs/validation/multi-client-spike.md (PR #2, item 12), read as UTC.</summary>
+    private static DateTime At(int minute, double seconds) =>
+        new DateTime(2026, 10, 17, 18, minute, 0, DateTimeKind.Utc).AddSeconds(seconds);
+
+    [Fact]
+    public void Hardware_run_1_under_load_without_waiting_for_logs_leaves_the_first_client_unmatched()
+    {
+        // 4 clients launched without waiting; the first two logs were both created at 18:04:11.
+        List<VrchatClientInfo> clients =
+        [
+            Client(1, At(3, 59.922)), Client(2, At(4, 7.608)), Client(3, At(4, 13.077)), Client(4, At(4, 16.093)),
+        ];
+        var files = new[]
+        {
+            File(At(4, 10), TimeZoneInfo.Utc, createdUtc: At(4, 11.5)),
+            File(At(4, 11), TimeZoneInfo.Utc, createdUtc: At(4, 11.5)),
+            File(At(4, 13), TimeZoneInfo.Utc, createdUtc: At(4, 13.8)),
+            File(At(4, 16), TimeZoneInfo.Utc, createdUtc: At(4, 16.85)),
+        };
+
+        VrchatLogMatcher.Evaluate(clients[0], clients, files, TimeZoneInfo.Utc).Failure
+            .Should().Be(VrchatLogMatcher.MatchFailure.NoFileInRange, "client 1's log is named after client 2 started");
+    }
+
+    [Fact]
+    public void Hardware_run_2_under_load_without_waiting_for_logs_shares_one_file_that_the_first_client_never_gets()
+    {
+        // All 4 clients wrote to output_log_..._18-05-24.txt, created 22 s after client 1 started.
+        List<VrchatClientInfo> clients =
+        [
+            Client(1, At(5, 2.222)), Client(2, At(5, 7.280)), Client(3, At(5, 14.659)), Client(4, At(5, 22.254)),
+        ];
+        var shared = File(At(5, 24), TimeZoneInfo.Utc, createdUtc: At(5, 24.442));
+
+        foreach (var client in clients.Take(3))
+        {
+            VrchatLogMatcher.Match(client, clients, [shared], TimeZoneInfo.Utc).Should().BeNull();
+        }
+
+        // A known limit: named after the last client's start, the shared file looks like
+        // that client's own log. Waiting for each log before the next launch prevents it.
+        VrchatLogMatcher.Match(clients[3], clients, [shared], TimeZoneInfo.Utc).Should().Be(shared.Path);
     }
 
     [Fact]
