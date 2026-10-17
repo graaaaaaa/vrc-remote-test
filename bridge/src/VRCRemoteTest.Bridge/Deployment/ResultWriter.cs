@@ -39,11 +39,14 @@ public sealed class ResultWriter : IResultWriter
             resultsDirectory);
     }
 
+    internal static string ResultPath(string resultsDirectory, string buildId) =>
+        Path.Combine(resultsDirectory, $"{buildId}.json");
+
     private static void Write(string buildId, BuildResult result, string resultsDirectory)
     {
         Directory.CreateDirectory(resultsDirectory);
 
-        var finalPath = Path.Combine(resultsDirectory, $"{buildId}.json");
+        var finalPath = ResultPath(resultsDirectory, buildId);
         var tempPath = Path.Combine(resultsDirectory, $"{buildId}.json.tmp");
 
         var json = JsonSerializer.Serialize(result, SerializerOptions);

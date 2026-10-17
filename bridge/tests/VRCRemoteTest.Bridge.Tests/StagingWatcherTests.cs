@@ -2,6 +2,7 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using FluentAssertions;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
 using VRCRemoteTest.Bridge.Configuration;
@@ -65,7 +66,8 @@ public class StagingWatcherTests : IDisposable
         IPackageValidator? validator = null,
         IWorldInstaller? installer = null,
         IResultWriter? resultWriter = null,
-        int? clientCount = null) =>
+        int? clientCount = null,
+        ILogger<StagingWatcher>? logger = null) =>
         new(
             Options.Create(CreateOptions(maxSize, retainBuilds, autoLaunchVrchat, clientCount)),
             validator ?? new PackageValidator(),
@@ -74,7 +76,7 @@ public class StagingWatcherTests : IDisposable
             new CleanupService(),
             clientCoordinator ?? new FakeVrchatClientCoordinator(),
             _logNotice,
-            NullLogger<StagingWatcher>.Instance);
+            logger ?? NullLogger<StagingWatcher>.Instance);
 
     /// <summary>
     /// The real coordinator over fake processes, for the multi-client integration tests.
@@ -123,9 +125,11 @@ public class StagingWatcherTests : IDisposable
         CreatedAtUtc = DateTimeOffset.UtcNow,
     };
 
+    private string ResultPath(string buildId) => Path.Combine(_stagingDir, "results", $"{buildId}.json");
+
     private BuildResult ReadResult(string buildId)
     {
-        var resultJson = File.ReadAllText(Path.Combine(_stagingDir, "results", $"{buildId}.json"));
+        var resultJson = File.ReadAllText(ResultPath(buildId));
         return JsonSerializer.Deserialize<BuildResult>(
             resultJson, new JsonSerializerOptions { PropertyNameCaseInsensitive = true })!;
     }
@@ -146,12 +150,13 @@ public class StagingWatcherTests : IDisposable
     }
 
     [Fact]
-    public async Task Does_not_reprocess_an_already_archived_build()
+    public async Task Does_not_reprocess_an_already_archived_build_and_keeps_its_result()
     {
         var watcher = CreateWatcher();
         var bytes = Encoding.UTF8.GetBytes("fake-world-bundle");
         WriteIncomingBuild(_stagingDir, "build-2", bytes);
         await watcher.RunOnceAsync(CancellationToken.None);
+        var deployed = File.ReadAllText(ResultPath("build-2"));
 
         // Simulate the same build id arriving a second time, with different bytes.
         WriteIncomingBuild(_stagingDir, "build-2", Encoding.UTF8.GetBytes("different-bundle"));
@@ -160,7 +165,168 @@ public class StagingWatcherTests : IDisposable
         Directory.GetFiles(_worldsDir, "vrc-remote-build-2*.vrcw").Should().HaveCount(1);
         File.ReadAllBytes(Path.Combine(_worldsDir, "vrc-remote-build-2.vrcw")).Should().Equal(bytes);
         Directory.GetFiles(Path.Combine(_stagingDir, "incoming")).Should().BeEmpty("the duplicate is consumed");
-        ReadResult("build-2").ErrorCode.Should().Be(ErrorCode.BuildAlreadyProcessed);
+        File.ReadAllText(ResultPath("build-2")).Should().Be(deployed, "the duplicate never replaces the result");
+        Directory.GetFiles(Path.Combine(_stateDir, "processing")).Should().BeEmpty();
+        Directory.GetFiles(Path.Combine(_stateDir, "failed")).Should().BeEmpty();
+    }
+
+    [Fact]
+    public async Task A_duplicate_of_an_archived_build_without_a_result_reports_BuildAlreadyProcessed()
+    {
+        var watcher = CreateWatcher();
+        var bytes = Encoding.UTF8.GetBytes("fake-world-bundle");
+        WriteIncomingBuild(_stagingDir, "build-noresult-dup", bytes);
+        await watcher.RunOnceAsync(CancellationToken.None);
+
+        // As after a cold start the Bridge stopped during the launch, or results/ was cleaned up.
+        File.Delete(ResultPath("build-noresult-dup"));
+        WriteIncomingBuild(_stagingDir, "build-noresult-dup", bytes);
+        await watcher.RunOnceAsync(CancellationToken.None);
+
+        ReadResult("build-noresult-dup").ErrorCode.Should().Be(ErrorCode.BuildAlreadyProcessed);
+        Directory.GetFiles(Path.Combine(_stagingDir, "incoming")).Should().BeEmpty();
+    }
+
+    /// <summary>
+    /// The 2026-10-18 case: about 10 s after a deploy, an empty file with the deployed
+    /// build's manifest name appeared in incoming/ and its MANIFEST_INVALID replaced the
+    /// deployed result. Anything under that name that cannot name a build is now dropped.
+    /// </summary>
+    [Theory]
+    [InlineData("")]
+    [InlineData("{ \"protocolVersion\": 1, \"buildI")]
+    [InlineData("{}")]
+    [InlineData("{ \"buildId\": \"not allowed\" }")]
+    public async Task A_late_unreadable_manifest_named_after_a_deployed_build_keeps_its_deployed_result(string content)
+    {
+        var logger = new ListLogger<StagingWatcher>();
+        var watcher = CreateWatcher(logger: logger);
+        WriteIncomingBuild(_stagingDir, "build-zombie", Encoding.UTF8.GetBytes("fake-world-bundle"));
+        await watcher.RunOnceAsync(CancellationToken.None);
+        var deployed = File.ReadAllText(ResultPath("build-zombie"));
+
+        File.WriteAllText(Path.Combine(_stagingDir, "incoming", "build-zombie.ready.json"), content);
+        await watcher.RunOnceAsync(CancellationToken.None);
+
+        File.ReadAllText(ResultPath("build-zombie")).Should().Be(deployed);
+        ReadResult("build-zombie").Status.Should().Be("deployed");
+        Directory.GetFiles(Path.Combine(_stagingDir, "incoming")).Should().BeEmpty("the late copy is consumed");
+        Directory.GetFiles(Path.Combine(_stateDir, "processing")).Should().BeEmpty();
+        Directory.GetFiles(Path.Combine(_stateDir, "failed")).Should().BeEmpty();
+        File.Exists(ArchivedManifest("build-zombie")).Should().BeTrue();
+        logger.Entries.Should().NotContain(e => e.Level >= LogLevel.Error);
+        logger.Entries.Should().ContainSingle(e =>
+            e.Level == LogLevel.Warning && e.Message.Contains("build-zombie was already processed"));
+    }
+
+    [Fact]
+    public async Task A_late_empty_manifest_named_after_a_failed_build_keeps_its_failure_and_quarantined_manifest()
+    {
+        var watcher = CreateWatcher();
+        var incoming = Path.Combine(_stagingDir, "incoming");
+        Directory.CreateDirectory(incoming);
+        var artifactBytes = Encoding.UTF8.GetBytes("corrupted-data");
+        File.WriteAllBytes(Path.Combine(incoming, "build-failed-zombie.vrcw"), artifactBytes);
+        var manifest = ManifestFor("build-failed-zombie", Encoding.UTF8.GetBytes("expected-data"));
+        var manifestJson = JsonSerializer.Serialize(new BuildManifest
+        {
+            ProtocolVersion = manifest.ProtocolVersion,
+            BuildId = manifest.BuildId,
+            FileName = manifest.FileName,
+            Size = artifactBytes.Length,
+            Sha256 = manifest.Sha256, // hash of different content
+            CreatedAtUtc = manifest.CreatedAtUtc,
+        });
+        File.WriteAllText(Path.Combine(incoming, "build-failed-zombie.ready.json"), manifestJson);
+        await watcher.RunOnceAsync(CancellationToken.None);
+        ReadResult("build-failed-zombie").ErrorCode.Should().Be(ErrorCode.HashMismatch);
+
+        File.WriteAllText(Path.Combine(incoming, "build-failed-zombie.ready.json"), string.Empty);
+        await watcher.RunOnceAsync(CancellationToken.None);
+
+        ReadResult("build-failed-zombie").ErrorCode.Should().Be(ErrorCode.HashMismatch);
+        File.ReadAllText(Path.Combine(_stateDir, "failed", "build-failed-zombie.ready.json"))
+            .Should().Be(manifestJson, "the quarantined manifest is not replaced by the empty copy");
+        Directory.GetFiles(incoming).Should().BeEmpty();
+    }
+
+    [Fact]
+    public async Task A_late_oversized_manifest_named_after_a_deployed_build_keeps_its_deployed_result()
+    {
+        var watcher = CreateWatcher();
+        WriteIncomingBuild(_stagingDir, "build-big-zombie", Encoding.UTF8.GetBytes("fake-world-bundle"));
+        await watcher.RunOnceAsync(CancellationToken.None);
+
+        File.WriteAllText(
+            Path.Combine(_stagingDir, "incoming", "build-big-zombie.ready.json"),
+            new string(' ', StagingWatcher.MaxManifestBytes + 1));
+        await watcher.RunOnceAsync(CancellationToken.None);
+
+        ReadResult("build-big-zombie").Status.Should().Be("deployed");
+        Directory.GetFiles(Path.Combine(_stagingDir, "incoming")).Should().BeEmpty();
+    }
+
+    [Fact]
+    public async Task Recovery_drops_a_late_unreadable_manifest_named_after_a_deployed_build()
+    {
+        var watcher = CreateWatcher();
+        WriteIncomingBuild(_stagingDir, "build-zombie-crash", Encoding.UTF8.GetBytes("fake-world-bundle"));
+        await watcher.RunOnceAsync(CancellationToken.None);
+
+        // The Bridge stopped right after claiming the late copy.
+        File.WriteAllText(Path.Combine(_stateDir, "processing", "build-zombie-crash.ready.json"), string.Empty);
+        await CreateWatcher().RecoverProcessingAsync(CancellationToken.None);
+
+        ReadResult("build-zombie-crash").Status.Should().Be("deployed");
+        Directory.GetFiles(Path.Combine(_stateDir, "processing")).Should().BeEmpty();
+        Directory.GetFiles(Path.Combine(_stateDir, "failed")).Should().BeEmpty();
+    }
+
+    [Fact]
+    public async Task An_empty_manifest_for_a_new_build_is_still_reported_as_invalid()
+    {
+        var watcher = CreateWatcher();
+        var incoming = Path.Combine(_stagingDir, "incoming");
+        Directory.CreateDirectory(incoming);
+        File.WriteAllText(Path.Combine(incoming, "build-empty.ready.json"), string.Empty);
+
+        await watcher.RunOnceAsync(CancellationToken.None);
+
+        ReadResult("build-empty").ErrorCode.Should().Be(ErrorCode.ManifestInvalid);
+        File.Exists(Path.Combine(_stateDir, "failed", "build-empty.ready.json")).Should().BeTrue();
+        Directory.GetFiles(incoming).Should().BeEmpty();
+    }
+
+    [Fact]
+    public async Task A_duplicate_with_a_path_traversal_file_name_never_touches_the_file_it_points_at()
+    {
+        // The duplicate check now runs before the file name is validated, so the shared
+        // artifact it consumes must still be a safe basename.
+        var watcher = CreateWatcher();
+        var bytes = Encoding.UTF8.GetBytes("fake-world-bundle");
+        WriteIncomingBuild(_stagingDir, "build-dup-traversal", bytes);
+        await watcher.RunOnceAsync(CancellationToken.None);
+
+        var victimPath = Path.Combine(_stagingDir, "victim.vrcw");
+        File.WriteAllBytes(victimPath, bytes);
+        var duplicate = ManifestFor("build-dup-traversal", bytes);
+        File.WriteAllText(
+            Path.Combine(_stagingDir, "incoming", "build-dup-traversal.ready.json"),
+            JsonSerializer.Serialize(new BuildManifest
+            {
+                ProtocolVersion = duplicate.ProtocolVersion,
+                BuildId = duplicate.BuildId,
+                FileName = "../victim.vrcw", // incoming/../victim.vrcw == _stagingDir/victim.vrcw
+                Size = duplicate.Size,
+                Sha256 = duplicate.Sha256,
+                CreatedAtUtc = duplicate.CreatedAtUtc,
+            }));
+
+        await watcher.RunOnceAsync(CancellationToken.None);
+
+        File.ReadAllBytes(victimPath).Should().Equal(bytes);
+        ReadResult("build-dup-traversal").Status.Should().Be("deployed");
+        Directory.GetFiles(Path.Combine(_stagingDir, "incoming")).Should().BeEmpty();
     }
 
     [Fact]
@@ -1169,11 +1335,11 @@ public class StagingWatcherTests : IDisposable
         Directory.GetFiles(Path.Combine(_stateDir, "failed")).Should().BeEmpty("an archived build is never quarantined");
         File.Exists(DeployedPath("build-halfstart")).Should().BeTrue();
 
-        // Sending the same build again does not deploy it again.
+        // Sending the same build again neither deploys it again nor replaces its result.
         WriteIncomingBuild(_stagingDir, "build-halfstart", bytes);
         await watcher.RunOnceAsync(CancellationToken.None);
 
-        ReadResult("build-halfstart").ErrorCode.Should().Be(ErrorCode.BuildAlreadyProcessed);
+        ReadResult("build-halfstart").ErrorCode.Should().Be(ErrorCode.VrchatStartFailed);
         launcher.Requests.Should().HaveCount(2);
     }
 
