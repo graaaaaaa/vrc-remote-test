@@ -593,6 +593,31 @@ PR #19（Relaunch の起動し直しのあいだ、Log Viewer の写しを「The
 
 後片付け: VRChat と観察用のプロセスを止め、`config.json` は確認前の値に戻し、Bridge は確認前の main `c9b1cd1` のビルド（SHA-256 `210804F9…`）に戻した。戻すとき、タスクを止めて Bridge のプロセスが消えたのを確かめた直後に、`install-bridge.ps1` の最後の置き換えが1回 `"Move" ... Access to the path is denied.` で失敗した。入っていた exe もタスクも変わっておらず、すぐに入れ直すと成功した。プロセスが終わった直後は、exe の置き換えがまだ拒否されることがあるらしい。
 
+#### Unity の Log Viewer と残りの確認（2026-10-18 00:36〜00:46）
+
+PR #19 のマージ後、main `b09d3f3` のビルド（SHA-256 `19CB492F6BA8674EA319FE74BC99DC22AA7C4E18137EB2147010C26AAFC2EB80`）で、Windows だけでは見られなかった Unity の表示と、残りの失敗の経路を確かめた。`config.json` は `VrchatClientMode: "Relaunch"`、`VrchatProfiles: [0, 1]`。Windows の写しは 0.25 秒ごとに読み、変わり目を記録した（時刻は Windows の JST）。Mac は Unity 2022.3.22f1 の Vrc-remote-test プロジェクト（パッケージ v0.4.0）で、VRC Remote Test ウィンドウの VRChat Log（フィルター All、Auto Refresh オン）を、画面を操作して見た。
+
+| 確認 | 結果 | 記録 |
+|------|------|------|
+| 準備の配置（記録の台はもう終了していた） | 合格 | 00:36:31.133 に写しが1行になり、`Launched 1/2` は 31.156。前の確認の「記録の2台がもう終了している配置」と同じ順 |
+| 台を閉じたあとに配置が失敗したとき | 合格 | Worlds への Bridge のユーザーの書き込みを ACL で拒否して送った（00:36:50.773）。`Closing`（00:36:54.255）と同時（54.248）に写しが1行になり、`Closed`（56.301、2.0 秒、0 forced）のあと `DEPLOY_FAILED`（`Access to the path '...Worlds\.vrc-remote-20261017T153650777Z-1051c583.vrcw.tmp' is denied.`、送ってから 5.5 秒）。`[ERR] Deploy failed`（56.316）の 0.011 秒後（56.327）に、写しは1行から最新のファイル（`output_log_2026-10-18_00-36-34.txt`、VRChat は1台も動いていない）に戻った |
+| その次の配置（記録が空） | 想定どおり | 拒否を外して送り直すと（00:37:08.778）、5.7 秒で `deployed`。`Launched 1/2` 00:37:11.385（PID 27960）、`2/2` 14.518、`Showing` 16.507。失敗の前に記録を `[]` に書き直しているので、この配置は記録が空のコールドスタートで、1行は出ず、前のログが1台目の起動から 5.1 秒残った（仕様書 §35.3 の「記録が空の配置」） |
+| Windows からの模擬アップロード（3回） | 合格 | 3回とも `deployed`。写しは `Closing` と同時に1行 →（1.5〜2.0 秒後）`Launched 1/2` の 0.03〜0.05 秒後に `has not created ...` → `Showing` でそのログ。1回目は `Closing` 00:41:19.885、`Launched 1/2` 21.947（PID 17104）、`Showing` 27.104。2回目は 00:41:55.133、56.675（PID 28100）、00:42:01.845。3回目は 00:42:29.786、31.322（PID 22604）、36.494。Unity では、1回目と3回目で、前のログ → `The first VRChat client (PID 17104 / 22604, ...) has not created its output_log_*.txt file yet ...` → 新しい1台目のログ、の順に変わるのを見た（2回目は観察の切れ目）。1行そのものは Unity に出なかった（下の「気づいたこと」1） |
+| Unity の Remote Build & Test | 合格 | `VRCDefaultWorldScene` をビルドして送った（build `20261017T154501009Z-ee70bdf1`）。Bridge が受け取ったのは 00:45:04.534、`Closing` 04.552 と同時（04.553）に写しが1行、`Closed` 06.588（2.0 秒、0 forced）、`Launched 1/2` 06.606（PID 11416）、`has not created` 06.641、`Launched 2/2` 09.629、`deployed` 09.630、`Showing` 11.772。Unity では「Waiting for Bridge result...」の間に、VRChat Log に `The Bridge is relaunching its VRChat clients with the new build (VrchatClientMode: Relaunch): they are closed, the build is installed, and they are started again. The first client's log is shown once it has started.` の1行が出て、そのあと新しい1台目のログ（00:45:11〜、`local:dab8e4…` への入室）になった。Unity の Last Deployment は `Deployed as vrc-remote-20261017T154501009Z-ee70bdf1.vrcw` |
+| Unity の Deploy Last Build | 合格 | 1回目の結果の 28.6 秒後に送った（build `20261017T154538203Z-b3eed4d9`）。`Closing` 00:45:39.722 と同時に1行、`Closed` 41.249（1.5 秒、0 forced）、`Launched 1/2` 41.267（PID 5476）、`has not created` 41.307、`deployed` 44.286、`Showing` 46.422。Unity は `Deployed as vrc-remote-20261017T154538203Z-b3eed4d9.vrcw` になり、そのあと新しい1台目のログだった（途中の画面は、画面の取得に失敗して見ていない） |
+| 3c. 閉じられない台 | 未実施 | 前回と同じく、プロセスの中断に昇格したリソースモニターが要る |
+
+気づいたこと:
+
+1. Unity の Log Viewer は、写しを5秒ごとにしか読み直さない（`RemoteTestWindow.LogRefreshIntervalSeconds`）。写しが1行なのは、閉じ始めてから1台目の起動まで（ふつう 1.5〜2 秒）なので、その間に読み直しが当たった回だけ Unity に1行が出る。今回は Remote Build & Test の1回で出た。どの回でも、Unity に前のセッションのログが出ることはなかった。起動直後のウィンドウの無い台を閉じる配置（案C の 5b、約 8.7 秒）なら1行は長く出るが、Unity の操作では前の結果から1秒以内に送れないので確かめていない。
+2. 台を閉じたあとに配置が失敗すると、記録は空になる（閉じたあとに `[]` に書き直すため）。次の配置は記録が空のコールドスタートなので、1行は出ず、前のログが1台目の起動から約5秒残る。初回の配置や Reload のコールドスタートと同じ扱いで、仕様書 §35.3 どおり。
+3. Unity の Remote Build & Test は、VRChat SDK にログインしていないときと、ログインしたあとでも開いているシーンに VRCSceneDescriptor が無いとき（空の「Untitled」）に、`SDK_BUILD_FAILED: SDK builder error: Open the SDK panel to build and upload worlds` になった。どちらもビルドの前で止まり、共有には何も送られない。
+4. 起動し直しを1分ほどの間に続けると、新しい台の VRChat のログに API の 429（`whatever it is that you are doing, you are doing it too quickly. slow down!`）が出ていた（Unity の VRChat Log で見た。Windows 側では確かめていない）。入室とビルドの結果には影響しなかった。
+
+PR #20（`install-bridge.ps1` の置き換えの入れ直し）の Windows での確認も、このとき同じ exe の入れ替えで行った。結果は PR #20 に書く。
+
+後片付け: VRChat を閉じ、`config.json` を Reload（`VrchatClientMode`・`VrchatProfiles`・`VrchatClientCount` なし）に戻して Bridge を起動し直した。Bridge の exe は main `b09d3f3` のビルドのまま。Worlds の ACL は継承だけに戻した。VRChat の画面の設定（ScreenManager）は確認前の値に戻した。Windows の `dotnet test`（main `b09d3f3`）は 507 件中 504 件成功（落ちたのはシンボリックリンクの3件）。Mac の Unity では、確認のために `VRCDefaultWorldScene` を開き、VRC Remote Test のタブを広げた。
+
 ---
 
 ## Go/No-Go 判定テーブル
