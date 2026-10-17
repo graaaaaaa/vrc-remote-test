@@ -18,6 +18,9 @@ namespace VRCRemoteTest
         public const string VrchatStartTimeout = "VRCHAT_START_TIMEOUT";
         public const string VrchatWatchWorldsMissing = "VRCHAT_WATCH_WORLDS_MISSING";
 
+        // === Multi-client launch (Bridge wire codes) ===
+        public const string VrchatUnmanagedRunning = "VRCHAT_UNMANAGED_RUNNING";
+
         // === Unity-side-only codes (never sent over the wire) ===
         public const string SdkNotAvailable = "SDK_NOT_AVAILABLE";
         public const string SdkBuildFailed = "SDK_BUILD_FAILED";

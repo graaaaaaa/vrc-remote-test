@@ -49,6 +49,9 @@ namespace VRCRemoteTest
             [ErrorCode.VrchatWatchWorldsMissing] =
                 "VRChat is already running without --watch-worlds and will not be auto-restarted. " +
                 "Close it and relaunch with --watch-worlds, or use start-vrchat-dev.ps1.",
+            [ErrorCode.VrchatUnmanagedRunning] =
+                "A VRChat the Bridge could not check is running, so nothing was launched or closed. " +
+                "Close that VRChat manually on the Windows machine, then try Remote Build & Test again.",
 
             // Unity-only codes
             [ErrorCode.SdkNotAvailable] =
