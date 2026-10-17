@@ -416,17 +416,7 @@ public class StagingWatcherRelaunchTests : IDisposable
 
     private static readonly TimeSpan PublishWait = TimeSpan.FromSeconds(5);
 
-    private string? Published()
-    {
-        try
-        {
-            return File.ReadAllText(Path.Combine(_stagingDir, "logs", "vrchat-latest.log"));
-        }
-        catch (IOException)
-        {
-            return null; // not written yet, or being replaced
-        }
-    }
+    private string? Published() => PublishedFile.TryRead(Path.Combine(_stagingDir, "logs", "vrchat-latest.log"));
 
     /// <summary>
     /// The real Log Viewer loop over a fake reader, with polls an hour apart, so that only

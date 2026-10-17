@@ -132,17 +132,7 @@ public class VrchatLogServiceTests : IDisposable
 
     private string PublishedPath => Path.Combine(_tempDir, "logs", "vrchat-latest.log");
 
-    private string? Published()
-    {
-        try
-        {
-            return File.ReadAllText(PublishedPath);
-        }
-        catch (IOException)
-        {
-            return null; // not written yet, or being replaced
-        }
-    }
+    private string? Published() => PublishedFile.TryRead(PublishedPath);
 
     [Fact]
     public async Task Publishes_the_notice_instead_of_reading_the_log_while_one_is_shown()
