@@ -95,6 +95,16 @@ internal sealed class VrchatLaunchPacer
     /// it cannot attribute. Without load the files exist by the end of the interval, so
     /// the clients start 3 s apart. The total wait is bounded by <see cref="LogWaitBudget"/>;
     /// past it, the remaining clients start 3 s apart.
+    ///
+    /// The wait stays on file names although the Log Viewer now finds a client's file by
+    /// the process that has it open (<see cref="VrchatLogOwners"/>): whether two clients
+    /// share a file depends only on the seconds their logging starts in, which the names
+    /// show, and the spacing also keeps the name match working where Restart Manager does
+    /// not answer. Waiting instead for the previous client to have its file open would
+    /// tell little more, since a batch begins with no VRChat running (a cold start, or a
+    /// relaunch after the Bridge's clients were closed) and the new files are the launched
+    /// clients', and it would put a Windows-only query, and its failures, into the launch
+    /// path rather than only into the display.
     /// </summary>
     public async Task WaitBeforeNextLaunchAsync(
         Batch batch, int launched, DateTime previousLaunchUtc, CancellationToken cancellationToken)

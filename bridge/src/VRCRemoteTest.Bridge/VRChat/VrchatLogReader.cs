@@ -21,9 +21,16 @@ namespace VRCRemoteTest.Bridge.VRChat;
 /// client of <see cref="VrchatProcessMonitor.SelectRepresentative"/>, or in Relaunch mode
 /// the running client launched first according to the Bridge's record), not the most
 /// recently written file, which with several clients would switch between them on
-/// every poll. The file is matched by <see cref="VrchatLogMatcher"/> and then kept
-/// for that client (its PID and creation time) until the client exits or the file
-/// disappears; when no file can be matched, a diagnostic is published instead.
+/// every poll. Every poll asks Windows Restart Manager which processes have the recent
+/// files open (<see cref="VrchatLogOwners"/>): the file that only this client has open,
+/// among VRChat processes, is its log. When that settles nothing (Restart Manager is
+/// unavailable or fails, the client has no file open, an owner cannot be identified),
+/// the file shown on the previous poll stays, or the file is matched by the times in the
+/// names (<see cref="VrchatLogMatcher"/>) as before. Whichever rule picks it, a file that
+/// another VRChat has open, or that was once seen open by several, is never shown. The
+/// file is kept for that client (its PID and creation time) until the client exits, the
+/// file disappears, or Restart Manager finds another VRChat on it or the client on
+/// another file; when no file can be matched, a diagnostic is published instead.
 /// Only with no VRChat running is the newest file shown, so the last session's log
 /// stays readable (multi-client plan section 13.2).
 /// </summary>
@@ -50,24 +57,33 @@ public sealed class VrchatLogReader : IVrchatLogReader
     private readonly ILogger<VrchatLogReader> _logger;
     private readonly Func<string, DateTime> _creationTimeUtc;
     private readonly IManagedClientStore? _managedClients;
+    private readonly Func<string, IReadOnlyList<VrchatLogOwners.Owner>>? _queryOwners;
 
     /// <summary>Only VrchatLogService's sequential loop calls this reader, so no synchronization is needed.</summary>
     private PinnedLog? _pinned;
 
+    /// <summary>
+    /// Files Restart Manager showed open by several VRChat processes, refused even after
+    /// the other processes exit: their lines stay in the file. Dropped once the file is gone.
+    /// </summary>
+    private readonly HashSet<string> _mixedLogs = new(StringComparer.OrdinalIgnoreCase);
+
     private string? _lastReportedProblem;
+    private string? _ownerQueryProblem;
 
     public VrchatLogReader(
         IOptions<BridgeOptions> options,
         IVrchatProcessMonitor processMonitor,
         ILogger<VrchatLogReader> logger,
         IManagedClientStore managedClients)
-        : this(options, processMonitor, logger, File.GetCreationTimeUtc, managedClients)
+        : this(options, processMonitor, logger, File.GetCreationTimeUtc, DefaultOwnerQuery(), managedClients)
     {
     }
 
     /// <summary>
     /// Test-only seam: not every filesystem the tests run on can set a file's creation
-    /// time, and matching depends on it.
+    /// time, and matching depends on it. Without Restart Manager, as on a machine that is
+    /// not Windows: only the times in the names match.
     /// </summary>
     internal VrchatLogReader(
         IOptions<BridgeOptions> options,
@@ -75,15 +91,42 @@ public sealed class VrchatLogReader : IVrchatLogReader
         ILogger<VrchatLogReader> logger,
         Func<string, DateTime> creationTimeUtc,
         IManagedClientStore? managedClients = null)
+        : this(options, processMonitor, logger, creationTimeUtc, queryOwners: null, managedClients)
+    {
+    }
+
+    /// <summary>
+    /// Test-only seam for the owners too: <paramref name="queryOwners"/> stands in for
+    /// <see cref="RestartManagerFileOwners.Query"/> (null: not available) and may throw
+    /// like it. <paramref name="managedClients"/> is the Relaunch record (null: none).
+    /// </summary>
+    internal VrchatLogReader(
+        IOptions<BridgeOptions> options,
+        IVrchatProcessMonitor processMonitor,
+        ILogger<VrchatLogReader> logger,
+        Func<string, DateTime> creationTimeUtc,
+        Func<string, IReadOnlyList<VrchatLogOwners.Owner>>? queryOwners,
+        IManagedClientStore? managedClients = null)
     {
         _options = options.Value;
         _processMonitor = processMonitor;
         _logger = logger;
         _creationTimeUtc = creationTimeUtc;
         _managedClients = managedClients;
+        _queryOwners = queryOwners;
     }
 
     private string? LogDirectory => VrchatLogDirectory.Resolve(_options);
+
+    private static Func<string, IReadOnlyList<VrchatLogOwners.Owner>>? DefaultOwnerQuery()
+    {
+        if (!OperatingSystem.IsWindows())
+        {
+            return null;
+        }
+
+        return RestartManagerFileOwners.Query;
+    }
 
     public LogSnapshotResult ReadSnapshot()
     {
@@ -100,8 +143,9 @@ public sealed class VrchatLogReader : IVrchatLogReader
 
         // The pinned client keeps its log for as long as it is seen, whichever client
         // would be chosen as representative right now (e.g. while WMI cannot read its
-        // command line for one poll). Only a confirmed exit, a reused PID or a deleted
-        // file releases the pin; an observation that cannot tell keeps it.
+        // command line for one poll). Only a confirmed exit, a reused PID, a deleted
+        // file or Restart Manager (see Resolve) releases the pin; an observation that
+        // cannot tell keeps it.
         if (_pinned is { } pinned)
         {
             if (!File.Exists(pinned.Path))
@@ -117,8 +161,7 @@ public sealed class VrchatLogReader : IVrchatLogReader
                 var owner = snapshot.Clients.FirstOrDefault(c => c.ProcessId == pinned.Client.ProcessId);
                 if (owner is not null && owner.CreationTimeUtc == pinned.Client.CreationTimeUtc)
                 {
-                    _lastReportedProblem = null;
-                    return ReadLog(pinned.Path);
+                    return Resolve(logDirectory, owner, snapshot, pinned.Path);
                 }
 
                 if (owner is { CreationTimeUtc: null } || (owner is null && snapshot.UnverifiedCount > 0))
@@ -149,55 +192,226 @@ public sealed class VrchatLogReader : IVrchatLogReader
             return Unmatched("VRChat is running, but its processes could not be checked.");
         }
 
-        var clientKey = new ClientKey(client.ProcessId, client.CreationTimeUtc);
+        return Resolve(logDirectory, client, snapshot, pinnedPath: null);
+    }
+
+    /// <summary>
+    /// The log of <paramref name="client"/>, which is also the pinned client when
+    /// <paramref name="pinnedPath"/> is given: the file Restart Manager shows only it has
+    /// open, else the pinned file, else the name match. A file another VRChat has open,
+    /// or that was seen mixed, is refused whichever rule picks it.
+    /// </summary>
+    private LogSnapshotResult Resolve(
+        string logDirectory, VrchatClientInfo client, VrchatClientSnapshot snapshot, string? pinnedPath)
+    {
+        if (pinnedPath is not null && _queryOwners is null)
+        {
+            // Without Restart Manager nothing here can release the pin, as before it was asked.
+            return Show(pinnedPath);
+        }
 
         var (candidates, scanCapped) = ListCandidates(logDirectory);
         if (scanCapped)
         {
-            return ScanCapped();
+            // Nothing to check a pinned file against; it stays.
+            return pinnedPath is null ? ScanCapped() : Show(pinnedPath);
+        }
+
+        _mixedLogs.RemoveWhere(path => !File.Exists(path));
+        var ownership = QueryOwners(client, snapshot, candidates, pinnedPath);
+        if (ownership is not null)
+        {
+            RecordMixed(ownership.Mixed);
+        }
+
+        switch (ownership)
+        {
+            case { Verdict: VrchatLogOwners.Verdict.Owned, Path: { } owned } when !_mixedLogs.Contains(owned):
+                return Pin(client, owned, "the only VRChat process that has it open");
+
+            case { Verdict: VrchatLogOwners.Verdict.Owned or VrchatLogOwners.Verdict.Shared, Path: { } mixed }:
+                _pinned = null;
+                return Unmatched(
+                    $"{Path.GetFileName(mixed)}, the {OutputLogPattern} file of the first VRChat client " +
+                    $"(PID {client.ProcessId}, {Started(client)}), is or was also open by other VRChat clients, " +
+                    "which happens when their logging starts within the same second; " +
+                    "not showing the mixed log as this client's.");
+
+            case { Verdict: VrchatLogOwners.Verdict.Several }:
+                _pinned = null;
+                return Unmatched(CouldNotMatch(client));
+        }
+
+        // Restart Manager settled nothing, so the file names decide as before, except for
+        // files it showed belong to another VRChat.
+        bool Refused(string path) => _mixedLogs.Contains(path) || ownership?.Refused.Contains(path) == true;
+
+        if (pinnedPath is not null)
+        {
+            if (!Refused(pinnedPath))
+            {
+                return Show(pinnedPath);
+            }
+
+            _pinned = null;
+            _logger.LogInformation(
+                "No longer showing {Path} as the log of VRChat client {ProcessId}: another VRChat process has or had it open.",
+                pinnedPath, client.ProcessId);
         }
 
         // A VRChat that could not be checked might own any file in the range.
         var result = snapshot.UnverifiedCount == 0
             ? VrchatLogMatcher.Evaluate(client, snapshot.Clients, candidates, TimeZoneInfo.Local)
             : new VrchatLogMatcher.MatchResult(null, VrchatLogMatcher.MatchFailure.Ambiguous);
-        if (result.Path is not { } match)
+        if (result.Path is { } match)
         {
-            var started = client.CreationTimeUtc is { } created
-                ? $"started {created:yyyy-MM-dd HH:mm:ss}Z"
-                : "start time unknown";
-
-            // VRChat created its output_log 0.70-0.84 s after the process start on real
-            // hardware without load, and 11-22 s after it with the CPU at about 100%
-            // (docs/validation/multi-client-spike.md, PR #2 verification, item 12), so the
-            // first poll after a cold start usually finds no file yet. Saying so replaces the
-            // previous session's log at once: publishing nothing would leave that closed
-            // client's log on the share, shown as if it were this client's (a9292a1
-            // re-verification). Past MaxRangeLength after the start, a new file can no
-            // longer be named in the client's range, so "not yet" would never end and the
-            // generic message applies.
-            if (result.Failure == VrchatLogMatcher.MatchFailure.NoFileYet
-                && DateTime.UtcNow - client.CreationTimeUtc < VrchatLogMatcher.MaxRangeLength)
+            if (!Refused(match))
             {
-                return Unmatched(
-                    $"The first VRChat client (PID {client.ProcessId}, {started}) has not created its " +
-                    $"{OutputLogPattern} file yet. This usually takes about a second, and 20 seconds or more " +
-                    "under heavy CPU load; its log is shown once it appears.");
+                return Pin(client, match, "matched by the time in its name");
             }
 
-            return Unmatched(
-                $"Could not match an {OutputLogPattern} file to the first VRChat client " +
-                $"(PID {client.ProcessId}, {started}); " +
-                "not showing another client's log instead. This happens when clients start within the same second " +
-                "or write to one shared file, when VRChat created the log a minute or more after the client started, " +
-                "or when the clock or time zone changed after the log was created.");
+            result = new VrchatLogMatcher.MatchResult(null, VrchatLogMatcher.MatchFailure.Ambiguous);
         }
 
-        _pinned = new PinnedLog(clientKey, match);
+        if (HasNoLogYet(client, result, ownership))
+        {
+            return Unmatched(
+                $"The first VRChat client (PID {client.ProcessId}, {Started(client)}) has not created its " +
+                $"{OutputLogPattern} file yet. This usually takes about a second, and a minute or more under " +
+                "heavy CPU load; its log is shown once it appears.");
+        }
+
+        return Unmatched(CouldNotMatch(client));
+    }
+
+    /// <summary>
+    /// VRChat created its output_log 0.70-0.84 s after the process start on real hardware
+    /// without load, and with the CPU at about 100% 11-22 s after it in one session and 60 s
+    /// to about 2 min after it in another (docs/validation/multi-client-spike.md, PR #2
+    /// verification item 12 and PR #3 verification B), so the first poll after a cold start
+    /// usually finds no file yet. Saying so replaces the previous session's log at once:
+    /// publishing nothing would leave that closed client's log on the share, shown as if it
+    /// were this client's (a9292a1 re-verification).
+    ///
+    /// With Restart Manager answering that the client has no file open, "not yet" holds for
+    /// as long as no file was named after the client's start or other VRChat processes are
+    /// seen holding theirs (so VRChat does keep its log open): the file can still be
+    /// matched by its owner when it appears. Without that, past MaxRangeLength after the
+    /// start a new file can no longer be named in the client's range, so "not yet" would
+    /// never end and the generic message applies.
+    /// </summary>
+    private static bool HasNoLogYet(
+        VrchatClientInfo client, VrchatLogMatcher.MatchResult result, VrchatLogOwners.Decision? ownership)
+    {
+        var noFileNamed = result.Failure == VrchatLogMatcher.MatchFailure.NoFileYet;
+        if (ownership is { Verdict: VrchatLogOwners.Verdict.NotOwned } && (noFileNamed || ownership.AnyVrchatOwner))
+        {
+            return true;
+        }
+
+        return noFileNamed && DateTime.UtcNow - client.CreationTimeUtc < VrchatLogMatcher.MaxRangeLength;
+    }
+
+    private static string Started(VrchatClientInfo client) =>
+        client.CreationTimeUtc is { } created ? $"started {created:yyyy-MM-dd HH:mm:ss}Z" : "start time unknown";
+
+    private static string CouldNotMatch(VrchatClientInfo client) =>
+        $"Could not match an {OutputLogPattern} file to the first VRChat client " +
+        $"(PID {client.ProcessId}, {Started(client)}); " +
+        "not showing another client's log instead. This happens when clients start within the same second " +
+        "or write to one shared file, when VRChat created the log a minute or more after the client started, " +
+        "or when the clock or time zone changed after the log was created.";
+
+    /// <summary>
+    /// The owners of the files created since shortly before the client started
+    /// (<see cref="VrchatLogOwners.QueryLead"/>) and of the pinned file. Null when Restart
+    /// Manager is not available (not Windows) or fails; a failure is logged once, and so is
+    /// the recovery. With no such file there is nothing to ask, and the decision is that
+    /// the client has no file open.
+    /// </summary>
+    private VrchatLogOwners.Decision? QueryOwners(
+        VrchatClientInfo client,
+        VrchatClientSnapshot snapshot,
+        IReadOnlyList<VrchatLogMatcher.Candidate> candidates,
+        string? pinnedPath)
+    {
+        if (_queryOwners is null || client.CreationTimeUtc is not { } created)
+        {
+            return null;
+        }
+
+        var paths = candidates
+            .Where(c => c.CreationTimeUtc >= created - VrchatLogOwners.QueryLead)
+            .Select(c => c.Path)
+            .ToList();
+        if (pinnedPath is not null && !paths.Contains(pinnedPath, StringComparer.OrdinalIgnoreCase))
+        {
+            paths.Add(pinnedPath);
+        }
+
+        var files = new List<VrchatLogOwners.FileOwners>(paths.Count);
+        try
+        {
+            foreach (var path in paths)
+            {
+                files.Add(new VrchatLogOwners.FileOwners(path, _queryOwners(path)));
+            }
+        }
+        catch (Exception ex)
+        {
+            // Display only, so any failure (a Restart Manager error, a missing rstrtmgr.dll)
+            // just falls back to the names.
+            if (ex.Message != _ownerQueryProblem)
+            {
+                _logger.LogWarning(
+                    ex,
+                    "Could not ask Windows Restart Manager which processes have the VRChat logs open; " +
+                    "matching them by the times in their names instead.");
+                _ownerQueryProblem = ex.Message;
+            }
+
+            return null;
+        }
+
+        if (_ownerQueryProblem is not null && files.Count > 0)
+        {
+            _logger.LogInformation("Windows Restart Manager answers again; matching VRChat logs by their owners.");
+            _ownerQueryProblem = null;
+        }
+
+        return VrchatLogOwners.Decide(client, snapshot.Clients, files);
+    }
+
+    private void RecordMixed(IEnumerable<string> mixed)
+    {
+        foreach (var path in mixed)
+        {
+            if (_mixedLogs.Add(path))
+            {
+                _logger.LogInformation(
+                    "{Path} is open by several VRChat processes; it is not shown as any one client's log.", path);
+            }
+        }
+    }
+
+    /// <summary>Logged when the pin changes, not on every poll.</summary>
+    private LogSnapshotResult Pin(VrchatClientInfo client, string path, string reason)
+    {
+        var pin = new PinnedLog(new ClientKey(client.ProcessId, client.CreationTimeUtc), path);
+        if (pin != _pinned)
+        {
+            _pinned = pin;
+            _logger.LogInformation(
+                "Showing {Path} as the log of VRChat client {ProcessId} ({Reason}).", path, client.ProcessId, reason);
+        }
+
+        return Show(path);
+    }
+
+    private LogSnapshotResult Show(string path)
+    {
         _lastReportedProblem = null;
-        _logger.LogInformation(
-            "Showing {Path} as the log of VRChat client {ProcessId}.", match, client.ProcessId);
-        return ReadLog(match);
+        return ReadLog(path);
     }
 
     /// <summary>

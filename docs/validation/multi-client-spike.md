@@ -489,6 +489,32 @@ B の各回（ログの作成時刻は `CreationTime`、ファイルを開いて
 
 main のビルドを入れてから 20:09 まで、Bridge のログに `held open … replacing it with POSIX semantics` は出なかった。`[ERR]` と `Failed to query VRChat command lines via WMI` も0件。
 
+### PR #5 の実機確認（2026-10-17 21:17〜21:44）
+
+PR #5（Log Viewer が、1台目だけが開いている output_log を Windows の Restart Manager で選ぶ）の `67aa84f` を Windows で確かめた。PR #3 の確認の G を受けた変更。
+
+**準備**: Windows の `dotnet test` は 364 件中 361 件成功。落ちたのはシンボリックリンクの3件だけで、Restart Manager を実際に呼ぶ `RestartManagerFileOwnersTests` の3件（`Reports_this_process_while_it_holds_the_file_open_and_not_after`、`Reports_every_process_that_holds_the_file_with_its_own_name`、`The_reader_shows_the_log_its_client_holds_even_when_the_name_cannot_match`）は成功した。手順1-B と同じ `dotnet publish` で作った exe（SHA-256 `1613550733E4C787C84D30AC5EF5800C3E76A3FBA64FBCD79B8EF5C0639F0774`）を `install-bridge.ps1` で入れた（それまでの main `d8b57c0` の exe と `config.json` は `%LOCALAPPDATA%\VRCRemoteTest\pr5-test-backup-20261017-211954\` に退避）。環境は PR #3 の確認と同じ（`VrchatClientCount: 4`、settle 30 秒、Logging「完全」、模擬のアップロード、負荷は `Start-Job { while ($true) {} }` ×16）。送ったワールドは build-A と同じ `Downloads` の元のファイル。各ログを開いているプロセスは、PR #3 の G と同じく Restart Manager で調べた。
+
+| 手順 | 結果 | 記録 |
+|------|------|------|
+| 1. テスト | 合格 | 上のとおり |
+| 2. 入れ替え | 済み | 上のとおり |
+| 3. 負荷なし・4台 | 合格 | `Launched` は 21:20:28.692 / 31.699 / 34.705 / 37.713（3.0 秒間隔）、`New output_log` は 0.8 / 0.7 / 0.8 秒後。写しは1台目の起動の 0.1 秒後に `has not created its output_log_*.txt file yet` の1行になり、5.3 秒後に `Showing ...output_log_2026-10-17_21-20-29.txt as the log of VRChat client 23712 (the only VRChat process that has it open).`。送信から `deployed` まで 13.4 秒（PR #3 の A は 12.2 秒）。4つのログは、それぞれ1つの PID が開いていた（起動順に 23712、31840、6216、32336）。4台とも同じインスタンス |
+| 4. 負荷あり・4台 | 合格 | 1台目（21:32:17.742 起動）のログは 60 秒以内にできず、21:33:20.507 に `within 60s` の警告のあと残りの3台を起動した。1台目のログ `21-33-45` ができたのは起動の 111 秒後（21:34:08.926）。それまで写しは `has not created its output_log_*.txt file yet` のままで、`Could not match` にはならなかった。ログができたあとの更新で `Showing ...output_log_2026-10-17_21-33-45.txt as the log of VRChat client 25160 (the only VRChat process that has it open).`（21:34:36.740。負荷で写しの更新が遅れ、ログの作成から 28 秒後）。3台目と4台目のログは1つのファイル `21-34-30` に混ざり（PID 8460・26496）、`...output_log_2026-10-17_21-34-30.txt is open by several VRChat processes; it is not shown as any one client's log.` が1回出た。2台目は自分だけのファイル `21-34-21`。送信から `deployed` まで 90.3 秒（PR #3 では 84〜96 秒） |
+| 5. 混ざったファイルが1台目になるとき | 合格（読み替え） | 手順4の回は2台目ではなく3・4台目が混ざったので、起動順に閉じていった。1台目を閉じると、6.5 秒後に `Showing ...21-34-21.txt as the log of VRChat client 22112 (the only VRChat process that has it open).`（2台目の自分だけのファイル）。続けて2台目を閉じると、混ざったファイルを持つ3台目（PID 8460）が1台目になり、5 秒後に `VRChat log not published: output_log_2026-10-17_21-34-30.txt, the output_log_*.txt file of the first VRChat client (PID 8460, ...), is or was also open by other VRChat clients, ...` の1行になった。さらに4台目を閉じて3台目だけにすると、Restart Manager ではそのファイルを開いているのは 8460 だけになったが、写しは同じ1行のままだった（15 秒見て、Bridge のログにも変化なし） |
+| 6. VRChat 以外のプロセスが開いているとき | 合格 | 手順3の4台で、pwsh（PID 28280）から1台目のログを `[System.IO.File]::Open(..., 'Open', 'Read', 'ReadWrite, Delete')` で20秒開いたままにした。Restart Manager は 23712（VRChat）と 28280（pwsh）の2つを返したが、写しは5秒ごとの4回とも1台目のログのままで、Bridge のログにも何も出なかった。閉じたあとは 23712 だけに戻った |
+| 7. 同じ秒の起動（Bridge は止めない） | 合格 | `start-vrchat-dev.ps1 -Clients 2 -LaunchIntervalSeconds 0`（2台の差は 6〜11ms）を9回。8回は1つのファイルに混ざり（PID 2つ）、そのたびに `... is open by several VRChat processes; ...` と `... is or was also open by other VRChat clients ...` が出て、写しはその1行になった。1回（起動 21:42:22.549 / .559）はログが `21-42-22` と `21-42-23` に分かれ、`Showing ...output_log_2026-10-17_21-42-22.txt as the log of VRChat client 30180 (the only VRChat process that has it open).` になった。写しの中身が `21-42-22`（Restart Manager で 30180 だけが開いているファイル）のものであることも確かめた。以前はこの場合 `Could not match` だった |
+| 8. Restart Manager のセッションの閉じ忘れ | 合格 | 手順3の4台を 21:20:28 から 21:31:30 まで（11 分）動かしたまま、`Could not ask Windows Restart Manager` は0件、`[ERR]`・`[WRN]` も0件。Bridge の CPU 使用率は 30 秒ごとの19回で平均 0.22%、最大 0.30%（16 論理 CPU 全体に対して）。ワーキングセット 50MB、ハンドル 515 |
+| 9. Unity の Result Timeout 120 秒で負荷ありのコールドスタート | 未実施 | Mac の Unity が要る |
+
+気づいたこと:
+
+1. 同じ秒に起動した2台のログが分かれるかどうかは、起動の時刻で決まっていた。ログ名の時刻は、起動のおよそ 0.45〜0.55 秒後の時刻になるようで、それが秒の境目をまたいだときだけ2つのファイルに分かれた（起動を秒の 0.22〜0.30 秒・0.46〜0.48 秒にそろえた6回のうち、分かれたのは 0.549 / 0.559 秒に起動した1回だけ）。
+2. 負荷が高いときは、PR #3 の確認と同じく、写しの更新が遅れる。手順4では、起動前に書かれた前のセッションのログが、1台目の起動から約 17 秒（21:32:34.883 まで）写しに残っていた。PR #5 の変更とは関係しない。
+3. 手順4の Bridge のログの警告は、`within 60s` の1件だけだった（想定どおり）。
+
+後片付け: `config.json` は確認前のバックアップに戻した。Bridge の exe は PR #5 のビルドのまま。
+
 ### 案C の Bridge への組み込み後の確認（2026-10-17 21:49〜22:04）
 
 案C（`VrchatClientMode: Relaunch`。別アカウントの N 台を、配置のたびに終了させてから `--url` と `--profile` で起動し直す）の実装 `93141d9`（main の v0.4.0 `6e01786` を取り込み済み。PR #5 は含まない）を Windows で確かめた。

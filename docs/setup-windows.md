@@ -393,7 +393,7 @@ VRChatのホーム画面到達を確認したら準備完了。以降はUnity側
 - **`VrchatStartupSettleDelaySeconds`（起動済みの台へ配置するまでの最低待機時間）は環境によって調整が必要**。デフォルト30秒でも短すぎる場合、ファイル配置は成功してもリロードされないことがある。手で起動したVRChatがホーム画面へ到達するまでの体感時間を確認し、それに応じて値を調整すること（`--url`で起動した台は、実測では起動の10秒後から配置を拾った）
 - 同じ Windows アカウントでは、Bridge は1つしか動かない。`%LOCALAPPDATA%\VRCRemoteTest\state\bridge.lock`を開いたままにしておき、2つ目のBridgeは「Another VRC Remote Test Bridge is already running」とログに出して起動を拒否する。その日のログファイルは1つ目の Bridge が開いているので、2つ目のメッセージは `%LOCALAPPDATA%\VRCRemoteTest\logs\bridge-<日付>_001.log` のような別名のファイルに書かれる。ロックはアカウントごとなので、共有と Worlds は Bridge 用のアカウント（U）1つだけで使う
 
-**Unity側のResult Timeout推奨値**: 結果が書かれるまでの時間は、「前に並んでいるビルドの残り ＋ このビルドのコピー・検証・配置 ＋ 準備待ち（起動直後の台があれば最大`VrchatStartupTimeoutSeconds`、デフォルト60秒）＋ コールドスタートでの起動の間隔（(台数−1)×3秒、4台で9秒。CPU の負荷が高く VRChat のログファイルができるのが遅いときは延び、最大で 60秒＋(台数−1)×3秒。手順11）＋ 余裕」になる。Unity側の `VRC Remote Test` ウィンドウ設定foldoutにある `Result Timeout (s)` はデフォルトの60秒だと足りないことがあるので、**90秒以上、ビルドを続けて送るなら120秒から**にする。120秒でも、ビルドがいくつ並んでも間に合うという保証ではない。
+**Unity側のResult Timeout推奨値**: 結果が書かれるまでの時間は、「前に並んでいるビルドの残り ＋ このビルドのコピー・検証・配置 ＋ 準備待ち（起動直後の台があれば最大`VrchatStartupTimeoutSeconds`、デフォルト60秒）＋ コールドスタートでの起動の間隔（(台数−1)×3秒、4台で9秒。CPU の負荷が高く VRChat のログファイルができるのが遅いときは延び、最大で 60秒＋(台数−1)×3秒。手順11）＋ 余裕」になる。負荷が高いと VRChat の起動そのものも遅くなり、3秒の間隔は 3.1〜7.5 秒に延びた。実機では、CPU の使用率が約100%のとき、4台のコールドスタートで送信から結果まで 84〜96 秒かかった。Unity側の `VRC Remote Test` ウィンドウ設定foldoutにある `Result Timeout (s)` はデフォルトの60秒だと足りないことがあるので、**120秒以上、ビルドを続けて送るなら180秒から**にする。コールドスタートの直後に次のビルドを送ると、そのビルドは前のビルドの残り（最大で約100秒）と準備待ち（最大60秒）を待つためである。180秒でも、ビルドがいくつ並んでも間に合うという保証ではない。
 
 ### 9-1. 複数台（SDK の Number of Clients 相当）
 
@@ -408,7 +408,7 @@ VRChatのホーム画面到達を確認したら準備完了。以降はUnity側
 - 負荷: 4台でワーキングセットの合計が約10.8GB（1台あたり2.6〜2.9GB）だった。2台目以降のログに API のレート制限の警告（`you are doing it too quickly`）が出るが、入室には影響しなかった。重いワールドやメモリの少ないマシンでは台数を減らす
 - Unity の Preflight は、1台目（`--watch-worlds` 付きの台のうち最も早く起動した台）の状態だけを表示する。台数は Bridge のログで確認する
 - Log Viewer は1台目のログを表示する（手順11）
-- 手動で起動したい場合は、`AutoLaunchVrchat: false` のまま `start-vrchat-dev.ps1 -Clients 2` などで起動しても、配置で全台がリロードする。ただしスクリプトは前の台のログファイルを待たないので、CPU の負荷が高いと Log Viewer が1台目のログを表示できないことがある（手順11）
+- 手動で起動したい場合は、`AutoLaunchVrchat: false` のまま `start-vrchat-dev.ps1 -Clients 2` などで起動しても、配置で全台がリロードする。ただしスクリプトは前の台のログファイルを待たないので、CPU の負荷が高いと台どうしのログが混ざりやすく、1台目のログが混ざると Log Viewer に表示できない（手順11）
 
 ### 9-2. Logging を「完全」にする
 
@@ -527,20 +527,27 @@ Moonlight（NVIDIA GameStream/Sunshine互換のリモートデスクトップク
 
 `RemoteBuildCommand`が使う同じSMB共有経由で、BridgeがVRChatの`output_log_*.txt`（最新200行、直近ウィンドウのスナップショット）を5秒間隔で配信する。Windows側の追加設定は不要 — `VrchatWorldsDirectory`が正しく設定済みであれば自動的に有効になる。Unity側の `VRC Remote Test` ウィンドウの `VRChat Log` foldoutから、カテゴリフィルタ（All/Error/Exception/Udon/Shader/Warning）付きで閲覧できる。表示専用で、readiness判定やビルドの成否には一切影響しない。
 
-VRChat が動いている間は、最新のファイルではなく1台目（`--watch-worlds` 付きの台のうち最も早く起動した台。Relaunch（手順9-3）では、Bridge の記録の中で最も早く起動した、まだ動いている台）のログを表示する。output_log には PID が出ないので、ファイル名の時刻と台の起動時刻で対応付け、その台が動いている間は同じファイルを表示し続ける。表示は次のとおり。Logging の設定は手順9-2を参照。
+VRChat が動いている間は、最新のファイルではなく1台目（`--watch-worlds` 付きの台のうち最も早く起動した台。Relaunch（手順9-3）では、Bridge の記録の中で最も早く起動した、まだ動いている台）のログを表示する。output_log には PID が出ないが、VRChat は自分の output_log を開いたままにしている。そこで Bridge は、更新のたびに Windows の Restart Manager で「どのプロセスがそのファイルを開いているか」を調べ、VRChat のうち1台目だけが開いているファイルを1台目のログにする。管理者権限は要らない。Restart Manager で決まらないときは、今までどおりファイル名の時刻と台の起動時刻で対応付ける。選んだファイルは、その台が動いている間は表示し続ける。表示は次のとおり。Logging の設定は手順9-2を参照。
 
-- 1台目のログファイルがまだ無いときは、「The first VRChat client (PID ...) has not created its output_log_*.txt file yet ...」という1行を表示する。起動直後の最初の更新はたいていこの1行になる（ファイルができるのは起動の約1秒後で、負荷が高いと20秒以上かかる）。ファイルができれば、次の更新（5秒以内）で1台目のログに切り替わる。この1行が、前のセッション（閉じた台）のログの表示を置き換える
-- 同じ秒に起動した台がある、ログが1つのファイルに混ざった、起動から1分以上たってログができた、ログを作ったあとに時計やタイムゾーンが変わった、などで対応付けられないときは、ログの代わりに「Could not match an output_log_*.txt file to the first VRChat client ...」という1行を表示する。別の台のログを1台目のものとして表示することはしない
+- 1台目のログファイルがまだ無いときは、「The first VRChat client (PID ...) has not created its output_log_*.txt file yet ...」という1行を表示する。起動直後の最初の更新はたいていこの1行になる（ファイルができるのは、負荷が無いときは起動の約1秒後。CPU の使用率が100%近いと、1〜2分かかったこともある）。ファイルができれば、次の更新（5秒以内）で1台目のログに切り替わる。起動から1分以上たってファイルができても、1台目だけが開いていれば表示できる。この1行が、前のセッション（閉じた台）のログの表示を置き換える
+- 1台目のログにほかの VRChat の台も書いているとき（ログを書き始めたのが同じ秒の台は、1つのファイルに書く）は、ログの代わりに「... is or was also open by other VRChat clients ...」という1行を表示する。Bridge は、2台以上の VRChat が開いているのを一度でも見たファイルを、ほかの台が終了したあとも表示しない
+- 1台目のログを特定できないときは、ログの代わりに「Could not match an output_log_*.txt file to the first VRChat client ...」という1行を表示する。Restart Manager で決まらず（下を参照）、ファイル名でも対応付けられないとき（同じ秒に起動した台がある、起動から1分以上たってログができた、ログを作ったあとに時計やタイムゾーンが変わった、など）にこうなる。別の台のログを1台目のものとして表示することはしない
 - VRChat が1台も動いていないときは、今までどおり最新のファイル（前回のセッションのログ）を表示する
 
-VRChat はログファイルに、ログを書き始めた時刻（秒まで）の名前を付ける。実機では、ファイルができたのは、負荷が無いときは起動の約0.8秒後、CPU の使用率が100%近いときは11〜22秒後だった。その間に次の台を起動すると、2台のログの名前が同じ秒になって1つのファイルに混ざったり、1台目のログの名前が2台目の起動より後の時刻になって対応付けられなくなったりする。そこで Bridge はコールドスタートで2台以上を起動するとき、前の台のログファイルができるのを待ってから次の台を起動する。
+ファイルを選んだときは、Bridge のログに `Showing ... as the log of VRChat client <PID> (the only VRChat process that has it open).` が出る。ファイル名の時刻で選んだときは、括弧の中が `matched by the time in its name` になる。
+
+- ファイルを開いているプロセスのうち、VRChat 以外（Bridge 自身、エディタ、ウイルス対策ソフトなど）は数えない。VRChat かどうかは、プロセスのイメージ名（`VRChat.exe`）で見る
+- 次のときは Restart Manager では決まらないので、ファイル名の時刻で対応付ける。Restart Manager が答えない（Bridge のログに `Could not ask Windows Restart Manager ...` の警告が1度出て、答えるようになると `Windows Restart Manager answers again` が出る）、1台目がどのファイルも開いていない、ファイルを開いているプロセスを確かめられない（ちょうど終了した、など）。このときも、ほかの VRChat が開いているファイルは表示しない
+- 表示中のファイルも更新のたびに確かめる。1台目だけが開いている別のファイルが見つかればそちらに切り替え、表示中のファイルをほかの VRChat が開いたら表示をやめる（Bridge のログに `No longer showing ...`）
+
+VRChat はログファイルに、ログを書き始めた時刻（秒まで）の名前を付ける。実機では、ファイルができたのは、負荷が無いときは起動の約0.8秒後、CPU の使用率が100%近いときは11〜22秒後、別の日には1〜2分後だった。その間に次の台を起動すると、2台のログの名前が同じ秒になって1つのファイルに混ざったり、1台目のログの名前が2台目の起動より後の時刻になって名前では対応付けられなくなったりする。混ざったファイルは、どの方法でも台ごとに分けられない。そこで Bridge はコールドスタートで2台以上を起動するとき、前の台のログファイルができるのを待ってから次の台を起動する。
 
 - 間隔は3秒以上で、さらに、前の台のログの名前の時刻から2秒たつまで待つ。負荷が無いときは、今までどおり3秒間隔になる
 - 台ごとに、新しくできたログの名前と、起動からできるまでの秒数が、Bridge のログに `New output_log ...` の行で出る。待ったときは、その前に `Waiting for VRChat client 1/4 to create its output_log file ...` が出る
-- 待つのは、1回のコールドスタートで合わせて60秒まで。過ぎると Bridge のログに `... has not created an output_log file within 60s ...` の警告を出し、残りの台を3秒間隔で起動する。このとき、残りの台どうしのログは1つのファイルに混ざることがある。混ざったファイルは、そのとき1台目の台のログとしては表示しないが、前の台を閉じていって残った台が1台目になると、その台のログとして表示されることがある
+- 待つのは、1回のコールドスタートで合わせて60秒まで。過ぎると Bridge のログに `... has not created an output_log file within 60s ...` の警告を出し、残りの台を3秒間隔で起動する。このとき、残りの台どうしのログは1つのファイルに混ざることがある。混ざったファイルは表示しない。ただし Restart Manager が答えないときは、前の台を閉じていって残った台が1台目になると、その台のログとして表示されることがある
 - ログの一覧を読めないとき（権限、ファイルが512個を超えている、など）は、待たずに3秒間隔で起動し、Bridge のログに警告を出す
 
-この待ちは Bridge が起動する台（`AutoLaunchVrchat: true` のコールドスタートと、Relaunch の起動し直し）だけに効く。`start-vrchat-dev.ps1 -Clients N` は決まった間隔（`-LaunchIntervalSeconds`、既定3秒）で起動するので、CPU の負荷が高いと Log Viewer が1台目のログを表示できないことがあり、ログが起動の間隔を超えて遅れると、終了した台のログを次の台のものとして表示することもありうる。負荷の高い状態で手で起動するなら、`-LaunchIntervalSeconds 30` のように間隔を延ばす。
+この待ちは Bridge が起動する台（`AutoLaunchVrchat: true` のコールドスタートと、Relaunch の起動し直し）だけに効く。`start-vrchat-dev.ps1 -Clients N` は決まった間隔（`-LaunchIntervalSeconds`、既定3秒）で起動するので、CPU の負荷が高いと台どうしのログが混ざりやすく、1台目のログが混ざると Log Viewer にはメッセージの1行だけが出る。Restart Manager が答えないときはファイル名の時刻だけで対応付けるので、1台目のログを表示できなかったり、ログが起動の間隔を超えて遅れたときに、終了した台のログを次の台のものとして表示したりすることもありうる。負荷の高い状態で手で起動するなら、`-LaunchIntervalSeconds 60` のように間隔を延ばす。
 
 VRChat のログには、自分の表示名やユーザー ID、訪れたワールドの情報、同じインスタンスにいた他プレイヤーの表示名が含まれる。共有に読み取り権限を持つ人はこれを読めるので、共有の資格情報は他人に渡さないこと。
 
@@ -726,7 +733,8 @@ Rename-Item -LiteralPath 'C:\VRCRemoteTest' -NewName ('VRCRemoteTest.old-' + (Ge
 | Relaunch で、Unity の Preflight に `VRChat is running without --watch-worlds` が出る | Relaunch では `--watch-worlds` を付けない（手順9-3） | 想定どおり。ビルドは止まらない |
 | Relaunch で、ビルドが `VRCHAT_UNMANAGED_RUNNING`・`VRCHAT_START_FAILED`・`UNKNOWN_ERROR` で失敗する | 手で起動した VRChat がある、台を終了させられない、記録を読み書きできない、など | 手順9-3の「うまくいかないとき」を見る |
 | Bridge が起動直後に `VrchatProfiles ...` `VrchatClientCount must not be set ...` などの `Configuration error` で終了する | Relaunch の設定の組み合わせが合っていない（手順9-3） | `VrchatClientMode`・`VrchatProfiles`・`AutoLaunchVrchat` を手順9-3のとおりにし、`VrchatClientCount` を消す |
-| Log Viewer に `Could not match an output_log_*.txt file ...` が出る | 1台目のログを特定できない（手順11） | 台を全部閉じて、Bridge に起動させ直す（3秒間隔で起動するので、ファイルが分かれる）。手で起動するなら、1秒以上あけて1台ずつ起動する |
+| Log Viewer に `Could not match an output_log_*.txt file ...` が出る | 1台目のログを特定できない（手順11）。Bridge のログに `Could not ask Windows Restart Manager ...` があれば、ファイルを開いているプロセスを調べられず、ファイル名の時刻だけで対応付けている | 台を全部閉じて、Bridge に起動させ直す（前の台のログができてから次を起動するので、ファイルが分かれる）。手で起動するなら、1秒以上あけて1台ずつ起動する |
+| Log Viewer に `... is or was also open by other VRChat clients ...` が出る | 1台目のログに、ほかの台も書いている（ログを書き始めたのが同じ秒だった。手順11） | 台を全部閉じて、Bridge に起動させ直す。CPU の負荷が高いときに起きやすいので、負荷を下げてから起動する |
 | Bridge のログに `Ignoring legacy ... inside the share` が出る | 共有内に旧構成の `processing`・`archive`・`failed` が残っている | 手順14に従って移行し、旧ディレクトリを削除する |
 
 ---
