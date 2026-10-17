@@ -27,7 +27,7 @@ public static class ErrorCode
 
     // === Multi-client launch ===
     // A VRChat process whose session or state the Bridge could not confirm is running,
-    // so it launches nothing next to it. Unity v0.3.0 has no guidance text for this
-    // code yet and shows the code and message as they are.
+    // so it launches nothing next to it. Unity v0.4.0 and later show guidance text for
+    // this code; v0.3.0 shows only the code and message.
     public const string VrchatUnmanagedRunning = "VRCHAT_UNMANAGED_RUNNING";
 }
