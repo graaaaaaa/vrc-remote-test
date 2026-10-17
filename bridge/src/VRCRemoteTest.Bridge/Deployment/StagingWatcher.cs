@@ -781,13 +781,12 @@ public sealed class StagingWatcher : BackgroundService, IBridgeWatcher
 
     /// <summary>
     /// A manifest named after a build that was already processed is a late copy, not a
-    /// new upload (Unity never reuses a build id). On 2026-10-18 an empty file with a
-    /// deployed build's manifest name appeared in incoming/ about 10 s after the Bridge
-    /// had consumed the manifest, although the Mac had only renamed it into place once,
-    /// and the MANIFEST_INVALID reported for it replaced the deployed result. Most likely
-    /// the Mac's SMB client wrote an extended attribute to the name, which on NTFS creates
-    /// the file with an empty main stream (docs/validation/smb-late-empty-manifest.md).
-    /// Such a copy is deleted; the build's result and whatever failed/ keeps for it stay
+    /// new upload (Unity never reuses a build id). On 2026-10-18 the Bridge consumed a
+    /// manifest 5 ms after the Mac renamed it into place, and 5 ms later an empty file
+    /// with the same name appeared in incoming/: the Mac's SMB client wrote an extended
+    /// attribute (a named stream) to the name, which on NTFS creates the file with an
+    /// empty main stream. The next scan reported MANIFEST_INVALID for it, replacing the
+    /// deployed result (docs/validation/smb-late-empty-manifest.md). Such a copy is deleted; the build's result and whatever failed/ keeps for it stay
     /// as they are. Returns false for a build that was not processed, which the caller
     /// reports as invalid as before.
     /// </summary>
