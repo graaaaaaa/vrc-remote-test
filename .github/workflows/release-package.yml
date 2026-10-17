@@ -28,6 +28,11 @@ jobs:
   # contents: write, and the publisher never holds OIDC/attestation
   # authority. Actions in this job are pinned to commit SHAs because it can
   # mint signing identities (Codex plan review, Bridge CI release, Round 1).
+  #
+  # bridge-tests.yml runs on every pull request that changes this file and
+  # dry-runs the publish, artifact hand-off and SHA-256 check with
+  # contents: read and without attestation. Keep its steps and action pins in
+  # sync with this workflow (its action-pins job fails on a pin mismatch).
   bridge:
     runs-on: ubuntu-latest
     timeout-minutes: 20
