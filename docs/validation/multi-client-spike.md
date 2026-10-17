@@ -532,7 +532,7 @@ PR #5（Log Viewer が、1台目だけが開いている output_log を Windows 
 | 4. 終了途中の強制終了 | 合格 | `Closing 2 VRChat client(s)`（21:57:57.757）の 0.08 秒後に `Stop-Process -Force`。ビルドは `state\processing` に残った。Bridge を起動し直すと `Recovering unfinished build left in processing/` のあと、そのビルドを配置して2台を起動した（`deployed`）。古い2台は、強制終了の前に送られていた終了の要求で 0.6 秒後に終わっていた（ログの最後の書き込みが 21:57:58.4）ので、起動し直したあとの `Closing` は出なかった |
 | 5a. 最小化した台 | 合格 | 1台を最小化して送った。`Closed 2 VRChat client(s) in 2.0s (0 forced)` |
 | 5b. ウィンドウがまだ無い台 | 合格 | ビルドを2つ続けて送った。2つ目の `Closing` は2台目の起動の 0.02 秒後で、`Closed 2 VRChat client(s) in 8.7s (0 forced)`（ウィンドウができてから求め直して閉じた）。2つ目も `deployed` |
-| 5c. 応答しない台 | 未実施 | リソースモニターは管理者権限で動くため操作できず、ゲームのプロセスの中断も避けた |
+| 5c. 応答しない台 | 未実施（あとで合格） | リソースモニターは管理者権限で動くため操作できず、ゲームのプロセスの中断も避けた。2026-10-18 に main `870893e` で確かめた（下の「案C の 5c（応答しない台）の確認」） |
 | 6. 2台が動いている状態で Bridge を再起動 | 合格 | タスクを止めて起動し直してから送った。`Closing 2 VRChat client(s) launched by the Bridge (PID 8732, 33964)`（記録と照合できた2台）→ 2.0 秒で閉じて起動し直した |
 | 7a. Relaunch の台を残して Reload に | 合格 | `VRCHAT_WATCH_WORLDS_MISSING`。2台とも残った |
 | 7b. Reload の台を残して Relaunch に | 合格 | `VRCHAT_UNMANAGED_RUNNING`（PID 29628）。何も閉じなかった |
@@ -561,7 +561,7 @@ PR #19（Relaunch の起動し直しのあいだ、Log Viewer の写しを「The
 | 2. 続けて送る | 合格 | 3回とも 1. と同じ順だった。前の結果の直後に送った回は、`Closing` 23:39:26.101 と写しの書き換え 26.101 が同時で、`Launched` 27.645 の 0.05 秒後に `has not created`、32.836 に `Showing`。2つ続けて送った回の1つ目は、`Closing` 40.723 と書き換え 40.724、`Launched` 42.797 の 0.05 秒後に `has not created`。2つ目は、`Closing` 45.847（起動の 0.02 秒後の台）と書き換えが同時で、`Closed` までの 8.7 秒（0 forced）も1行のまま、`Launched` 54.530 の 0.07 秒後に `has not created`、59.761 に `Showing` |
 | 3a. 手で起動した台だけ | 合格 | `VRCHAT_UNMANAGED_RUNNING`。1行は出ず、写しは手で起動した台のログ（`Showing ... client 31492, the only ...`）のままだった |
 | 3b. Bridge の起動の間に手で1台（案C の 3c） | 合格 | `Closing`（23:41:15.765）で1行、`Launched 1/2`（18.327）の 0.05 秒後に `has not created`、21.337 に `Launched 1 of 2 ... then stopped ... (PID 33044)`。23:41:23.484 に写しが `output_log_2026-10-17_23-41-18.txt, the output_log_*.txt file of the first VRChat client (PID 2412 ...) is or was also open by other VRChat clients ...` になり、1行は残らなかった（手で起動した台が1台目の 0.17 秒後に起動し、同じファイルに書いた） |
-| 3c. 閉じられない台 | 未実施 | プロセスの中断にはリソースモニター（昇格）が要り、ゲームのプロセスを中断するのも避けた |
+| 3c. 閉じられない台 | 未実施（あとで合格） | プロセスの中断にはリソースモニター（昇格）が要り、ゲームのプロセスを中断するのも避けた。2026-10-18 に main `870893e` で確かめた（下の「案C の 5c（応答しない台）の確認」） |
 | 4. 終了の途中の強制終了 | 一部不合格 | `Closing`（23:42:21.547）の 0.14 秒後に `Stop-Process -Force`。写しは1行のまま残った（想定どおり）。Bridge を起動し直すと（23:42:30.090）、0.14 秒後（30.228）に写しが今の状態に戻り、`Recovering unfinished build` のあと、やり直した配置は `deployed` になった。ただし古い2台は、強制終了の前に送られていた終了の要求で、起動し直す前に終わっていた。やり直しの配置には閉じる台が無く、`a316877` の規則（閉じる台が無ければ出さない）どおり1行は出なかった。その結果、30.228 に書かれた前のセッションのログ（閉じた台の `23-42-11`）が、新しい1台目の起動（30.294）から `Showing`（35.444）まで 5.2 秒残った |
 | 5. 写しを書けないとき | 合格 | `C:\VRCRemoteTest\logs` に `icacls /deny <ユーザー>:(OI)(CI)(W)`。`Unhandled error while polling the VRChat log.`（`UnauthorizedAccessException`: `...\vrchat-latest.log.tmp` is denied）が5回出て、うち1回は `Closing` の時刻のもの。それでも `deployed` になり、2台が起動し直した。拒否を外すと ACL は元に戻り、次の読み取りで新しい1台目のログになった |
 | 6. Reload に戻す（`VrchatClientCount: 2`） | 合格（1行は出ない） | コールドスタートでは写しに前のログが残り、1台目の起動（23:43:52.720）から 5.15 秒後（57.872）の `Showing` でそのログになった。起動済みの台への配置は、settle の 30 秒を待って `deployed`。1行は出なかった |
@@ -605,7 +605,7 @@ PR #19 のマージ後、main `b09d3f3` のビルド（SHA-256 `19CB492F6BA8674E
 | Windows からの模擬アップロード（3回） | 合格 | 3回とも `deployed`。写しは `Closing` と同時に1行 →（1.5〜2.0 秒後）`Launched 1/2` の 0.03〜0.05 秒後に `has not created ...` → `Showing` でそのログ。1回目は `Closing` 00:41:19.885、`Launched 1/2` 21.947（PID 17104）、`Showing` 27.104。2回目は 00:41:55.133、56.675（PID 28100）、00:42:01.845。3回目は 00:42:29.786、31.322（PID 22604）、36.494。Unity では、1回目と3回目で、前のログ → `The first VRChat client (PID 17104 / 22604, ...) has not created its output_log_*.txt file yet ...` → 新しい1台目のログ、の順に変わるのを見た（2回目は観察の切れ目）。1行そのものは Unity に出なかった（下の「気づいたこと」1） |
 | Unity の Remote Build & Test | 合格 | `VRCDefaultWorldScene` をビルドして送った（build `20261017T154501009Z-ee70bdf1`）。manifest が共有に届いたのは 00:45:04.534、`Closing` 04.552 と同時（04.553）に写しが1行、`Closed` 06.588（2.0 秒、0 forced）、`Launched 1/2` 06.606（PID 11416）、`has not created` 06.641、`Launched 2/2` 09.629、`deployed` 09.630、`Showing` 11.772。Unity では「Waiting for Bridge result...」の間に、VRChat Log に `The Bridge is relaunching its VRChat clients with the new build (VrchatClientMode: Relaunch): they are closed, the build is installed, and they are started again. The first client's log is shown once it has started.` の1行が出て、そのあと新しい1台目のログ（00:45:11〜、`local:dab8e4…` への入室）になった。Unity の Last Deployment は `Deployed as vrc-remote-20261017T154501009Z-ee70bdf1.vrcw` |
 | Unity の Deploy Last Build | 合格 | 1回目の結果の 28.6 秒後に送った（build `20261017T154538203Z-b3eed4d9`）。`Closing` 00:45:39.722 と同時に1行、`Closed` 41.249（1.5 秒、0 forced）、`Launched 1/2` 41.267（PID 5476）、`has not created` 41.307、`deployed` 44.286、`Showing` 46.422。Unity は `Deployed as vrc-remote-20261017T154538203Z-b3eed4d9.vrcw` になり、そのあと新しい1台目のログだった（途中の画面は、画面の取得に失敗して見ていない） |
-| 3c. 閉じられない台 | 未実施 | 前回と同じく、プロセスの中断に昇格したリソースモニターが要る |
+| 3c. 閉じられない台 | 未実施（あとで合格） | 前回と同じく、プロセスの中断に昇格したリソースモニターが要る。2026-10-18 に main `870893e` で確かめた（下の「案C の 5c（応答しない台）の確認」） |
 
 気づいたこと:
 
@@ -661,6 +661,26 @@ S4 の準備: `state\managed-clients.json` に、前の節の Unity の確認（
 5. この間の Bridge のログの `[ERR]`・`[WRN]` は、1. の1件と、S5・S5b で意図して起こしたものだけ。`Closed` は2回とも `0 forced`（1.5 秒・2.0 秒）。10個の output_log に API の 429 は無かった。
 
 後片付け（S6、01:25〜01:26）: 写しの観察を止めた。VRChat を全部閉じ、`config.json` を確認前のもの（退避先のもの。Reload、`AutoLaunchVrchat: true`、`VrchatClientMode`・`VrchatProfiles`・`VrchatClientCount` なし）に戻して、Bridge を起動し直した。Bridge の exe は v0.5.0（`2339C8A4…`、ファイルバージョン `0.5.0.0`）のままで、これが入れ替えた後の状態。`managed-clients.json` は、閉じた2台（PID 34252・12776）が載ったままにした。S4 の前に退避した記録は戻していない。1. の結果ファイルと `state\failed` の空のファイルは残した。VRChat の画面の設定（ScreenManager）は確認前の値に戻した。
+
+### 案C の 5c（応答しない台）の確認（2026-10-18 03:21〜03:23）
+
+案C の確認の 5c と、PR #19 の確認の 3c（どちらも未実施）を、main `870893e` のビルドで確かめた。
+- exe は Windows の `dotnet publish` で作った。SHA-256 は `0557CD0EC2DBC2DC446EEEFAAE1695BEE04BC5007BC55AA7F65D01F80C3F9CCE`
+- `config.json` は `VrchatClientMode: "Relaunch"`、`VrchatProfiles: [0, 1]`。Logging は「完全」
+- ビルドは Windows で模擬して送った（build-A / build-B の元のファイル）
+- 写しは別のプロセスで 0.25 秒ごとに読んだ
+
+これまではリソースモニター（昇格）を使うつもりで、ゲームのプロセスを中断するのも避けていた。今回はユーザーの了承を得て、Bridge のユーザーの PowerShell から `NtSuspendProcess`（`PROCESS_SUSPEND_RESUME` で開く。昇格は要らない）で中断した。Bridge が起動した VRChat ではアンチチートが動いていない（上の案C の確認の「アンチチート」）。
+
+| 確認 | 結果 | 記録 |
+|------|------|------|
+| 準備の配置 | 合格 | 記録には前の確認で閉じた2台が載っていた。`Launched 1/2 (profile 0, PID 17480)` 03:21:49.581、`2/2 (profile 1, PID 23404)` 52.603、`deployed` 52.608 |
+| 5c. 1台を中断してから配置 | 合格 | 起動から 25 秒後（03:22:18.220）に profile 1 の台（PID 23404、アカウント#2）を中断した。7 秒後には 199 個のスレッドがすべて中断され、`IsHungAppWindow` が true、`Process.Responding` が false。03:22:25.236 に送った。`Closing 2 VRChat client(s) launched by the Bridge (PID 17480, 23404)` は 27.695、写しの1行の書き込みは 27.689。PID 17480 は閉じる要求で終わった（ログの最後の書き込みは 28.372）。37.708 に `[WRN] VRChat client 23404 did not close within 10s; forcing it to exit.` が出て、38.223 に `Closed 2 VRChat client(s) in 10.5s (1 forced).`。38.247 に `Launched 1/2 (profile 0, PID 3352)`、38.295 に写しが `has not created ... PID 3352`、41.269 に `2/2 (profile 1, PID 6808)`、41.271 に `deployed`（送ってから 16.0 秒）。43.444 に `Showing output_log_2026-10-18_03-22-38.txt ... client 3352 (the only ...)`。新しい2台（#1・#2）は `local:dab8e4…:1` にそろい、お互いの `OnPlayerJoined` を出した。記録は PID 3352・6808 に書き換わった |
+| PR #19 の 3c. 閉じられない台の間の写し | 合格 | 写しは `Closing`（27.689）から1台目の起動のあと（38.295）まで、10.6 秒のあいだ1行のままだった。中断した台のログ（`output_log_2026-10-18_03-21-53.txt`、最後の書き込みは中断の前の 03:22:14.668）や前のセッションのログが、写しに出ることは無かった |
+
+この間の Bridge のログの `[WRN]` は、上の強制終了の1件だけ。`[ERR]` は無かった。
+
+後片付け: 写しの観察を止め、VRChat を全部閉じた。`config.json` は確認前の値（Reload、`VrchatClientMode`・`VrchatProfiles`・`VrchatClientCount` なし）に戻し、Bridge を起動し直した。Bridge の exe は main `870893e` のビルドのまま。VRChat の画面の設定（ScreenManager）は確認前の値に戻した。
 
 ---
 
