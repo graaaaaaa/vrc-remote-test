@@ -6,7 +6,8 @@ namespace VRCRemoteTest.Bridge.VRChat;
 /// Isolates all OS-process-inspection code (Process enumeration + Windows-only WMI
 /// command-line lookup), mirroring how VrcSdkBuildAdapter is the sole class touching
 /// VRChat SDK types on the Unity side. No other class in this project should call
-/// Process.GetProcessesByName or System.Management directly.
+/// Process.GetProcessesByName or System.Management directly. RestartManagerFileOwners
+/// only looks up, by PID, the processes that have a log file open; it does not enumerate.
 /// </summary>
 public interface IVrchatProcessMonitor
 {

@@ -27,6 +27,11 @@ namespace VRCRemoteTest.Bridge.VRChat;
 /// spacing: a late file then leaves the client unmatched, and a file delayed beyond the
 /// launch interval can still be matched to the next client if an earlier client that
 /// owned it has exited.
+///
+/// On Windows, <see cref="VrchatLogOwners"/> comes first: Restart Manager ties a client to
+/// the file that only it has open, late or not. This match is the fallback when that
+/// settles nothing, and <see cref="VrchatLogReader"/> still refuses its result when Restart
+/// Manager shows that another VRChat has the file open.
 /// </summary>
 internal static class VrchatLogMatcher
 {

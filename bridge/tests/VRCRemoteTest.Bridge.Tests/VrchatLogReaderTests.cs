@@ -1,5 +1,7 @@
+using System.ComponentModel;
 using System.Text;
 using FluentAssertions;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
 using VRCRemoteTest.Bridge.Configuration;
@@ -13,8 +15,10 @@ namespace VRCRemoteTest.Bridge.Tests;
 /// Bridge test strategy. VrchatWorldsDirectory is pointed at a "Worlds"
 /// subfolder so its parent (the log directory VrchatLogReader derives) is a
 /// separate, controllable temp directory. The running VRChat clients come from a
-/// fake process monitor; the matching rules themselves are covered by
-/// VrchatLogMatcherTests.
+/// fake process monitor, and the processes that have each file open from a fake Restart
+/// Manager; the matching rules themselves are covered by VrchatLogMatcherTests and
+/// VrchatLogOwnersTests. Readers made by CreateReader have no Restart Manager, as on a
+/// machine that is not Windows, so they show the name match alone, as before.
 /// </summary>
 public class VrchatLogReaderTests : IDisposable
 {
@@ -22,6 +26,16 @@ public class VrchatLogReaderTests : IDisposable
     private readonly string _logDir;
     private readonly string _worldsDir;
     private readonly FakeVrchatProcessMonitor _monitor = new();
+    private readonly CapturingLogger<VrchatLogReader> _logger = new();
+
+    /// <summary>What the fake Restart Manager reports, by file name; files not listed have no owner.</summary>
+    private readonly Dictionary<string, VrchatLogOwners.Owner[]> _owners = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>The file names the fake Restart Manager was asked about, in order.</summary>
+    private readonly List<string> _queried = [];
+
+    /// <summary>When set, the fake Restart Manager throws this instead of answering.</summary>
+    private Exception? _ownerQueryError;
 
     public VrchatLogReaderTests()
     {
@@ -44,12 +58,42 @@ public class VrchatLogReaderTests : IDisposable
     /// it, so matching depends neither on the clock nor on whether the filesystem can
     /// record or set creation times.
     /// </summary>
-    private VrchatLogReader CreateReader() =>
+    private VrchatLogReader CreateReader(Func<string, DateTime>? creationTimeUtc = null) =>
         new(
             Options.Create(new BridgeOptions { VrchatWorldsDirectory = _worldsDir }),
             _monitor,
             NullLogger<VrchatLogReader>.Instance,
-            CreationTimeFromName);
+            creationTimeUtc ?? CreationTimeFromName);
+
+    /// <summary>A reader whose Restart Manager reports the owners set with <see cref="Open"/>.</summary>
+    private VrchatLogReader CreateOwnerAwareReader(Func<string, DateTime>? creationTimeUtc = null) =>
+        new(
+            Options.Create(new BridgeOptions { VrchatWorldsDirectory = _worldsDir }),
+            _monitor,
+            _logger,
+            creationTimeUtc ?? CreationTimeFromName,
+            QueryOwners);
+
+    private IReadOnlyList<VrchatLogOwners.Owner> QueryOwners(string path)
+    {
+        _queried.Add(Path.GetFileName(path));
+        if (_ownerQueryError is not null)
+        {
+            throw _ownerQueryError;
+        }
+
+        return _owners.TryGetValue(Path.GetFileName(path), out var owners) ? owners : [];
+    }
+
+    /// <summary>Reports that the monitor's clients <paramref name="processIds"/> have <paramref name="path"/> open.</summary>
+    private void Open(string path, params int[] processIds) =>
+        SetOwners(path, processIds
+            .Select(pid => new VrchatLogOwners.Owner(
+                pid, _monitor.Clients.Single(c => c.ProcessId == pid).CreationTimeUtc, "VRChat"))
+            .ToArray());
+
+    private void SetOwners(string path, params VrchatLogOwners.Owner[] owners) =>
+        _owners[Path.GetFileName(path)] = owners;
 
     private static DateTime CreationTimeFromName(string path) =>
         VrchatLogMatcher.ParseNameTime(Path.GetFileName(path)) is { } local
@@ -394,5 +438,250 @@ public class VrchatLogReaderTests : IDisposable
 
         result.IsAvailable.Should().BeTrue();
         result.Content.Should().NotContain("unknown owner");
+    }
+
+    [Fact]
+    public void Restart_Manager_finds_the_first_clients_log_when_its_name_is_far_from_its_creation()
+    {
+        // B1 of the PR #3 verification: named 19-53-40 under load, but created 33 s later.
+        Func<string, DateTime> creation = p => CreationTimeFromName(p).AddSeconds(33);
+        _monitor.AddClient(100, T0);
+        var path = WriteLogFor(T0.AddSeconds(75), "first client line\n");
+        Open(path, 100);
+
+        CreateReader(creation).ReadSnapshot().Content.Should().NotContain("first client line", "the name is not trusted");
+        CreateOwnerAwareReader(creation).ReadSnapshot().Content.Should().Contain("first client line");
+        _logger.MessagesAt(LogLevel.Information).Should().Contain(m =>
+            m.Contains("as the log of VRChat client 100") && m.Contains("the only VRChat process that has it open"));
+    }
+
+    [Fact]
+    public void Restart_Manager_finds_the_first_clients_log_when_it_is_named_after_the_next_clients_start()
+    {
+        // B2, B3 and B5: the first client's log appeared after the next client had started.
+        _monitor.AddClient(100, T0);
+        _monitor.AddClient(200, T0.AddSeconds(5));
+        var first = WriteLogFor(T0.AddSeconds(55), "first client line\n");
+        var second = WriteLogFor(T0.AddSeconds(60), "second client line\n");
+        Open(first, 100);
+        Open(second, 200);
+
+        CreateReader().ReadSnapshot().Content.Should().Contain("Could not match");
+        CreateOwnerAwareReader().ReadSnapshot().Content.Should().Contain("first client line").And.NotContain("second");
+    }
+
+    [Fact]
+    public void A_log_the_first_client_shares_with_another_client_is_not_shown()
+    {
+        _monitor.AddClient(100, T0);
+        _monitor.AddClient(200, T0.AddSeconds(3));
+        var shared = WriteLogFor(T0.AddSeconds(30), "mixed line\n");
+        Open(shared, 100, 200);
+
+        var result = CreateOwnerAwareReader().ReadSnapshot();
+
+        result.IsAvailable.Should().BeTrue();
+        result.Content.Should().Contain("is or was also open by other VRChat clients").And.Contain("PID 100")
+            .And.NotContain("mixed line");
+    }
+
+    [Fact]
+    public void A_log_seen_mixed_stays_refused_after_the_other_client_exits()
+    {
+        _monitor.AddClient(100, T0);
+        _monitor.AddClient(200, T0.AddSeconds(3));
+        var shared = WriteLogFor(T0.AddSeconds(30), "mixed line\n");
+        Open(shared, 100, 200);
+        var reader = CreateOwnerAwareReader();
+        reader.ReadSnapshot();
+
+        _monitor.Clients.RemoveAt(1);
+        Open(shared, 100);
+
+        reader.ReadSnapshot().Content.Should().Contain("is or was also open by other VRChat clients")
+            .And.NotContain("mixed line");
+    }
+
+    [Fact]
+    public void A_shown_log_that_another_client_opens_is_withdrawn()
+    {
+        _monitor.AddClient(100, T0);
+        var path = WriteLogFor(T0, "first client line\n");
+        Open(path, 100);
+        var reader = CreateOwnerAwareReader();
+        reader.ReadSnapshot().Content.Should().Contain("first client line");
+
+        _monitor.AddClient(200, T0.AddSeconds(1));
+        Open(path, 100, 200);
+
+        reader.ReadSnapshot().Content.Should().Contain("also open by other VRChat clients").And.NotContain("client line");
+        _queried.Should().HaveCount(2, "the shown file is asked about on every poll");
+    }
+
+    [Fact]
+    public void A_name_match_gives_way_to_the_file_the_client_turns_out_to_have_open()
+    {
+        // A closed session's file named in the client's first second, before its own appears.
+        _monitor.AddClient(100, T0);
+        WriteLogFor(T0, "closed session line\n");
+        var reader = CreateOwnerAwareReader();
+        reader.ReadSnapshot().Content.Should().Contain("closed session line");
+
+        var own = WriteLogFor(T0.AddSeconds(1), "first client line\n");
+        Open(own, 100);
+
+        reader.ReadSnapshot().Content.Should().Contain("first client line").And.NotContain("closed session");
+    }
+
+    [Fact]
+    public void A_name_matched_log_that_another_client_has_open_is_released()
+    {
+        _monitor.AddClient(100, T0);
+        var path = WriteLogFor(T0, "first second line\n");
+        var reader = CreateOwnerAwareReader();
+        reader.ReadSnapshot().Content.Should().Contain("first second line");
+
+        _monitor.AddClient(200, T0.AddSeconds(30));
+        Open(path, 200);
+
+        reader.ReadSnapshot().Content.Should().NotContain("first second line").And.Contain("PID 100");
+        _logger.MessagesAt(LogLevel.Information).Should().Contain(m => m.Contains("No longer showing"));
+    }
+
+    [Fact]
+    public void The_name_match_never_picks_a_file_another_VRChat_has_open()
+    {
+        // E.g. a VRChat in another session, or one that could not be checked.
+        _monitor.AddClient(100, T0);
+        var path = WriteLogFor(T0, "other VRChat line\n");
+        SetOwners(path, new VrchatLogOwners.Owner(300, T0.AddMinutes(-1), "VRChat"));
+
+        var result = CreateOwnerAwareReader().ReadSnapshot();
+
+        result.Content.Should().NotContain("other VRChat line").And.Contain("PID 100");
+    }
+
+    [Fact]
+    public void Processes_that_are_not_VRChat_do_not_keep_the_log_from_being_shown()
+    {
+        _monitor.AddClient(100, T0);
+        var path = WriteLogFor(T0.AddSeconds(75), "first client line\n");
+        SetOwners(
+            path,
+            new VrchatLogOwners.Owner(4242, T0.AddHours(-1), "VRCRemoteTest.Bridge"),
+            new VrchatLogOwners.Owner(100, T0, "VRChat"),
+            new VrchatLogOwners.Owner(3100, T0.AddDays(-1), "MsMpEng"));
+
+        CreateOwnerAwareReader().ReadSnapshot().Content.Should().Contain("first client line");
+    }
+
+    [Fact]
+    public void The_owner_is_trusted_while_another_VRChat_cannot_be_checked()
+    {
+        _monitor.AddClient(100, T0);
+        _monitor.UnverifiedCount = 1;
+        var path = WriteLogFor(T0, "first client line\n");
+        Open(path, 100);
+
+        CreateReader().ReadSnapshot().Content.Should().NotContain("first client line");
+        CreateOwnerAwareReader().ReadSnapshot().Content.Should().Contain("first client line");
+    }
+
+    [Fact]
+    public void Several_files_open_by_the_first_client_are_not_shown()
+    {
+        _monitor.AddClient(100, T0);
+        var a = WriteLogFor(T0, "a line\n");
+        var b = WriteLogFor(T0.AddSeconds(20), "b line\n");
+        Open(a, 100);
+        Open(b, 100);
+
+        CreateOwnerAwareReader().ReadSnapshot().Content.Should().Contain("Could not match").And.NotContain("line");
+    }
+
+    [Fact]
+    public void With_no_owners_at_all_the_names_decide_as_before()
+    {
+        WriteLogFor(T0, "first client line\n");
+        WriteLogFor(T0.AddSeconds(3), "second client line\n");
+        _monitor.AddClient(100, T0);
+        _monitor.AddClient(200, T0.AddSeconds(3));
+
+        CreateOwnerAwareReader().ReadSnapshot().Content.Should().Contain("first client line");
+        _logger.MessagesAt(LogLevel.Information).Should().Contain(m => m.Contains("matched by the time in its name"));
+    }
+
+    [Fact]
+    public void A_Restart_Manager_failure_falls_back_to_the_names_and_is_logged_once()
+    {
+        WriteLogFor(T0, "first client line\n");
+        WriteLogFor(T0.AddSeconds(3), "second client line\n");
+        _monitor.AddClient(100, T0);
+        _monitor.AddClient(200, T0.AddSeconds(3));
+        _ownerQueryError = new Win32Exception(5);
+        var reader = CreateOwnerAwareReader();
+
+        reader.ReadSnapshot().Content.Should().Contain("first client line");
+        reader.ReadSnapshot().Content.Should().Contain("first client line");
+        _ownerQueryError = null;
+        reader.ReadSnapshot().Content.Should().Contain("first client line");
+
+        _logger.MessagesAt(LogLevel.Warning).Should().ContainSingle().Which.Should().Contain("Restart Manager");
+        _logger.MessagesAt(LogLevel.Information).Should().Contain(m => m.Contains("Restart Manager answers again"));
+    }
+
+    [Fact]
+    public void A_shown_log_stays_while_Restart_Manager_fails()
+    {
+        _monitor.AddClient(100, T0);
+        _monitor.AddClient(200, T0.AddSeconds(3));
+        var path = WriteLogFor(T0.AddSeconds(75), "first client line\n");
+        Open(path, 100);
+        var reader = CreateOwnerAwareReader();
+        reader.ReadSnapshot().Content.Should().Contain("first client line");
+
+        _ownerQueryError = new Win32Exception(5);
+
+        reader.ReadSnapshot().Content.Should().Contain("first client line");
+    }
+
+    [Fact]
+    public void Not_yet_lasts_past_a_minute_while_Restart_Manager_can_still_find_the_log()
+    {
+        _monitor.AddClient(100, DateTime.UtcNow.AddSeconds(-90));
+
+        var result = CreateOwnerAwareReader().ReadSnapshot();
+
+        result.Content.Should().Contain("has not created its output_log_*.txt file yet").And.Contain("a minute or more")
+            .And.NotContain("Could not match");
+    }
+
+    [Fact]
+    public void Not_yet_holds_while_the_other_clients_already_hold_their_logs()
+    {
+        // B: past the 60 s wait the other clients start and log, while the first has no log yet.
+        var now = DateTime.UtcNow;
+        _monitor.AddClient(100, now.AddSeconds(-90));
+        _monitor.AddClient(200, now.AddSeconds(-20));
+        var second = WriteLogFor(now.AddSeconds(-19), "second client line\n");
+        Open(second, 200);
+
+        CreateReader().ReadSnapshot().Content.Should().Contain("Could not match");
+        CreateOwnerAwareReader().ReadSnapshot().Content.Should().Contain("has not created its output_log_*.txt file yet")
+            .And.NotContain("second client line");
+    }
+
+    [Fact]
+    public void Only_files_created_since_shortly_before_the_client_started_are_asked_about()
+    {
+        WriteLogFor(T0.AddMinutes(-2), "old session line\n");
+        var recent = WriteLogFor(T0.AddSeconds(-30), "recent session line\n");
+        var own = WriteLogFor(T0, "first client line\n");
+        _monitor.AddClient(100, T0);
+        Open(own, 100);
+
+        CreateOwnerAwareReader().ReadSnapshot().Content.Should().Contain("first client line");
+
+        _queried.Should().BeEquivalentTo([Path.GetFileName(recent), Path.GetFileName(own)]);
     }
 }
