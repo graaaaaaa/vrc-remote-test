@@ -477,8 +477,9 @@ public class VrchatClientObserverTests : IDisposable
         _now = new DateTimeOffset(T0.AddMinutes(10).AddSeconds(5));
 
         var first = Poll();
-        first.PreviousMarkers.Should().BeEmpty("the replaced client's file is still being read");
-        first.MarkerFiles.Should().NotContain(m => m.Slot == 0, "its markers file stays until its .prev is kept");
+        Markers(first.PreviousMarkers.Single().Content!).Header.GetProperty("catchingUp").GetBoolean()
+            .Should().BeTrue("what was read so far is kept as .prev while the rest is read");
+        first.MarkerFiles.Should().NotContain(m => m.Slot == 0, "its markers file stays until its .prev is complete");
 
         var second = Poll();
         Markers(second.PreviousMarkers.Single().Content!).Records.Should().ContainSingle().Which.Should().EndWith("last words");
@@ -518,5 +519,30 @@ public class VrchatClientObserverTests : IDisposable
 
         observation.MarkerFiles.Should().BeEmpty();
         observation.Clients.Clients.Single().ObservationEpoch.Should().BeNull();
+    }
+
+    [Fact]
+    public void A_shrunk_log_is_read_from_its_start_once_an_epoch_can_be_saved_again()
+    {
+        // Codex review, round 3: a failed re-read was forgotten once the file grew back.
+        _monitor.AddClient(100, T0);
+        var path = LogPath(T0);
+        File.WriteAllText(path, JoinLines("Alice", "usr_aaaaaaaa-0000") + Lines("[SPK003] one"));
+        var before = Poll();
+        var length = new FileInfo(path).Length;
+
+        Directory.Delete(_stateDir, recursive: true);
+        File.WriteAllText(_stateDir, "a file where the state directory was: nothing can be saved");
+        File.WriteAllText(path, Lines("[SPK003] two"));
+        Entry(Poll(), 0).State.Should().Be("unknown");
+        File.WriteAllText(path, Lines("[SPK003] three") + Lines(new string('x', (int)length)));
+        Entry(Poll(), 0).State.Should().Be("unknown", "the file grew back, but it was never read from its start");
+
+        File.Delete(_stateDir);
+        Directory.CreateDirectory(_stateDir);
+        var after = Poll();
+
+        Entry(after, 0).ObservationEpoch.Should().BeGreaterThan(Entry(before, 0).ObservationEpoch!.Value);
+        Markers(MarkerFile(after, 0)).Records.Should().ContainSingle().Which.Should().EndWith("[SPK003] three");
     }
 }

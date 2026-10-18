@@ -32,6 +32,7 @@ public class LogRedactorTests
     [InlineData(@"C:\Users\O'Brien\AppData", @"C:\Users\<user>\AppData")]
     [InlineData("{\"password\":\"correct \\\"horse\\\" battery\"} next", "{\"password\":\"<redacted>\"} next")]
     [InlineData("password=\"correct\nhorse\" next", "password=\"<redacted>\" next")]
+    [InlineData("cookie=\"correct\nhorse\" next", "cookie=<redacted>")]
     public void Masks_each_kind_of_value(string input, string expected)
     {
         LogRedactor.Redact(input).Should().Be(expected);

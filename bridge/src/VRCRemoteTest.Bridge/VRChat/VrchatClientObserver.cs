@@ -44,8 +44,10 @@ public sealed record VrchatObservation(
 /// end, or could not be read this time, is catchingUp. A client confirmed to have exited is
 /// read on to the end of its file, so its last lines are not lost. So is one whose slot a new
 /// client takes, over as many polls as that needs (giving up only when its file is gone or
-/// keeps failing for <see cref="MaxRetiringFailures"/> polls): its markers then become the
-/// slot's .prev, and the new client's markers file waits until then.
+/// keeps failing for <see cref="MaxRetiringFailures"/> polls): its markers are kept as the
+/// slot's .prev as they grow and once more at the end, and the new client's markers file
+/// waits until then. A restart in between thus leaves at least what was read in .prev; a
+/// .prev that could not be written before a restart is lost (observation only).
 ///
 /// An epoch is used only once the roster has saved it; when it cannot, the client is not
 /// observed (or its log not read again) until it can.
@@ -222,16 +224,24 @@ public sealed class VrchatClientObserver
             retiring.RetiringFailures = retiring.ReadFailed ? retiring.RetiringFailures + 1 : 0;
         }
 
-        if (retiring.Drained || retiring.RetiringFailures >= MaxRetiringFailures)
+        var done = retiring.Drained || retiring.RetiringFailures >= MaxRetiringFailures;
+        if (done && !retiring.Drained)
         {
-            if (!retiring.Drained)
-            {
-                _logger.LogWarning(
-                    "Gave up reading {Path} to its end for the VRChat client that had slot {Slot}; its markers are kept as they are.",
-                    path, slot);
-            }
+            _logger.LogWarning(
+                "Gave up reading {Path} to its end for the VRChat client that had slot {Slot}; its markers are kept as they are.",
+                path, slot);
+        }
 
+        // Kept as .prev while it is still read too, so a restart in between does not lose it,
+        // and once more when done.
+        if (done || retiring.MarkersChanged)
+        {
             _pendingPrevious[slot] = new PreviousMarkers(slot, retiring.RenderMarkers(slot));
+            retiring.Acknowledge(retiring.CurrentKey);
+        }
+
+        if (done)
+        {
             _retiring[slot] = null;
         }
 
@@ -334,10 +344,11 @@ public sealed class VrchatClientObserver
                 "Reading {Path} for VRChat client {ProcessId} in slot {Slot} (observation epoch {Epoch}).",
                 path, observation.Entry.ProcessId, observation.Entry.Slot, observation.Epoch);
         }
-        else if ((!string.Equals(observation.Scanner.Path, path, StringComparison.OrdinalIgnoreCase)
+        else if ((observation.RestartRequired
+                || !string.Equals(observation.Scanner.Path, path, StringComparison.OrdinalIgnoreCase)
                 || observation.Scanner.FileCreationUtc != created
                 || !observation.Prefixes.SequenceEqual(Prefixes))
-            && !Restart(observation, path, created, "another file or other marker prefixes"))
+            && !Restart(observation, path, created, "another file, a shorter one, or other marker prefixes"))
         {
             return 0;
         }
@@ -386,6 +397,9 @@ public sealed class VrchatClientObserver
     {
         if (TryAllocateEpoch() is not { } epoch)
         {
+            // Remembered, so the file is read from its start once an epoch can be saved,
+            // even if it has grown back past the old position by then.
+            observation.RestartRequired = true;
             observation.ReadFailed = true;
             observation.CatchingUp = true;
             return false;
@@ -586,6 +600,9 @@ public sealed class VrchatClientObserver
         /// <summary>Polls in a row that a replaced client's file could not be read.</summary>
         public int RetiringFailures { get; set; }
 
+        /// <summary>The log must be read again from its start before anything else is read.</summary>
+        public bool RestartRequired { get; set; }
+
         /// <summary>Until the log is read, the markers file says it may be incomplete.</summary>
         private bool HeaderCatchingUp => Scanner is null || CatchingUp;
 
@@ -606,6 +623,7 @@ public sealed class VrchatClientObserver
             CatchingUp = true;
             ReadFailed = false;
             Drained = false;
+            RestartRequired = false;
         }
 
         public string RenderMarkers(int slot) => Markers.Render(new MarkerFileHeader

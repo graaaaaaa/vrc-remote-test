@@ -103,11 +103,12 @@ internal static class LogRedactor
 
         try
         {
-            text = CredentialHeader.Replace(text, m => m.Groups[1].Value + m.Groups[2].Value + Redacted);
-            text = Bearer.Replace(text, "Bearer " + Redacted);
+            // Quoted values first: a header's rule stops at a LF that a quoted value may span.
             text = QuotedSecretValue.Replace(
                 text,
                 m => m.Groups[1].Value + m.Groups[2].Value + m.Groups[3].Value + m.Groups[4].Value + Redacted + m.Groups[5].Value);
+            text = CredentialHeader.Replace(text, m => m.Groups[1].Value + m.Groups[2].Value + Redacted);
+            text = Bearer.Replace(text, "Bearer " + Redacted);
             text = SecretValue.Replace(
                 text, m => m.Groups[1].Value + m.Groups[2].Value + m.Groups[3].Value + Redacted);
             text = AuthCookie.Replace(text, "authcookie_" + Redacted);
