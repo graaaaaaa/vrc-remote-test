@@ -662,6 +662,177 @@ S4 の準備: `state\managed-clients.json` に、前の節の Unity の確認（
 
 後片付け（S6、01:25〜01:26）: 写しの観察を止めた。VRChat を全部閉じ、`config.json` を確認前のもの（退避先のもの。Reload、`AutoLaunchVrchat: true`、`VrchatClientMode`・`VrchatProfiles`・`VrchatClientCount` なし）に戻して、Bridge を起動し直した。Bridge の exe は v0.5.0（`2339C8A4…`、ファイルバージョン `0.5.0.0`）のままで、これが入れ替えた後の状態。`managed-clients.json` は、閉じた2台（PID 34252・12776）が載ったままにした。S4 の前に退避した記録は戻していない。1. の結果ファイルと `state\failed` の空のファイルは残した。VRChat の画面の設定（ScreenManager）は確認前の値に戻した。
 
+### S5a: ログの行の形・Logging ごとの出方・Udon の出力の形・4台のログ量（2026-10-18 13:34〜13:52）
+
+台ごとの観測（`.claude/docs/research/client-observation-control-plan.md` の F1〜F3）を実装する前に、状態の判定に使う行と、読み取りの上限を決めるための確認（計画 v3 の §5 S5）。Windows のセッションが行い、生のメモは Windows の `%LOCALAPPDATA%\VRCRemoteTest\s5\s5-notes.md` にある。ワールドは SPK-003 のプローブ（`vrc-remote-20261018T022005192Z-ed77b640.vrcw`、133,672 バイト、SHA-256 `2B0BF148…C76C`）。起動は `start-vrchat-dev.ps1` で、Bridge（v0.5.1、Relaunch、`VrchatProfiles: [0, 1]`）は動かしたまま、配置はしていない。以下の行の表示名は `<表示名#1>`（profile 0）・`<表示名#2>`（profile 1）、`usr_…` は `usr_***`、Windows のユーザー名は `<user>` に伏せた。
+
+**準備**: Bridge の Relaunch で 11:20 に起動していた SPK-003 の2台（PID 20800 `--profile=0`、8148 `--profile=1`）を、ユーザーの了承を得て閉じた。Logging（`LOGGING_ENABLED_h120798204`）は 1（完全）だった。
+
+#### A1. 入室の行の形（Logging「完全」、profile 0・1 を `--url` で起動、`--watch-worlds` なし）
+
+profile 0 の台（Master）:
+
+```
+2026.10.18 13:34:37 Debug      -  User Authenticated: <表示名#1> (usr_***)
+2026.10.18 13:34:37 Debug      -  [Behaviour] Destination requested: local:dab8e405667a4de729f91623db09e31f57071efe70ea4b1ee764bd3563dd5383
+2026.10.18 13:34:37 Debug      -  [Behaviour] Destination fetching: local:dab8e4…5383:1
+2026.10.18 13:34:37 Debug      -  [Behaviour] Destination set: local:dab8e4…5383:1
+2026.10.18 13:34:39 Debug      -  [Behaviour] OnConnectedToMaster
+2026.10.18 13:34:39 Debug      -  [Behaviour] Entering Room: Local Test
+2026.10.18 13:34:39 Debug      -  [Behaviour] Joining local:dab8e405667a4de729f91623db09e31f57071efe70ea4b1ee764bd3563dd5383
+2026.10.18 13:34:39 Debug      -  [Behaviour] Joining or Creating Room: Local Test
+2026.10.18 13:34:39 Debug      -  [Behaviour] Successfully joined room
+2026.10.18 13:34:41 Debug      -  [Behaviour] Waiting to discover master client.
+2026.10.18 13:34:43 Debug      -  [Behaviour] I am MASTER
+2026.10.18 13:34:43 Debug      -  [Behaviour] Finished entering world.
+2026.10.18 13:34:43 Debug      -  [Behaviour] OnPlayerJoined <表示名#1> (usr_***)
+2026.10.18 13:34:47 Debug      -  [Behaviour] OnPlayerJoined <表示名#2> (usr_***)
+```
+
+profile 1 の台も同じ順（13:34:40 `User Authenticated` → 13:34:42 `Joining` → 13:34:46 `I am *NOT* MASTER` → 13:34:46 `Finished entering world.` → 13:34:47 `OnPlayerJoined` #1・#2）。
+
+- `Joining` の local ID の末尾に `:1` は無い。`:1` が付くのは `Destination fetching` と `Destination set` だけで、初回の `Destination requested` にも付かない。
+- `OnJoinedRoom` という行は無い。部屋に入ったことを示すのは `Entering Room: <名前>` → `Joining or Creating Room: <名前>` → `Successfully joined room`。
+- `I am MASTER` / `I am *NOT* MASTER` は `Finished entering world.` の直前に1回だけ出る。`OnPlayerJoined`（自分を含む）はそのあと。
+- `Finished entering world.` は、A1・A3・A4 の読み込み直し・A6 の入り直しの、どの入室でも1回ずつ出た。ただし Error World に入ったとき（A5）にも出るので、直前の `Joining local:…` と組で見ないと、狙ったワールドに入れたとは言えない。
+
+#### A2. Master の台を閉じたとき
+
+Master（profile 0、PID 26704）を `CloseMainWindow` で閉じた（13:35:36.390）。残った台:
+
+```
+2026.10.18 13:35:36 Debug      -  [Behaviour] OnMasterClientSwitched
+2026.10.18 13:35:36 Debug      -  [NetworkProcessing] Transferred ownership of Dispatcher to 0
+（同じ形で SceneEventHandlerAndInstantiator …、VRCWorld、SPK003_PlayerDataProbe）
+2026.10.18 13:35:36 Debug      -  [Behaviour] OnPlayerLeftRoom
+2026.10.18 13:35:36 Debug      -  [Behaviour] OnPlayerLeft <表示名#1> (usr_***)
+2026.10.18 13:35:36 Debug      -  [SPK003] PLAYER_LEFT id=1 local=False
+```
+
+- Master が移ったことを示すのは `OnMasterClientSwitched`。`I am MASTER` は新たに出ない（その台の `I am` は最初の `I am *NOT* MASTER` の1回だけ）。誰が Master になったかは、この行からは分からない。
+- そのあと、その台の RPC SanityCheck の行の末尾が `(local non-master non-owner)` から `(local master …)` に変わった。
+- 閉じた台のログの最後は `[Behaviour] Destroying <表示名#2>` と `Error - [Behaviour] Attempted to execute RPC _DestroyObjects … when local player is invalid.`。
+
+#### A3. 違う profile の構成で、1台だけ起動し直す（S1 の前半）
+
+閉じた台を A1 とまったく同じ引数（同じ roomId）で起動し直した（13:36:01）。その台は 13:36:04 に `Destination set: local:dab8e4…:1`、13:36:05 に `Joining local:dab8e4…`、13:36:09 に `I am *NOT* MASTER` → `Finished entering world.` → `OnPlayerJoined` #2・#1。残った台には 13:36:10 に `OnPlayerJoined <表示名#1>`、`[SPK003] PLAYER_JOINED id=3 local=False`、`PLAYER_RESTORED id=3` が出た。**残った台と同じ `local:dab8e4…` に入った。**
+
+#### A4. 同じ profile の構成で、読み込み直したあとに 1台だけ起動し直す（S1 の後半）
+
+`-Clients 2 -WorldPath` で起動した（`-NoWatchWorlds` を付けなければ `--watch-worlds` が付く。`--profile` は付かないので2台とも profile 0）。2台とも `local:dab8e4…` に入った。13:37:47 に `Worlds\vrc-remote-s5-20261018T133747.vrcw` をコピーすると、2台とも:
+
+```
+2026.10.18 13:37:47 Debug      -  World Updated: C:\Users\<user>\AppData\LocalLow\VRChat\VRChat\Worlds\vrc-remote-s5-20261018T133747.vrcw // 1
+2026.10.18 13:37:47 Debug      -  [Behaviour] Destination set: local:ce318f3e82d614028e1b7fd1c58e2dc69783d28f221338974d3230b42f743c4a:1
+2026.10.18 13:37:47 Debug      -  [Behaviour] OnPlayerLeft <表示名#1> (usr_***)  ×2
+2026.10.18 13:37:48 Debug      -  [Behaviour] Joining local:ce318f…
+2026.10.18 13:37:54 Debug      -  [Behaviour] I am MASTER（2台目。1台目は *NOT*）→ Finished entering world. → OnPlayerJoined ×2
+```
+
+2台とも `local:ce318f…:1` にそろい、Master が入れ替わった。1台目を 13:38:18 に閉じ、同じ引数（`--url` と `--watch-worlds`）で起動し直すと、その台は `Destination set: local:dab8e4…:1` → `Joining local:dab8e4…` → `I am MASTER` → `Finished entering world.` と進み、`OnPlayerJoined` は自分の1件だけだった。残った台には `OnPlayerLeftRoom` と `OnPlayerLeft` が出ただけで、そのあと `OnPlayerJoined` は出なかった。**起動し直した台は、残った台（`ce318f`）とは別のインスタンス（`dab8e4`）に入った。** コピーしたワールドは消した。
+
+#### A5. `--url` なしで起動（ケース3の再確認）
+
+```
+2026.10.18 13:39:19 Debug      -  [Behaviour] Going to Home Location: wrld_…
+2026.10.18 13:39:20 Debug      -  [Behaviour] Going to current users Home world
+2026.10.18 13:39:22 Warning    -  [Behaviour] Failed to join instance 'wrld_…:40635~private(usr_***)~region(jp)' due to 'オフラインテストモードでいる間は、オンラインのワールドに移動することはできません。
+System.Exception: You are in offline testing mode, and cannot travel to online worlds. / If you are trying to use VRChat normally, please ensure you start VRChat by starting launch.exe. …
+2026.10.18 13:39:42 Error      -  [Behaviour] Going to Error World
+System.Exception: Going to Error World
+2026.10.18 13:39:42 Debug      -  [Behaviour] Destination requested: local:error_4327609248367914
+2026.10.18 13:39:42 Debug      -  [Behaviour] Destination set: local:error_4327609248367914:1
+2026.10.18 13:39:43 Debug      -  [Behaviour] Entering Room: Error World
+2026.10.18 13:39:43 Debug      -  [Behaviour] Joining local:error_4327609248367914
+2026.10.18 13:39:43 Debug      -  [Behaviour] Successfully joined room
+2026.10.18 13:39:45 Debug      -  [Behaviour] I am MASTER
+2026.10.18 13:39:45 Debug      -  [Behaviour] Finished entering world.
+2026.10.18 13:39:45 Debug      -  [Behaviour] OnPlayerJoined <表示名#1> (usr_***)
+```
+
+（`System.Exception` の行は頭の無い続きの行。）ホームへの移動の失敗から `Going to Error World` まで約 20 秒。Error World でも `Finished entering world.` が出る。
+
+#### A6. Quick Menu からの入り直し（プロセスを終了させない再入場）
+
+ユーザーの了承を得て、Windows 上で直接、1台（profile 0、`--url`、`local:dab8e4…`）の Quick Menu を操作した。Esc → 下のバーの「現在地」→ ワールドアクションの「ワールドに入り直す」→「本当にこのワールドのインスタンスに入り直しますか？」に「はい」。
+
+```
+2026.10.18 13:41:39 Debug      -  [Behaviour] Rejoining local world: local:dab8e4…5383:1
+2026.10.18 13:41:39 Debug      -  [Behaviour] Destination requested: local:dab8e4…5383:1（このときは :1 付き）
+2026.10.18 13:41:39 Debug      -  [Behaviour] Destination fetching: …:1 / Destination set: …:1
+2026.10.18 13:41:39 Debug      -  [Behaviour] <color=red>Resetting game flow because "Destination instance set": [SkipLogin, RemainInNetworkRoom]</color>
+2026.10.18 13:41:40 Debug      -  [Behaviour] OnLeftRoom
+2026.10.18 13:41:40 Debug      -  [Behaviour] OnPlayerLeft <表示名#1> (usr_***)
+2026.10.18 13:41:40 Debug      -  [SPK003] PLAYER_LEFT id=1 local=True
+2026.10.18 13:41:40 Debug      -  [Behaviour] Joining local:dab8e4…5383 → Successfully joined room
+2026.10.18 13:41:41 Debug      -  [Behaviour] I am MASTER → Finished entering world. → OnPlayerJoined <表示名#1> → [SPK003] PLAYER_JOINED id=1 local=True; … → PLAYER_RESTORED id=1 local=True
+```
+
+- 入り直しは `Rejoining local world:` で始まる。抜けるときの行は、自分のときは `OnLeftRoom`、ほかの台が抜けるときは `OnPlayerLeftRoom`。
+- 途中に、頭の無い JSON の行（`{"runningTime": …}` や `  'onLoadingSceneActive': 0,`）が入る。
+- プロセスは同じまま、入り直しのあとにプローブの `PLAYER_RESTORED` が出た。
+
+#### B. Logging の設定ごとの出方
+
+- **0（エラーのみ）**: 全部閉じてから 0 にし、profile 0・1 の2台を `--url` で起動して、40 秒後に1台を閉じた。2つのログ（7,070 バイト・51 行、4,865 バイト・31 行）で、`Joining`・`Finished entering world`・`OnPlayerJoined`・`OnPlayerLeft`・`I am (*NOT*) MASTER`・`User Authenticated`・`Destination set`・Udon の `[SPK003]`・頭が `Debug` の行・頭が `Warning` の行は、どれも 0 件。出るのは頭が `Error` の行（30・26 行）と、その続きの行（スタックトレースや JSON）だけ（例: `… Error      -  StyleEngine: Missing resource reference:Atlas`、`… Error      -  LSM: Failed to read state for 1 from …-objects`、閉じたときの `… Error      -  Safe handle has been closed`）。入室も人数も判定できない。
+- **-1（オフ）**: output_log は2つとも作られたが、最後まで 0 バイトだった（作成時刻と最終書き込み時刻が同じ）。「ファイルはあるが 0 バイトのまま」で見分けられる。
+- 終わったあと 1 に戻し、`reg query` で `0x1` を確かめた。
+
+#### C. Udon の出力の形
+
+- プローブの `Debug.Log` の行は、`[Behaviour]` の行と頭がまったく同じ。頭は `YYYY.MM.DD HH:MM:SS` ＋ 空白 ＋ 空白で 11 文字にしたレベル（`Debug` ＋ 空白6、`Warning` ＋ 空白4、`Error` ＋ 空白6）＋ `-  `（ハイフンと空白2つ）。（S5b で訂正。初めは「10 文字に詰めた」と書いていた）例: `2026.10.18 11:20:26 Debug      -  [SPK003] PLAYER_JOINED id=1 local=True; no PlayerData read yet`。VRChat が付ける接頭辞は無く、`[SPK003]` はワールド自身の文字列。
+- 頭に出るレベルは `Debug`・`Warning`・`Error` の3つだけ。
+- SPK-003 のログの `[SPK003]` は 26 行（START、PLAYER_JOINED、PLAYER_RESTORED、SLOT_MISSING、SLOT_READ、WRITE、DATA_UPDATED、FIRST_JOIN_SEEDED_A、PEER_CHECK、PEER_OBSERVATION_WRITTEN / READ。S5 の中では PLAYER_LEFT も出た）。
+- Udon の例外は `… Error      -  [UdonBehaviour] An exception occurred during Udon execution, this UdonBehaviour will be halted.` の1行のあとに、単独の LF と、頭の無い続きの行（`VRC.Udon.VM.UdonVMException: …`、`  at VRC.Udon.Wrapper.Modules.…`）が続く。
+- 複数行のメッセージは、本文の中の改行がそのまま書かれ、2行目以降に頭は付かない。行の終わりは CRLF だが、本文の中の改行は LF のことも CRLF のこともある。
+- 10-17 以降の空でない output_log 268 個（頭のある行 533,717 行）で、頭の直前が単独の LF だったのは、3台が同じファイルに書いて混ざったログ（`output_log_2026-10-18_03-30-17.txt`）の1件だけ。1台だけが書いたログでは、頭の直前は必ず CRLF（かファイルの先頭）だった。本文の中の単独の LF は 25,763 個あった。
+- 判断: ワールドが `Debug.Log("[Behaviour] Joining …")` を出すと、頭もレベルも本物と同じなので、行の形では見分けられない。「改行のあとに偽の日時の頭」は、LF で改行したものなら、頭の直前が単独の LF になるので、1台だけが書くログでは本物と見分けられそう。CRLF で改行されると見分けられない。Udon の文字列の LF・CRLF がそのまま書かれるかは、S5b（専用の試験ワールド）で確かめる。
+
+#### D. 4台のログの量
+
+`-Clients 4 -WorldPath` で起動した（4台とも profile 0）。4台とも、起動の引数に `--url=… --watch-worlds --no-vr --enable-debug-gui --enable-sdk-log-levels --enable-udon-debug-logging` があることを確かめた。13:46:33・36・39・42 に起動し、4台とも `local:dab8e4…` に入った（どの台も `OnPlayerJoined` が4回）。起動から 316 秒まで、約6秒ごとに 51 回サイズを記録した（最初の記録は起動から 14 秒後）。
+
+| 台 | 入室の完了 | 完了までのサイズ | 間隔あたりの増加（最大 / 平均） | 5 分後のサイズ |
+|---|---|---|---|---|
+| 1 | 13:46:42 | 86,053 B | 5,879 B / 354 B | 126,740 B |
+| 2 | 13:46:45 | 90,795 B | 9,024 B / 439 B | 143,190 B |
+| 3 | 13:46:53 | 119,323 B | 31,041 B / 960 B | 143,897 B |
+| 4 | 13:46:55 | 143,015 B | 67,654 B / 1,713 B | 165,955 B |
+
+- 4台の合計の、間隔あたりの増加は最大 107,913 B、平均 3,466 B。各ログは最後に 1,147〜1,505 行で、`Error` の行は 26〜101、`Warning` の行は 70〜153。
+- CPU は全体の平均 18.8%（最大 50.7%、起動直後）。VRChat 4台の合計は、論理 16 コアに対して平均 13.4%（最大 52.2%）。
+- 判断: 計画の読み取りの上限（1台 4 MiB / 5 秒、全体 16 MiB / 5 秒）は、見えた最大（1台 68 KB、全体 108 KB）の約 60 倍あり、十分に追いつける。ただし、このワールドは Udon の出力が少ない。毎フレーム `Debug.Log` するワールドや、エラーが続くワールドでは増える。
+
+#### 後片付け（13:52）
+
+VRChat はすべて閉じ、コピーしたワールド（`vrc-remote-s5-…`）は消した。Logging は `0x1`（完全）で、始める前と同じ。`config.json` と `managed-clients.json` は、始める前とハッシュが同じ。Bridge は PID 29812 のまま動いており、S5 の間に Bridge での配置は無い（results の更新は 0 件）。SPK-003 で動いていた2台は閉じたまま（SPK-003 の側で配置し直す）。
+
+### S5b: 偽の行の試験ワールド（2026-10-18 14:21〜14:30）
+
+S5a の C で残った「Udon の文字列の改行がそのままログに書かれるか」を、専用の試験ワールドで確かめた。Mac の Unity の試験用プロジェクト（`~/Documents/VRChatProjects/Vrc-remote-test`）に UdonSharp の `S5LogForgeProbe`（`Assets/S5LogProbe/`）を置き、Remote Build & Test で送った。プローブとシーンに置くためのエディタースクリプトの写しは `docs/validation/s5b-log-probe/` にある（Unity のプロジェクトの `Assets/S5LogProbe/` と `Assets/S5LogProbe/Editor/` に置き、`Tools > VRC Remote Test S5 > Add Log Probe` を実行すると再現できる）。確認のあと、試験用プロジェクトからは取り除いた。プローブは入室から 15 秒ごとに 6 回、偽の `[Behaviour]` の行、LF と CRLF のあとに偽の日時の頭を入れた複数行、`Warning` と `Error`、タブと ESC、日本語と絵文字、4,096 文字と 65,536 文字の行を `Debug.Log` で出す。偽の行には必ず `s5forged` か `S5Fake` が入る。Windows のセッションが、2台の output_log をバイト単位で調べた（全体の出力は Windows の `%LOCALAPPDATA%\VRCRemoteTest\s5\s5b-analysis.txt`）。2台の結果は同じで、下の 16 進は profile 0 の台（`output_log_2026-10-18_14-21-40.txt`、182,254 バイト）のもの。
+
+**配置**: build `20261018T052136873Z-108899a4`。Bridge（v0.5.1、Relaunch）の取り込みは 14:21:40.280。記録の台（S5a で閉じた PID 20800・8148）はもう終わっていたので `Closing` は出ず、`Launched VRChat client 1/2 (profile 0, PID 11676)` は 14:21:40.322、`2/2 (profile 1, PID 23268)` は 14:21:43.343、`deployed` は 14:21:43.345。Unity の `Deployed as …` は 14:22:09。2台とも `local:dab8e4…` に入り、お互いの `OnPlayerJoined` を出した。`[VRCRT] S5 done after 6 rounds` は profile 0 が 14:23:04、profile 1 が 14:23:06。
+
+| 確認 | 結果 |
+|---|---|
+| A. 偽の頭の直前のバイト | LF のあとに書いた偽の頭は、直前が `74 0A`（単独の LF）。CRLF のあとに書いた偽の頭は、直前が `0D 0A` で、本物の行の頭とまったく同じ。6 回とも同じ。頭のある行（偽を含む）850 行（profile 1 は 781 行）のうち、直前が CRLF は 843（774）、単独の LF は 6（6、LF の偽の 6 回とちょうど一致）、ファイルの先頭が 1。**Udon の文字列の LF・CRLF は置き換えられずにそのまま書かれる。** S5a の C の判断（単独の LF のあとの頭は続きの行とみなす）はこのワールドでも成り立ち、LF の偽はすべて除ける。CRLF の偽はバイトでは本物と区別できない（偽の日時 `2026.01.01` は今回たまたま違うだけで、ワールドが今の時刻を書けば区別できない） |
+| B. 1 行の偽装 | `[Behaviour] Joining local:s5forged1` は、直前の `0D 0A`、日時、`Debug` と空白 6 つ、`-  [Behaviour] ` まで本物と同じ。`OnPlayerLeft S5Fake` と `Finished entering world. s5forged1` も同じ |
+| B'. 偽の行が入る位置 | round 1 の偽の行は、ワールドの `Start` から出たので、本物の `Finished entering world.` より前に書かれた。本物の `Joining local:dab8e4…` は 0xB6CA（14:21:44）、偽の `Joining` / `OnPlayerLeft` / `Finished entering world. s5forged1` は 0x13C23〜（14:21:49）、本物の `Finished entering world.` は 0x260E5（14:21:49）。「`Joining` のあと最初の `Finished entering world`」を入室の完了とみなすと、ワールドの `Start` が出した偽の行に先を越される |
+| C. `Warning` と `Error` | 頭は `Warning    -  `（`57 61 72 6E 69 6E 67 20 20 20 20 2D 20 20`）と `Error      -  `（`45 72 72 6F 72 20 20 20 20 20 20 2D 20 20`）。Udon の `Debug.LogError` には、スタックトレースなどの続きの行が付かない（`0D 0A` で 1 行で終わり、次はすぐ次の頭）。レベルは空白で 11 文字にしてから `-  ` が付く（S5a の C の記述を訂正した） |
+| D. タブと ESC | どちらも置き換えられずに書かれる（`74 61 62 09 68 65 72 65`、`1B 5B 33 31 6D`） |
+| E. 日本語と絵文字 | UTF-8 のまま書かれる（BOM や置き換えは無い。`🎮` は `F0 9F 8E AE` の 4 バイト）。Unity の Log Viewer では `🎮` が表示されなかったが、ファイルには書かれている |
+| F. 長い行 | long4k は 4,152 バイト、long64k は 65,593 バイトで、どちらも切り詰められずに 1 行で書かれた（頭 34 バイト ＋ マーカー ＋ 本文 ＋ ` end` ＋ `0D 0A`）。続きの行は無い |
+| G. Bridge の写し（`logs\vrchat-latest.log`） | 今の写しは、ログの最後の 256 KiB を読み、`\n` で分けて行末の `\r` を落とし、最後の 200 行を取り、512 文字を超える行を 497 文字＋`... [truncated]` にして LF でつなぐ（`VrchatLogReader.ReadTailLines`・`BuildBoundedOutput`）。14:23 の写しは 21,318 バイト、200 行で、CR は 0 個。**写しでは CRLF と LF の区別が無くなり**、LF の偽の頭（`S5FakeNewline`）も CRLF の偽の頭（`s5forgedcrlf`）も、続きの行（`multiline third`）も、それぞれ独立した 1 行に見える。Unity の Log Viewer でも、`2026.01.01 00:00:00 Debug - [Behaviour] Joining local:s5forgedcrlf6` が独立した 1 行として表示された。タブ・ESC・日本語・絵文字は写しでもそのまま。写しに入っていたのは round 2〜6 だけで、round 1 の長い行は最後の 200 行より前だった |
+
+判断:
+
+- 単独の LF のあとの日時の頭を続きの行として扱えば、LF で改行した偽の行は除ける。CRLF で改行した偽の行と、1 行の偽装は、ログのバイトでは本物と区別できない。
+- ワールドの `Start` の出力は、本物の `Joining` と `Finished entering world.` の間に入る。ワールドが `[Behaviour] Finished entering world.` と同じ文字列を出せば、入室の完了を先に偽装できる。
+- この判断は、Bridge が元の output_log のバイトで行う必要がある。今の写しは CRLF と LF の区別を落とすので、写しを読む側（Unity、CLI）では使えない。
+- 1 行が 64 KiB を超えることがある（ワールドが長い文字列を出せば、そのまま 1 行で書かれる）。
+
+**状態**: 2台（PID 11676・23268）は S5b の試験ワールドのまま動かしてある。Logging（`0x1`）と config.json は触っていない。SPK-003 の側が次に配置すれば、Relaunch で入れ替わる。
+
 ---
 
 ## Go/No-Go 判定テーブル
