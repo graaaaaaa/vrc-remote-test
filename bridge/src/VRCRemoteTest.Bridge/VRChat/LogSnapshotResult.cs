@@ -1,6 +1,6 @@
 namespace VRCRemoteTest.Bridge.VRChat;
 
-/// <summary>Outcome of IVrchatLogReader.ReadSnapshot().</summary>
+/// <summary>One published log copy from IVrchatLogReader.Read(): a slot's, or the compatible vrchat-latest.log.</summary>
 public sealed class LogSnapshotResult
 {
     /// <summary>

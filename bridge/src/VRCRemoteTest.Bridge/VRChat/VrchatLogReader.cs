@@ -6,38 +6,51 @@ using VRCRemoteTest.Bridge.Configuration;
 namespace VRCRemoteTest.Bridge.VRChat;
 
 /// <summary>
-/// Snapshot reader: every call re-resolves the log file and reads a bounded tail
-/// window, rather than tracking a persistent (file, offset, incomplete-line-buffer)
+/// Snapshot reader: every call re-resolves the log files and reads a bounded tail
+/// window of each, rather than tracking a persistent (file, offset, incomplete-line-buffer)
 /// state machine. This design replaced an original stateful-tailer proposal that
 /// Codex plan review found underspecified (FileShare flags, encoding,
 /// rotation/truncation handling) and over-built for a "glance at recent logs"
 /// developer convenience feature (Codex plan review Phase 5, Rounds 1-3, confidence
-/// converged to 0.91). Real VRChat output_log files were inspected on real Windows
-/// hardware before writing this class: filename pattern
-/// output_log_YYYY-MM-DD_HH-MM-SS.txt, no BOM, UTF-8-compatible encoding, lines
-/// shaped like "YYYY.MM.DD HH:MM:SS Level    - Message".
+/// converged to 0.91). The incremental reading that collects marker lines from the start
+/// of a session is VrchatLogScanner's, fed with the files resolved here. Real VRChat
+/// output_log files were inspected on real Windows hardware before writing this class:
+/// filename pattern output_log_YYYY-MM-DD_HH-MM-SS.txt, no BOM, UTF-8-compatible encoding,
+/// lines shaped like "YYYY.MM.DD HH:MM:SS Level      -  Message" and ended by CRLF.
 ///
-/// With VRChat running, the log shown is the first client's (the representative
-/// client of <see cref="VrchatProcessMonitor.SelectRepresentative"/>, or in Relaunch mode
-/// the running client launched first according to the Bridge's record), not the most
-/// recently written file, which with several clients would switch between them on
-/// every poll. Every poll asks Windows Restart Manager which processes have the recent
-/// files open (<see cref="VrchatLogOwners"/>): the file that only this client has open,
-/// among VRChat processes, is its log. When that settles nothing (Restart Manager is
-/// unavailable or fails, the client has no file open, an owner cannot be identified),
-/// the file shown on the previous poll stays, or the file is matched by the times in the
-/// names (<see cref="VrchatLogMatcher"/>) as before. Whichever rule picks it, a file that
-/// another VRChat has open, or that was once seen open by several, is never shown. The
-/// file is kept for that client (its PID and creation time) until the client exits, the
-/// file disappears, or Restart Manager finds another VRChat on it or the client on
-/// another file; when no file can be matched, a diagnostic is published instead.
-/// Only with no VRChat running is the newest file shown, so the last session's log
-/// stays readable (multi-client plan section 13.2).
+/// Each VRChat client has a slot (<see cref="VrchatClientRoster"/>, client-observation plan
+/// C2), and each slot's log is resolved by the rules that used to apply to the first client
+/// alone. Every poll asks Windows Restart Manager which processes have the recent files
+/// open (<see cref="VrchatLogOwners"/>), once per file however many slots ask about it: the
+/// file that only this client has open, among VRChat processes, is its log. When that
+/// settles nothing for a slot (Restart Manager is unavailable or fails for one of the
+/// slot's files, the client has no file open, an owner cannot be identified), the file
+/// shown on the previous poll stays, or the file is matched by the times in the names
+/// (<see cref="VrchatLogMatcher"/>) as before. Whichever rule picks it, a file that another
+/// VRChat has open, or that was once seen open by several, is never shown; every slot's
+/// "mixed" findings are collected before any slot's file is chosen, so the outcome does not
+/// depend on the order of the slots. A slot keeps its file (pinned to its client's PID and
+/// creation time) until the client exits, the file disappears, or Restart Manager finds
+/// another VRChat on it or the client on another file; when no file can be matched, a
+/// diagnostic is published instead.
+///
+/// logs/vrchat-latest.log (Unity 0.5.x) keeps showing what it showed before slots: the
+/// first client's log (the representative client of
+/// <see cref="VrchatProcessMonitor.SelectRepresentative"/>, or in Relaunch mode the running
+/// client launched first according to the Bridge's record), which is slot 0's unless slot 0
+/// exited, and it stays on that client while it runs. Only with no VRChat running is the
+/// newest file shown there, so the last session's log stays readable (multi-client plan
+/// section 13.2).
+///
+/// The copies are split at CRLF and continuation lines are indented (client-observation
+/// plan C6 and F2, <see cref="VrchatLogLine.ToDisplayLines"/>), and masked
+/// (<see cref="LogRedactor"/>) before being cut to their limits.
 /// </summary>
 public sealed class VrchatLogReader : IVrchatLogReader
 {
     private const string OutputLogPattern = VrchatLogDirectory.OutputLogPattern;
     private const int MaxDirectoryScan = VrchatLogDirectory.MaxDirectoryScan;
+    private const int SlotCount = VrchatClientRoster.SlotCount;
 
     private const int SnapshotBytes = 256 * 1024;
     private const int PublishedLineLimit = 200;
@@ -58,25 +71,32 @@ public sealed class VrchatLogReader : IVrchatLogReader
     private readonly Func<string, DateTime> _creationTimeUtc;
     private readonly IManagedClientStore? _managedClients;
     private readonly Func<string, IReadOnlyList<VrchatLogOwners.Owner>>? _queryOwners;
+    private readonly VrchatClientRoster _roster;
 
     /// <summary>Only VrchatLogService's sequential loop calls this reader, so no synchronization is needed.</summary>
-    private PinnedLog? _pinned;
+    private readonly PinnedLog?[] _pinned = new PinnedLog?[SlotCount];
 
     /// <summary>
-    /// Files Restart Manager showed open by several VRChat processes, refused even after
-    /// the other processes exit: their lines stay in the file. Dropped once the file is gone.
+    /// Files Restart Manager showed open by several VRChat processes, refused for every slot
+    /// even after the other processes exit: their lines stay in the file. Dropped once the
+    /// file is gone.
     /// </summary>
     private readonly HashSet<string> _mixedLogs = new(StringComparer.OrdinalIgnoreCase);
 
-    private string? _lastReportedProblem;
+    private readonly string?[] _lastReportedProblem = new string?[SlotCount];
+    private string? _lastLatestProblem;
     private string? _ownerQueryProblem;
+
+    /// <summary>The client vrchat-latest.log follows while it runs and its slot shows its log.</summary>
+    private ClientKey? _latest;
 
     public VrchatLogReader(
         IOptions<BridgeOptions> options,
         IVrchatProcessMonitor processMonitor,
         ILogger<VrchatLogReader> logger,
-        IManagedClientStore managedClients)
-        : this(options, processMonitor, logger, File.GetCreationTimeUtc, DefaultOwnerQuery(), managedClients)
+        IManagedClientStore managedClients,
+        VrchatClientRoster roster)
+        : this(options, processMonitor, logger, File.GetCreationTimeUtc, DefaultOwnerQuery(), managedClients, roster)
     {
     }
 
@@ -98,7 +118,8 @@ public sealed class VrchatLogReader : IVrchatLogReader
     /// <summary>
     /// Test-only seam for the owners too: <paramref name="queryOwners"/> stands in for
     /// <see cref="RestartManagerFileOwners.Query"/> (null: not available) and may throw
-    /// like it. <paramref name="managedClients"/> is the Relaunch record (null: none).
+    /// like it. <paramref name="managedClients"/> is the Relaunch record (null: none), and
+    /// <paramref name="roster"/> defaults to one kept in memory only.
     /// </summary>
     internal VrchatLogReader(
         IOptions<BridgeOptions> options,
@@ -106,7 +127,8 @@ public sealed class VrchatLogReader : IVrchatLogReader
         ILogger<VrchatLogReader> logger,
         Func<string, DateTime> creationTimeUtc,
         Func<string, IReadOnlyList<VrchatLogOwners.Owner>>? queryOwners,
-        IManagedClientStore? managedClients = null)
+        IManagedClientStore? managedClients = null,
+        VrchatClientRoster? roster = null)
     {
         _options = options.Value;
         _processMonitor = processMonitor;
@@ -114,6 +136,7 @@ public sealed class VrchatLogReader : IVrchatLogReader
         _creationTimeUtc = creationTimeUtc;
         _managedClients = managedClients;
         _queryOwners = queryOwners;
+        _roster = roster ?? new VrchatClientRoster(filePath: null);
     }
 
     private string? LogDirectory => VrchatLogDirectory.Resolve(_options);
@@ -128,118 +151,213 @@ public sealed class VrchatLogReader : IVrchatLogReader
         return RestartManagerFileOwners.Query;
     }
 
-    public LogSnapshotResult ReadSnapshot()
+    /// <summary>vrchat-latest.log's content alone: what this reader published before slots.</summary>
+    internal LogSnapshotResult ReadSnapshot() => Read().Latest;
+
+    public VrchatLogReadResult Read()
     {
+        var snapshot = _processMonitor.GetClients();
+        var records = _options.IsRelaunchMode && _managedClients is not null ? _managedClients.Known : [];
+        var roster = _roster.Update(snapshot, records);
+
         var logDirectory = LogDirectory;
         if (logDirectory is null || !Directory.Exists(logDirectory))
         {
             // VRChat has never run on this machine, or the derived path is
             // wrong -- never throw, just report nothing available (Codex plan
             // review Phase 5, Round 3, Scenario A).
-            return LogSnapshotResult.Empty();
+            var unavailable = Enumerable.Range(0, SlotCount)
+                .Select(slot => new SlotLogResult(slot, SlotLogStatus.Unavailable, null, LogSnapshotResult.Empty()))
+                .ToList();
+            return new VrchatLogReadResult(snapshot, roster, unavailable, LogSnapshotResult.Empty());
         }
 
-        var snapshot = _processMonitor.GetClients();
-
-        // The pinned client keeps its log for as long as it is seen, whichever client
-        // would be chosen as representative right now (e.g. while WMI cannot read its
-        // command line for one poll). Only a confirmed exit, a reused PID, a deleted
-        // file or Restart Manager (see Resolve) releases the pin; an observation that
-        // cannot tell keeps it.
-        if (_pinned is { } pinned)
-        {
-            if (!File.Exists(pinned.Path))
-            {
-                _pinned = null;
-            }
-            else if (snapshot.EnumerationError is not null)
-            {
-                return Unmatched("VRChat processes could not be checked; the log is shown again once they can be.");
-            }
-            else
-            {
-                var owner = snapshot.Clients.FirstOrDefault(c => c.ProcessId == pinned.Client.ProcessId);
-                if (owner is not null && owner.CreationTimeUtc == pinned.Client.CreationTimeUtc)
-                {
-                    return Resolve(logDirectory, owner, snapshot, pinned.Path);
-                }
-
-                if (owner is { CreationTimeUtc: null } || (owner is null && snapshot.UnverifiedCount > 0))
-                {
-                    return Unmatched(
-                        $"VRChat client {pinned.Client.ProcessId} could not be checked; " +
-                        "its log is shown again once it can be.");
-                }
-
-                _pinned = null;
-            }
-        }
-
-        if (snapshot.EnumerationError is not null)
-        {
-            return Unmatched("The VRChat process list could not be read.");
-        }
-
-        if (snapshot.Clients.Count == 0 && snapshot.UnverifiedCount == 0)
-        {
-            _lastReportedProblem = null;
-            return ReadNewest(logDirectory);
-        }
-
-        var client = SelectFirstClient(snapshot.Clients);
-        if (client is null)
-        {
-            return Unmatched("VRChat is running, but its processes could not be checked.");
-        }
-
-        return Resolve(logDirectory, client, snapshot, pinnedPath: null);
+        var slots = ResolveSlots(logDirectory, snapshot, roster);
+        var latest = ResolveLatest(logDirectory, snapshot, roster, slots);
+        return new VrchatLogReadResult(snapshot, roster, slots, latest);
     }
 
-    /// <summary>
-    /// The log of <paramref name="client"/>, which is also the pinned client when
-    /// <paramref name="pinnedPath"/> is given: the file Restart Manager shows only it has
-    /// open, else the pinned file, else the name match. A file another VRChat has open,
-    /// or that was seen mixed, is refused whichever rule picks it.
-    /// </summary>
-    private LogSnapshotResult Resolve(
-        string logDirectory, VrchatClientInfo client, VrchatClientSnapshot snapshot, string? pinnedPath)
+    private SlotLogResult[] ResolveSlots(string logDirectory, VrchatClientSnapshot snapshot, RosterView roster)
     {
-        if (pinnedPath is not null && _queryOwners is null)
+        var results = new SlotLogResult[SlotCount];
+        var pending = new List<PendingSlot>();
+
+        for (var slot = 0; slot < SlotCount; slot++)
         {
-            // Without Restart Manager nothing here can release the pin, as before it was asked.
-            return Show(pinnedPath);
+            var rosterSlot = roster.Slots[slot];
+            var entry = rosterSlot.Entry;
+
+            // The pin stays for as long as its client is seen, whichever client would be
+            // chosen now (e.g. while WMI cannot read its command line for one poll). Only a
+            // confirmed exit, a reused PID, a deleted file or Restart Manager (see Resolve)
+            // releases it; an observation that cannot tell keeps it.
+            if (_pinned[slot] is { } pin
+                && (entry is null || pin.Client != KeyOf(entry) || rosterSlot.Liveness == RosterLiveness.Exited
+                    || !File.Exists(pin.Path)))
+            {
+                _pinned[slot] = null;
+            }
+
+            var pinnedPath = _pinned[slot]?.Path;
+            if (snapshot.EnumerationError is not null)
+            {
+                results[slot] = pinnedPath is not null
+                    ? Problem(slot, SlotLogStatus.CannotCheck, "VRChat processes could not be checked; the log is shown again once they can be.")
+                    : Problem(slot, SlotLogStatus.CannotCheck, "The VRChat process list could not be read.");
+                continue;
+            }
+
+            switch (rosterSlot.Liveness)
+            {
+                case RosterLiveness.Empty:
+                    results[slot] = NotRunning(slot, snapshot, entry);
+                    break;
+                case RosterLiveness.Exited:
+                    results[slot] = NotRunning(slot, snapshot, entry);
+                    break;
+                case RosterLiveness.Unknown:
+                    results[slot] = Problem(
+                        slot,
+                        SlotLogStatus.CannotCheck,
+                        pinnedPath is not null
+                            ? $"VRChat client {entry!.ProcessId} could not be checked; its log is shown again once it can be."
+                            : $"VRChat client {entry!.ProcessId} in slot {slot} could not be checked.");
+                    break;
+                default:
+                    if (pinnedPath is not null && _queryOwners is null)
+                    {
+                        // Without Restart Manager nothing here can release the pin, as before it was asked.
+                        results[slot] = Show(slot, pinnedPath);
+                    }
+                    else
+                    {
+                        pending.Add(new PendingSlot(slot, rosterSlot.Client!, pinnedPath));
+                    }
+
+                    break;
+            }
+        }
+
+        if (pending.Count == 0)
+        {
+            return results;
         }
 
         var (candidates, scanCapped) = ListCandidates(logDirectory);
         if (scanCapped)
         {
             // Nothing to check a pinned file against; it stays.
-            return pinnedPath is null ? ScanCapped() : Show(pinnedPath);
+            foreach (var request in pending)
+            {
+                results[request.Slot] = request.PinnedPath is null ? ScanCapped(request.Slot) : Show(request.Slot, request.PinnedPath);
+            }
+
+            return results;
         }
 
         _mixedLogs.RemoveWhere(path => !File.Exists(path));
-        var ownership = QueryOwners(client, snapshot, candidates, pinnedPath);
-        if (ownership is not null)
+        var owners = QueryOwners(pending, candidates);
+        var decisions = pending.Select(request => Decide(request, snapshot, candidates, owners)).ToList();
+        foreach (var decision in decisions)
         {
-            RecordMixed(ownership.Mixed);
+            if (decision is not null)
+            {
+                RecordMixed(decision.Mixed);
+            }
         }
 
+        for (var i = 0; i < pending.Count; i++)
+        {
+            var request = pending[i];
+            results[request.Slot] = Resolve(request, snapshot, candidates, decisions[i]);
+        }
+
+        return results;
+    }
+
+    /// <summary>
+    /// The first client's log, as before slots: kept on one client while it may still run
+    /// and its slot shows its log (or cannot tell for now), else the first client chosen now.
+    /// </summary>
+    private LogSnapshotResult ResolveLatest(
+        string logDirectory, VrchatClientSnapshot snapshot, RosterView roster, IReadOnlyList<SlotLogResult> slots)
+    {
+        if (_latest is { } followed)
+        {
+            var slot = roster.Slots.FirstOrDefault(s =>
+                s.Entry is { } e && KeyOf(e) == followed && s.Liveness is RosterLiveness.Running or RosterLiveness.Unknown);
+            if (slot is not null && slots[slot.Slot].Status is SlotLogStatus.Shown or SlotLogStatus.CannotCheck)
+            {
+                return slots[slot.Slot].Content;
+            }
+
+            _latest = null;
+        }
+
+        if (snapshot.EnumerationError is not null)
+        {
+            return LatestProblem("The VRChat process list could not be read.");
+        }
+
+        if (snapshot.Clients.Count == 0 && snapshot.UnverifiedCount == 0)
+        {
+            _lastLatestProblem = null;
+            return ReadNewest(logDirectory);
+        }
+
+        var client = SelectFirstClient(snapshot.Clients);
+        if (client is null)
+        {
+            return LatestProblem("VRChat is running, but its processes could not be checked.");
+        }
+
+        if (roster.SlotOf(client) is not { } clientSlot)
+        {
+            // Its creation time is unknown, or it is a fifth client.
+            return LatestProblem(CouldNotMatch(client, slot: null));
+        }
+
+        var result = slots[clientSlot.Slot];
+        if (result.Status == SlotLogStatus.Shown)
+        {
+            _latest = KeyOf(client);
+        }
+
+        _lastLatestProblem = null;
+        return result.Content;
+    }
+
+    /// <summary>
+    /// The log of the slot's client, which is also its pinned client when
+    /// <see cref="PendingSlot.PinnedPath"/> is given: the file Restart Manager shows only it
+    /// has open, else the pinned file, else the name match. A file another VRChat has open,
+    /// or that was seen mixed, is refused whichever rule picks it.
+    /// </summary>
+    private SlotLogResult Resolve(
+        PendingSlot request,
+        VrchatClientSnapshot snapshot,
+        IReadOnlyList<VrchatLogMatcher.Candidate> candidates,
+        VrchatLogOwners.Decision? ownership)
+    {
+        var (slot, client, pinnedPath) = request;
         switch (ownership)
         {
             case { Verdict: VrchatLogOwners.Verdict.Owned, Path: { } owned } when !_mixedLogs.Contains(owned):
-                return Pin(client, owned, "the only VRChat process that has it open");
+                return Pin(slot, client, owned, "the only VRChat process that has it open");
 
             case { Verdict: VrchatLogOwners.Verdict.Owned or VrchatLogOwners.Verdict.Shared, Path: { } mixed }:
-                _pinned = null;
-                return Unmatched(
-                    $"{Path.GetFileName(mixed)}, the {OutputLogPattern} file of the first VRChat client " +
-                    $"(PID {client.ProcessId}, {Started(client)}), is or was also open by other VRChat clients, " +
+                _pinned[slot] = null;
+                return Problem(
+                    slot,
+                    SlotLogStatus.Unmatched,
+                    $"{Path.GetFileName(mixed)}, the {OutputLogPattern} file of {Describe(client, slot)}, " +
+                    "is or was also open by other VRChat clients, " +
                     "which happens when their logging starts within the same second; " +
                     "not showing the mixed log as this client's.");
 
             case { Verdict: VrchatLogOwners.Verdict.Several }:
-                _pinned = null;
-                return Unmatched(CouldNotMatch(client));
+                _pinned[slot] = null;
+                return Problem(slot, SlotLogStatus.Unmatched, CouldNotMatch(client, slot));
         }
 
         // Restart Manager settled nothing, so the file names decide as before, except for
@@ -250,10 +368,10 @@ public sealed class VrchatLogReader : IVrchatLogReader
         {
             if (!Refused(pinnedPath))
             {
-                return Show(pinnedPath);
+                return Show(slot, pinnedPath);
             }
 
-            _pinned = null;
+            _pinned[slot] = null;
             _logger.LogInformation(
                 "No longer showing {Path} as the log of VRChat client {ProcessId}: another VRChat process has or had it open.",
                 pinnedPath, client.ProcessId);
@@ -267,7 +385,7 @@ public sealed class VrchatLogReader : IVrchatLogReader
         {
             if (!Refused(match))
             {
-                return Pin(client, match, "matched by the time in its name");
+                return Pin(slot, client, match, "matched by the time in its name");
             }
 
             result = new VrchatLogMatcher.MatchResult(null, VrchatLogMatcher.MatchFailure.Ambiguous);
@@ -275,13 +393,15 @@ public sealed class VrchatLogReader : IVrchatLogReader
 
         if (HasNoLogYet(client, result, ownership))
         {
-            return Unmatched(
-                $"The first VRChat client (PID {client.ProcessId}, {Started(client)}) has not created its " +
-                $"{OutputLogPattern} file yet. This usually takes about a second, and a minute or more under " +
-                "heavy CPU load; its log is shown once it appears.");
+            return Problem(
+                slot,
+                SlotLogStatus.NotYet,
+                $"The {Describe(client, slot)} has not created its {OutputLogPattern} file yet. " +
+                "This usually takes about a second, and a minute or more under heavy CPU load; " +
+                "its log is shown once it appears.");
         }
 
-        return Unmatched(CouldNotMatch(client));
+        return Problem(slot, SlotLogStatus.Unmatched, CouldNotMatch(client, slot));
     }
 
     /// <summary>
@@ -315,71 +435,144 @@ public sealed class VrchatLogReader : IVrchatLogReader
     private static string Started(VrchatClientInfo client) =>
         client.CreationTimeUtc is { } created ? $"started {created:yyyy-MM-dd HH:mm:ss}Z" : "start time unknown";
 
-    private static string CouldNotMatch(VrchatClientInfo client) =>
-        $"Could not match an {OutputLogPattern} file to the first VRChat client " +
-        $"(PID {client.ProcessId}, {Started(client)}); " +
+    private static string Describe(VrchatClientInfo client, int? slot) =>
+        slot is { } s
+            ? $"VRChat client in slot {s} (PID {client.ProcessId}, {Started(client)})"
+            : $"VRChat client without a slot (PID {client.ProcessId}, {Started(client)})";
+
+    private static string CouldNotMatch(VrchatClientInfo client, int? slot) =>
+        $"Could not match an {OutputLogPattern} file to the {Describe(client, slot)}; " +
         "not showing another client's log instead. This happens when clients start within the same second " +
         "or write to one shared file, when VRChat created the log a minute or more after the client started, " +
         "or when the clock or time zone changed after the log was created.";
 
-    /// <summary>
-    /// The owners of the files created since shortly before the client started
-    /// (<see cref="VrchatLogOwners.QueryLead"/>) and of the pinned file. Null when Restart
-    /// Manager is not available (not Windows) or fails; a failure is logged once, and so is
-    /// the recovery. With no such file there is nothing to ask, and the decision is that
-    /// the client has no file open.
-    /// </summary>
-    private VrchatLogOwners.Decision? QueryOwners(
-        VrchatClientInfo client,
-        VrchatClientSnapshot snapshot,
-        IReadOnlyList<VrchatLogMatcher.Candidate> candidates,
-        string? pinnedPath)
+    private SlotLogResult NotRunning(int slot, VrchatClientSnapshot snapshot, RosterEntry? entry)
     {
-        if (_queryOwners is null || client.CreationTimeUtc is not { } created)
+        var message = entry is null
+            ? $"No VRChat client is running in slot {slot}."
+            : $"The VRChat client in slot {slot} (PID {entry.ProcessId}) is not running.";
+        if (snapshot.UnverifiedCount > 0)
         {
-            return null;
+            message += $" {snapshot.UnverifiedCount} VRChat process(es) could not be checked.";
         }
 
-        var paths = candidates
-            .Where(c => c.CreationTimeUtc >= created - VrchatLogOwners.QueryLead)
-            .Select(c => c.Path)
-            .ToList();
-        if (pinnedPath is not null && !paths.Contains(pinnedPath, StringComparer.OrdinalIgnoreCase))
+        _lastReportedProblem[slot] = null;
+        return new SlotLogResult(slot, SlotLogStatus.NotRunning, null, LogSnapshotResult.Diagnostic(message));
+    }
+
+    /// <summary>
+    /// The owners of every file a pending slot asks about: those created since shortly before
+    /// its client started (<see cref="VrchatLogOwners.QueryLead"/>) and its pinned file. Each
+    /// file is asked once per poll; a file whose query failed maps to null. A failure is
+    /// logged once, and so is the recovery. Without Restart Manager (not Windows) nothing is
+    /// asked.
+    /// </summary>
+    private Dictionary<string, IReadOnlyList<VrchatLogOwners.Owner>?> QueryOwners(
+        IReadOnlyList<PendingSlot> pending, IReadOnlyList<VrchatLogMatcher.Candidate> candidates)
+    {
+        var owners = new Dictionary<string, IReadOnlyList<VrchatLogOwners.Owner>?>(StringComparer.OrdinalIgnoreCase);
+        if (_queryOwners is null)
         {
-            paths.Add(pinnedPath);
+            return owners;
         }
 
-        var files = new List<VrchatLogOwners.FileOwners>(paths.Count);
-        try
+        Exception? failure = null;
+        var answered = false;
+        foreach (var request in pending)
         {
-            foreach (var path in paths)
+            foreach (var path in PathsToAsk(request, candidates))
             {
-                files.Add(new VrchatLogOwners.FileOwners(path, _queryOwners(path)));
+                if (owners.ContainsKey(path))
+                {
+                    continue;
+                }
+
+                try
+                {
+                    owners[path] = _queryOwners(path);
+                    answered = true;
+                }
+                catch (Exception ex)
+                {
+                    // Display only, so any failure (a Restart Manager error, a missing
+                    // rstrtmgr.dll) just makes the slots that asked fall back to the names.
+                    owners[path] = null;
+                    failure ??= ex;
+                }
             }
         }
-        catch (Exception ex)
+
+        if (failure is not null)
         {
-            // Display only, so any failure (a Restart Manager error, a missing rstrtmgr.dll)
-            // just falls back to the names.
-            if (ex.Message != _ownerQueryProblem)
+            if (failure.Message != _ownerQueryProblem)
             {
                 _logger.LogWarning(
-                    ex,
+                    failure,
                     "Could not ask Windows Restart Manager which processes have the VRChat logs open; " +
                     "matching them by the times in their names instead.");
-                _ownerQueryProblem = ex.Message;
+                _ownerQueryProblem = failure.Message;
             }
-
-            return null;
         }
-
-        if (_ownerQueryProblem is not null && files.Count > 0)
+        else if (_ownerQueryProblem is not null && answered)
         {
             _logger.LogInformation("Windows Restart Manager answers again; matching VRChat logs by their owners.");
             _ownerQueryProblem = null;
         }
 
-        return VrchatLogOwners.Decide(client, snapshot.Clients, files);
+        return owners;
+    }
+
+    private static IEnumerable<string> PathsToAsk(PendingSlot request, IReadOnlyList<VrchatLogMatcher.Candidate> candidates)
+    {
+        if (request.Client.CreationTimeUtc is not { } created)
+        {
+            yield break;
+        }
+
+        var asked = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var candidate in candidates)
+        {
+            if (candidate.CreationTimeUtc >= created - VrchatLogOwners.QueryLead && asked.Add(candidate.Path))
+            {
+                yield return candidate.Path;
+            }
+        }
+
+        if (request.PinnedPath is { } pinned && asked.Add(pinned))
+        {
+            yield return pinned;
+        }
+    }
+
+    /// <summary>
+    /// The slot's decision from the answers about the files it asks about. Null when
+    /// Restart Manager is not available, the client's creation time is unknown, or one of
+    /// the slot's files could not be asked about; with no such file there is nothing to
+    /// ask, and the decision is that the client has no file open.
+    /// </summary>
+    private VrchatLogOwners.Decision? Decide(
+        PendingSlot request,
+        VrchatClientSnapshot snapshot,
+        IReadOnlyList<VrchatLogMatcher.Candidate> candidates,
+        IReadOnlyDictionary<string, IReadOnlyList<VrchatLogOwners.Owner>?> owners)
+    {
+        if (_queryOwners is null || request.Client.CreationTimeUtc is null)
+        {
+            return null;
+        }
+
+        var files = new List<VrchatLogOwners.FileOwners>();
+        foreach (var path in PathsToAsk(request, candidates))
+        {
+            if (!owners.TryGetValue(path, out var fileOwners) || fileOwners is null)
+            {
+                return null;
+            }
+
+            files.Add(new VrchatLogOwners.FileOwners(path, fileOwners));
+        }
+
+        return VrchatLogOwners.Decide(request.Client, snapshot.Clients, files);
     }
 
     private void RecordMixed(IEnumerable<string> mixed)
@@ -395,23 +588,24 @@ public sealed class VrchatLogReader : IVrchatLogReader
     }
 
     /// <summary>Logged when the pin changes, not on every poll.</summary>
-    private LogSnapshotResult Pin(VrchatClientInfo client, string path, string reason)
+    private SlotLogResult Pin(int slot, VrchatClientInfo client, string path, string reason)
     {
-        var pin = new PinnedLog(new ClientKey(client.ProcessId, client.CreationTimeUtc), path);
-        if (pin != _pinned)
+        var pin = new PinnedLog(KeyOf(client), path);
+        if (pin != _pinned[slot])
         {
-            _pinned = pin;
+            _pinned[slot] = pin;
             _logger.LogInformation(
-                "Showing {Path} as the log of VRChat client {ProcessId} ({Reason}).", path, client.ProcessId, reason);
+                "Showing {Path} as the log of VRChat client {ProcessId} in slot {Slot} ({Reason}).",
+                path, client.ProcessId, slot, reason);
         }
 
-        return Show(path);
+        return Show(slot, path);
     }
 
-    private LogSnapshotResult Show(string path)
+    private SlotLogResult Show(int slot, string path)
     {
-        _lastReportedProblem = null;
-        return ReadLog(path);
+        _lastReportedProblem[slot] = null;
+        return new SlotLogResult(slot, SlotLogStatus.Shown, path, ReadLog(path));
     }
 
     /// <summary>
@@ -444,18 +638,18 @@ public sealed class VrchatLogReader : IVrchatLogReader
         var (newestFile, scanCapped) = FindNewestOutputLog(logDirectory);
         if (scanCapped)
         {
-            return ScanCapped();
+            return ScanCappedDiagnostic();
         }
 
-        return newestFile is null ? LogSnapshotResult.Empty() : ReadLog(newestFile);
+        // No VRChat runs, so nothing writes this file any more: its last line is as complete as it gets.
+        return newestFile is null ? LogSnapshotResult.Empty() : ReadLog(newestFile, keepUnterminated: true);
     }
 
-    private LogSnapshotResult ReadLog(string path)
+    private LogSnapshotResult ReadLog(string path, bool keepUnterminated = false)
     {
         try
         {
-            var lines = ReadTailLines(path);
-            return LogSnapshotResult.Success(BuildBoundedOutput(lines));
+            return LogSnapshotResult.Success(BuildBoundedOutput(ReadTailLines(path, keepUnterminated)));
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
@@ -464,21 +658,35 @@ public sealed class VrchatLogReader : IVrchatLogReader
         }
     }
 
-    private static LogSnapshotResult ScanCapped() =>
+    private SlotLogResult ScanCapped(int slot) =>
+        new(slot, SlotLogStatus.Unmatched, null, ScanCappedDiagnostic());
+
+    private static LogSnapshotResult ScanCappedDiagnostic() =>
         LogSnapshotResult.Diagnostic(
             $"Too many {OutputLogPattern} files in the VRChat log directory; " +
             $"no log was selected because the scan cap ({MaxDirectoryScan}) was exceeded.");
 
     /// <summary>
-    /// Logged once per distinct problem, not on every 5-second poll, and only as
+    /// Logged once per distinct problem and slot, not on every 5-second poll, and only as
     /// information: right after a client starts, its file usually does not exist yet.
     /// </summary>
-    private LogSnapshotResult Unmatched(string message)
+    private SlotLogResult Problem(int slot, SlotLogStatus status, string message)
     {
-        if (message != _lastReportedProblem)
+        if (message != _lastReportedProblem[slot])
+        {
+            _logger.LogInformation("VRChat log of slot {Slot} not published: {Message}", slot, message);
+            _lastReportedProblem[slot] = message;
+        }
+
+        return new SlotLogResult(slot, status, null, LogSnapshotResult.Diagnostic(message));
+    }
+
+    private LogSnapshotResult LatestProblem(string message)
+    {
+        if (message != _lastLatestProblem)
         {
             _logger.LogInformation("VRChat log not published: {Message}", message);
-            _lastReportedProblem = message;
+            _lastLatestProblem = message;
         }
 
         return LogSnapshotResult.Diagnostic(message);
@@ -488,9 +696,15 @@ public sealed class VrchatLogReader : IVrchatLogReader
     private (List<VrchatLogMatcher.Candidate> Candidates, bool ScanCapped) ListCandidates(string logDirectory) =>
         VrchatLogDirectory.ListCandidates(logDirectory, _creationTimeUtc);
 
+    private static ClientKey KeyOf(VrchatClientInfo client) => new(client.ProcessId, client.CreationTimeUtc);
+
+    private static ClientKey KeyOf(RosterEntry entry) => new(entry.ProcessId, entry.CreationTimeUtc);
+
     private readonly record struct ClientKey(int ProcessId, DateTime? CreationTimeUtc);
 
     private sealed record PinnedLog(ClientKey Client, string Path);
+
+    private sealed record PendingSlot(int Slot, VrchatClientInfo Client, string? PinnedPath);
 
     /// <summary>
     /// Bounded single-pass scan: stops as soon as a (MaxDirectoryScan + 1)th
@@ -537,8 +751,17 @@ public sealed class VrchatLogReader : IVrchatLogReader
     /// FileShare.ReadWrite | FileShare.Delete: VRChat itself has this file open
     /// for writing, and must remain free to keep writing, rotate, or delete it
     /// (Codex plan review Phase 5, Round 2, confidence 0.91).
+    ///
+    /// The window is split at CRLF (<see cref="VrchatLogLine"/>). When it does not start at
+    /// byte 0, everything up to its first CRLF may be part of a line (the read seeked into
+    /// the middle of the file) and is discarded rather than published as a fragment, and so
+    /// is the last line until its CRLF is written (VRChat may be writing it; a value at its
+    /// end may be incomplete and not yet recognizable to mask), unless
+    /// <paramref name="keepUnterminated"/> says no VRChat writes the file any more. Each whole line is masked
+    /// before it is split into display lines, so a value after a lone LF is still masked
+    /// (client-observation plan C5).
     /// </summary>
-    private static string[] ReadTailLines(string path)
+    private static List<string> ReadTailLines(string path, bool keepUnterminated)
     {
         using var fs = new FileStream(
             path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
@@ -560,44 +783,32 @@ public sealed class VrchatLogReader : IVrchatLogReader
             totalRead += read;
         }
 
-        var text = DecodeTolerantly(buffer, totalRead);
-        var lines = text.Split('\n');
-        for (var i = 0; i < lines.Length; i++)
+        ReadOnlySpan<byte> window = buffer.AsSpan(0, totalRead);
+        if (start > 0)
         {
-            lines[i] = lines[i].TrimEnd('\r');
+            var first = VrchatLogLine.IndexAfterFirstCrlf(window);
+            window = first < 0 ? [] : window[first..];
         }
 
-        // A trailing newline produces a final empty element; drop it.
-        if (lines.Length > 0 && lines[^1].Length == 0)
+        var physical = VrchatLogLine.SplitPhysicalLines(window);
+        if (!keepUnterminated || physical[^1].Length == 0)
         {
-            lines = lines[..^1];
+            physical.RemoveAt(physical.Count - 1);
         }
 
-        // If the read window didn't start at byte 0, the first decoded line may
-        // be a partial line (we seeked into the middle of the file) -- discard it
-        // rather than publish a corrupted-looking fragment.
-        if (start > 0 && lines.Length > 0)
+        var lines = physical.Select(LogRedactor.Redact).SelectMany(VrchatLogLine.ToDisplayLines).ToList();
+
+        // A trailing lone LF leaves an empty last part; it is not a line.
+        if (lines.Count > 0 && lines[^1].Length == 0)
         {
-            lines = lines[1..];
+            lines.RemoveAt(lines.Count - 1);
         }
 
         return lines;
     }
 
-    /// <summary>
-    /// UTF-8 tolerant of invalid byte sequences (replacement character instead
-    /// of throwing) -- real VRChat logs were confirmed BOM-less and
-    /// UTF-8-compatible on real hardware, but a mid-file seek could still land
-    /// on a partial multi-byte sequence at the very start of the window, which
-    /// this must not crash on (Codex plan review Phase 5, Round 2).
-    /// </summary>
-    private static string DecodeTolerantly(byte[] buffer, int count)
-    {
-        var decoder = new UTF8Encoding(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: false);
-        return decoder.GetString(buffer, 0, count);
-    }
-
-    private static string BuildBoundedOutput(string[] lines)
+    /// <summary>Cuts each masked line, then the whole copy, to their limits.</summary>
+    private static string BuildBoundedOutput(List<string> lines)
     {
         var selected = lines.TakeLast(PublishedLineLimit).Select(TruncateLine).ToArray();
 

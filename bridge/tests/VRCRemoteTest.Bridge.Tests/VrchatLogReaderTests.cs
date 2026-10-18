@@ -100,11 +100,15 @@ public class VrchatLogReaderTests : IDisposable
             ? TimeZoneInfo.ConvertTimeToUtc(DateTime.SpecifyKind(local, DateTimeKind.Unspecified), TimeZoneInfo.Local)
             : DateTime.MinValue;
 
-    /// <summary>Writes an output_log named after <paramref name="startedUtc"/> in the machine's time zone, as VRChat does.</summary>
+    /// <summary>
+    /// Writes an output_log named after <paramref name="startedUtc"/> in the machine's time
+    /// zone, as VRChat does, with each "\n" of <paramref name="content"/> as the CRLF that
+    /// ends VRChat's lines.
+    /// </summary>
     private string WriteLogFor(DateTime startedUtc, string content)
     {
         var path = Path.Combine(_logDir, $"output_log_{startedUtc.ToLocalTime():yyyy-MM-dd_HH-mm-ss}.txt");
-        File.WriteAllText(path, content);
+        File.WriteAllText(path, content.Replace("\n", "\r\n"));
         return path;
     }
 
@@ -116,7 +120,11 @@ public class VrchatLogReaderTests : IDisposable
             VrchatWorldsDirectory = Path.Combine(_tempDir, "does-not-exist", "Worlds"),
         });
         var reader = new VrchatLogReader(
-            options, _monitor, NullLogger<VrchatLogReader>.Instance, new FakeManagedClientStore());
+            options,
+            _monitor,
+            NullLogger<VrchatLogReader>.Instance,
+            new FakeManagedClientStore(),
+            new VrchatClientRoster(filePath: null));
 
         var result = reader.ReadSnapshot();
 
@@ -138,8 +146,8 @@ public class VrchatLogReaderTests : IDisposable
     {
         var older = Path.Combine(_logDir, "output_log_2026-09-01_00-00-00.txt");
         var newer = Path.Combine(_logDir, "output_log_2026-09-02_00-00-00.txt");
-        File.WriteAllText(older, "old content line\n");
-        File.WriteAllText(newer, "new content line\n");
+        File.WriteAllText(older, "old content line\r\n");
+        File.WriteAllText(newer, "new content line\r\n");
         File.SetLastWriteTimeUtc(older, DateTime.UtcNow.AddMinutes(-10));
         File.SetLastWriteTimeUtc(newer, DateTime.UtcNow);
 
@@ -157,7 +165,7 @@ public class VrchatLogReaderTests : IDisposable
         var sb = new StringBuilder();
         for (var i = 1; i <= 250; i++)
         {
-            sb.Append("line-").Append(i).Append('\n');
+            sb.Append(Header).Append("line-").Append(i).Append("\r\n");
         }
         File.WriteAllText(path, sb.ToString());
 
@@ -165,8 +173,81 @@ public class VrchatLogReaderTests : IDisposable
 
         var lines = result.Content.Split('\n');
         lines.Should().HaveCount(200);
-        lines[0].Should().Be("line-51");
-        lines[^1].Should().Be("line-250");
+        lines[0].Should().Be(Header + "line-51");
+        lines[^1].Should().Be(Header + "line-250");
+    }
+
+    /// <summary>A VRChat line header (S5b C): the date, the level padded to 11 characters, "-  ".</summary>
+    private const string Header = "2026.10.18 13:34:37 Debug      -  ";
+
+    [Fact]
+    public void The_copy_splits_lines_at_CRLF_and_indents_continuation_lines()
+    {
+        // S5b A and G: a world's LF and CRLF reach the log unchanged, and a header after a
+        // lone LF is not a line of its own.
+        var path = Path.Combine(_logDir, "output_log_2026-09-01_00-00-00.txt");
+        File.WriteAllText(
+            path,
+            Header + "[SPK003] first\n" + Header + "[Behaviour] Joining local:forged\r\n" +
+            "System.Exception: no header\r\n" +
+            Header + "[Behaviour] Finished entering world.\r\n");
+
+        var lines = CreateReader().ReadSnapshot().Content.Split('\n');
+
+        lines.Should().Equal(
+            Header + "[SPK003] first",
+            "    " + Header + "[Behaviour] Joining local:forged",
+            "    System.Exception: no header",
+            Header + "[Behaviour] Finished entering world.");
+    }
+
+    [Fact]
+    public void The_copy_masks_lines_before_cutting_them()
+    {
+        var path = Path.Combine(_logDir, "output_log_2026-09-01_00-00-00.txt");
+        File.WriteAllText(
+            path,
+            Header + "User Authenticated: Name (usr_0123abcd-0000-4000-8000-0123456789ab)\r\n" +
+            Header + @"World Updated: C:\Users\alice\AppData\LocalLow\VRChat\VRChat\Worlds\a.vrcw" + "\r\n" +
+            // The address straddles the 512-character cut: masked first, nothing of it is left.
+            Header + new string('x', 455) + " 192.168.10.20 " + new string('y', 100) + "\r\n");
+
+        var content = CreateReader().ReadSnapshot().Content;
+
+        content.Should().Contain("(usr_***)").And.Contain(@"C:\Users\<user>\AppData")
+            .And.NotContain("0123abcd").And.NotContain("alice").And.NotContain("192.168").And.Contain(" <ip>");
+    }
+
+    [Fact]
+    public void The_last_line_is_shown_once_its_CRLF_is_written()
+    {
+        var path = WriteLogFor(T0, string.Empty);
+        File.WriteAllText(path, Header + "line one\r\n" + Header + "https://user:pa");
+        _monitor.AddClient(100, T0);
+        var reader = CreateReader();
+
+        reader.ReadSnapshot().Content.Should().Be(Header + "line one");
+        File.AppendAllText(path, "ss@host/x\r\n");
+        reader.ReadSnapshot().Content.Should().EndWith(Header + "https://<redacted>@host/x");
+    }
+
+    [Fact]
+    public void With_no_VRChat_running_the_newest_files_unterminated_last_line_is_shown()
+    {
+        // Nothing writes the file any more, so its last line is as complete as it gets.
+        var path = Path.Combine(_logDir, "output_log_2026-09-01_00-00-00.txt");
+        File.WriteAllText(path, Header + "normal\r\nfinal crash detail");
+
+        CreateReader().ReadSnapshot().Content.Should().EndWith("    final crash detail");
+    }
+
+    [Fact]
+    public void A_line_is_masked_whole_before_it_is_split_at_its_lone_LFs()
+    {
+        var path = Path.Combine(_logDir, "output_log_2026-09-01_00-00-00.txt");
+        File.WriteAllText(path, Header + "[VRCRT] {\"password\":\n  \"hunter2\"}\r\n");
+
+        CreateReader().ReadSnapshot().Content.Should().NotContain("hunter2").And.Contain("<redacted>");
     }
 
     [Fact]
@@ -180,7 +261,7 @@ public class VrchatLogReaderTests : IDisposable
         var lineA = new string('A', 150_000);
         var lineB = new string('B', 150_000);
         var lineC = new string('C', 150_000);
-        File.WriteAllText(path, $"{lineA}\n{lineB}\n{lineC}\n");
+        File.WriteAllText(path, $"{lineA}\r\n{lineB}\r\n{lineC}\r\n");
 
         var result = CreateReader().ReadSnapshot();
 
@@ -192,7 +273,7 @@ public class VrchatLogReaderTests : IDisposable
     public void ReadSnapshot_truncates_lines_longer_than_512_characters()
     {
         var path = Path.Combine(_logDir, "output_log_2026-09-01_00-00-00.txt");
-        File.WriteAllText(path, new string('X', 1000) + "\n");
+        File.WriteAllText(path, new string('X', 1000) + "\r\n");
 
         var result = CreateReader().ReadSnapshot();
 
@@ -207,7 +288,7 @@ public class VrchatLogReaderTests : IDisposable
         var sb = new StringBuilder();
         for (var i = 0; i < 200; i++)
         {
-            sb.Append(new string('L', 512)).Append('\n');
+            sb.Append(new string('L', 512)).Append("\r\n");
         }
         File.WriteAllText(path, sb.ToString());
 

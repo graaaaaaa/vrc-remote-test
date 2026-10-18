@@ -1,3 +1,4 @@
+using System.Text.Json;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
@@ -12,33 +13,59 @@ namespace VRCRemoteTest.Bridge.VRChat;
 /// 10s, since a log viewer a developer is actively watching implies an
 /// expectation of near-live updates that a 10s-shared loop would not meet).
 ///
+/// Every poll publishes, from one enumeration of the VRChat clients
+/// (client-observation plan F1-F3):
+/// - logs/vrchat-latest.log, the first client's log as before slots (Unity 0.5.x);
+/// - logs/clients/slot-{n}.log for slots 0-3, each slot's log tail or why it is not shown;
+/// - logs/clients/slot-{n}.markers.log when its content changed, after keeping the previous
+///   client's markers as slot-{n}.markers.prev.log when a new client took the slot;
+/// - status/vrchat-clients.json.
+///
+/// A log copy whose content did not change since it was last written is not written again.
+/// A markers or .prev file counts as written only when SharedFileWriter replaced it (not when
+/// a reader kept it busy), and the observer offers it again until then; a slot's new markers
+/// wait until its .prev is in place.
+///
 /// Every iteration is wrapped in try/catch: an unhandled exception escaping
 /// BackgroundService.ExecuteAsync stops the entire Generic Host by default (.NET
 /// 6+ BackgroundServiceExceptionBehavior) -- the same lesson Phase 4a learned the
-/// hard way for VrchatMonitorService, applied here from the start.
+/// hard way for VrchatMonitorService, applied here from the start. A file that cannot be
+/// written is logged and the others are still written.
 ///
 /// While the deploy flow shows a <see cref="VrchatLogNotice"/> (Relaunch mode, from just
 /// before closing the recorded clients until the first new one is recorded), that line is
-/// published instead of the log, and the log is not read. Showing or clearing it wakes this
-/// loop, so the line replaces the log, and the log returns, without waiting for the next poll.
+/// published instead of every log copy, and the logs are not read. Showing or clearing it
+/// wakes this loop, so the line replaces the logs, and the logs return, without waiting for
+/// the next poll.
 /// </summary>
 public sealed class VrchatLogService : BackgroundService
 {
     private static readonly TimeSpan DefaultPollInterval = TimeSpan.FromSeconds(5);
 
+    private static readonly JsonSerializerOptions SerializerOptions = new() { WriteIndented = true };
+
     private readonly BridgeOptions _options;
     private readonly IVrchatLogReader _logReader;
+    private readonly VrchatClientObserver _observer;
     private readonly VrchatLogNotice _notice;
     private readonly ILogger<VrchatLogService> _logger;
-    private readonly SharedFileWriter _fileWriter;
     private readonly TimeSpan _pollInterval;
+
+    /// <summary>One writer per published file, so each logs its own outcome changes.</summary>
+    private readonly Dictionary<string, SharedFileWriter> _writers = new(StringComparer.OrdinalIgnoreCase);
+
+    private readonly Dictionary<string, string> _lastWriteProblem = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>What each log copy was last written with.</summary>
+    private readonly Dictionary<string, string> _written = new(StringComparer.OrdinalIgnoreCase);
 
     public VrchatLogService(
         IOptions<BridgeOptions> options,
         IVrchatLogReader logReader,
+        VrchatClientObserver observer,
         VrchatLogNotice notice,
         ILogger<VrchatLogService> logger)
-        : this(options, logReader, notice, logger, DefaultPollInterval)
+        : this(options, logReader, observer, notice, logger, DefaultPollInterval)
     {
     }
 
@@ -46,19 +73,24 @@ public sealed class VrchatLogService : BackgroundService
     internal VrchatLogService(
         IOptions<BridgeOptions> options,
         IVrchatLogReader logReader,
+        VrchatClientObserver observer,
         VrchatLogNotice notice,
         ILogger<VrchatLogService> logger,
         TimeSpan pollInterval)
     {
         _options = options.Value;
         _logReader = logReader;
+        _observer = observer;
         _notice = notice;
         _logger = logger;
-        _fileWriter = new SharedFileWriter(logger);
         _pollInterval = pollInterval;
     }
 
     private string LogsDirectory => Path.Combine(_options.StagingDirectory, "logs");
+
+    private string ClientLogsDirectory => Path.Combine(LogsDirectory, "clients");
+
+    private string StatusDirectory => Path.Combine(_options.StagingDirectory, "status");
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
@@ -66,15 +98,15 @@ public sealed class VrchatLogService : BackgroundService
         {
             try
             {
-                var snapshot = NextSnapshot();
-                if (snapshot.IsAvailable)
-                {
-                    Publish(snapshot.Content);
-                }
+                PollOnce(stoppingToken);
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
                 _logger.LogError(ex, "Unhandled error while polling the VRChat log.");
+            }
+            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+            {
+                break;
             }
 
             try
@@ -89,29 +121,169 @@ public sealed class VrchatLogService : BackgroundService
     }
 
     /// <summary>
-    /// A notice shown while the log was being read replaces what was read, which is then
-    /// the log of a client being closed. One shown after this check is published on the
+    /// A notice shown while the logs were being read replaces what was read, which is then
+    /// the logs of clients being closed. One shown after this check is published on the
     /// next iteration, which its wake starts at once.
     /// </summary>
-    private LogSnapshotResult NextSnapshot()
+    private void PollOnce(CancellationToken cancellationToken)
     {
         if (_notice.Message is { } shown)
         {
-            return LogSnapshotResult.Diagnostic(shown);
+            PublishNotice(shown);
+            return;
         }
 
-        var snapshot = _logReader.ReadSnapshot();
-        return _notice.Message is { } message ? LogSnapshotResult.Diagnostic(message) : snapshot;
+        var read = _logReader.Read();
+        if (_notice.Message is { } message)
+        {
+            PublishNotice(message);
+            return;
+        }
+
+        var observation = _observer.Observe(read, cancellationToken);
+
+        if (read.Latest.IsAvailable)
+        {
+            PublishIfChanged(Path.Combine(LogsDirectory, "vrchat-latest.log"), read.Latest.Content);
+        }
+
+        foreach (var slot in read.Slots)
+        {
+            if (!slot.Content.IsAvailable)
+            {
+                continue;
+            }
+
+            var content = observation.SlotNotices.TryGetValue(slot.Slot, out var notices)
+                ? string.Join("\n", notices.Select(n => "# " + n).Append(slot.Content.Content))
+                : slot.Content.Content;
+            PublishIfChanged(SlotLogPath(slot.Slot), content);
+        }
+
+        var waiting = new HashSet<int>();
+        foreach (var previous in observation.PreviousMarkers)
+        {
+            if (KeepPreviousMarkers(previous))
+            {
+                _observer.AcknowledgePrevious(previous);
+            }
+            else
+            {
+                waiting.Add(previous.Slot);
+            }
+        }
+
+        foreach (var markers in observation.MarkerFiles)
+        {
+            if (!waiting.Contains(markers.Slot) && Publish(MarkersPath(markers.Slot), markers.Content))
+            {
+                _observer.AcknowledgeMarkers(markers.Slot, markers.Key);
+            }
+        }
+
+        Publish(
+            Path.Combine(StatusDirectory, "vrchat-clients.json"),
+            JsonSerializer.Serialize(observation.Clients, SerializerOptions));
+    }
+
+    private void PublishNotice(string message)
+    {
+        PublishIfChanged(Path.Combine(LogsDirectory, "vrchat-latest.log"), message);
+        for (var slot = 0; slot < VrchatClientRoster.SlotCount; slot++)
+        {
+            PublishIfChanged(SlotLogPath(slot), message);
+        }
+    }
+
+    private string SlotLogPath(int slot) => Path.Combine(ClientLogsDirectory, $"slot-{slot}.log");
+
+    private string MarkersPath(int slot) => Path.Combine(ClientLogsDirectory, $"slot-{slot}.markers.log");
+
+    private string PreviousMarkersPath(int slot) => Path.Combine(ClientLogsDirectory, $"slot-{slot}.markers.prev.log");
+
+    /// <summary>
+    /// Keeps the previous client's markers as slot-{n}.markers.prev.log, replacing the older
+    /// one, so only the one generation before is kept (client-observation plan C5). Without
+    /// the markers in memory (that client ran before this Bridge started), the published file
+    /// is moved there as it is, without being read: the share's logs directory is the
+    /// Bridge's to write, not the SMB account's. True once done.
+    /// </summary>
+    private bool KeepPreviousMarkers(PreviousMarkers previous)
+    {
+        var previousPath = PreviousMarkersPath(previous.Slot);
+        if (previous.Content is { } content)
+        {
+            return Publish(previousPath, content);
+        }
+
+        var current = MarkersPath(previous.Slot);
+        try
+        {
+            if (File.Exists(current))
+            {
+                File.Move(current, previousPath, overwrite: true);
+            }
+
+            return true;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            if (!_lastWriteProblem.TryGetValue(previousPath, out var problem) || problem != ex.Message)
+            {
+                _logger.LogWarning(ex, "Could not move {Path} to {Previous}; trying again on the next poll.", current, previousPath);
+                _lastWriteProblem[previousPath] = ex.Message;
+            }
+
+            return false;
+        }
+    }
+
+    private void PublishIfChanged(string path, string content)
+    {
+        if (_written.TryGetValue(path, out var written) && written == content)
+        {
+            return;
+        }
+
+        if (Publish(path, content))
+        {
+            _written[path] = content;
+        }
+        else
+        {
+            _written.Remove(path);
+        }
     }
 
     /// <summary>
     /// Tmp-then-rename like ResultWriter, except that a destination held open by the
     /// Mac's SMB client is replaced with POSIX semantics rather than failing every poll
-    /// (see SharedFileWriter).
+    /// (see SharedFileWriter). A failure is logged once per file and problem.
     /// </summary>
-    private void Publish(string content)
+    private bool Publish(string path, string content)
     {
-        Directory.CreateDirectory(LogsDirectory);
-        _fileWriter.Write(Path.Combine(LogsDirectory, "vrchat-latest.log"), content);
+        try
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+            if (!_writers.TryGetValue(path, out var writer))
+            {
+                writer = new SharedFileWriter(_logger);
+                _writers[path] = writer;
+            }
+
+            var outcome = writer.Write(path, content);
+            _lastWriteProblem.Remove(path);
+            return outcome != SharedFileWriteOutcome.DestinationBusy;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            if (!_lastWriteProblem.TryGetValue(path, out var problem) || problem != ex.Message)
+            {
+                _logger.LogError(ex, "Could not publish {Path}.", path);
+                _lastWriteProblem[path] = ex.Message;
+            }
+
+            return false;
+        }
     }
 }

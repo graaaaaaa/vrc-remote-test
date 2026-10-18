@@ -118,7 +118,7 @@ public class RestartManagerFileOwnersTests : IDisposable
         var worldsDir = Path.Combine(logDir, "Worlds");
         Directory.CreateDirectory(worldsDir);
         var path = Path.Combine(logDir, "output_log_2020-01-01_00-00-00.txt");
-        File.WriteAllText(path, "first client line\n");
+        File.WriteAllText(path, "first client line\r\n");
 
         using var current = Process.GetCurrentProcess();
         var monitor = new FakeVrchatProcessMonitor();
@@ -127,7 +127,8 @@ public class RestartManagerFileOwnersTests : IDisposable
             Options.Create(new BridgeOptions { VrchatWorldsDirectory = worldsDir }),
             monitor,
             NullLogger<VrchatLogReader>.Instance,
-            new FakeManagedClientStore());
+            new FakeManagedClientStore(),
+            new VrchatClientRoster(filePath: null));
 
         using (HoldOpen(path))
         {

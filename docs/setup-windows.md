@@ -18,6 +18,7 @@ VRC Remote Testを使うために、Windows実機（VRChatクライアントを�
 - Windows で実行するスクリプトは、Windows のローカルにあるものだけを使う。Mac の共有上のスクリプトを実行すると、Mac が侵害されたときに Windows でコードを実行されてしまう。
 - これらは一人開発・家庭内 LAN を想定した設計。共有の資格情報が漏れれば、任意のワールドを配置される（Mac が侵害された場合も同じ）。
 - `vrcremote` には、シンボリックリンクを作成する特権を与えない（既定のまま）。Bridge は共有内のリンクを取り込まないが、検査と読み取りの間に差し替えられる余地までは塞いでいない。
+- 共有には VRChat のログの写し（全台の分、手順11-1）が出る。ユーザー ID・ユーザープロファイルのパス・IP アドレス・認証の値は伏せるが、全 profile の表示名と訪れたワールドの情報は、共有を読める人に見える。一人の操作者を前提にした残余リスクとして受け入れている。
 - 受け入れている残余リスク: 共有の資格情報を持つ人は、`incoming` へのアップロードでディスクを埋めたり、処理中のアップロードを同名のファイルで妨害したりできる。いずれも配置されるワールドの中身には影響しない。処理済みの buildId をもう一度アップロードしても、`results` の結果は書き換わらない（v0.5.0 までは `BUILD_ALREADY_PROCESSED` や `MANIFEST_INVALID` で上書きされた）。
 
 ---
@@ -430,10 +431,14 @@ VRChatのホーム画面到達を確認したら準備完了。以降はUnity側
    Get-ChildItem -LiteralPath "$env:USERPROFILE\AppData\LocalLow\VRChat\VRChat" -Filter 'output_log_*.txt' -File |
        ForEach-Object { Remove-Item -LiteralPath $_.FullName }
    ```
-5. 共有の写しと、書き込み途中のファイルを消す:
+5. 共有の写しと、書き込み途中のファイルを消す（v0.6.0 からは台ごとの写しとマーカー行、台の一覧も）:
    ```powershell
-   foreach ($path in 'C:\VRCRemoteTest\logs\vrchat-latest.log', 'C:\VRCRemoteTest\logs\vrchat-latest.log.tmp') {
+   foreach ($path in 'C:\VRCRemoteTest\logs\vrchat-latest.log', 'C:\VRCRemoteTest\logs\vrchat-latest.log.tmp',
+                     'C:\VRCRemoteTest\status\vrchat-clients.json', 'C:\VRCRemoteTest\status\vrchat-clients.json.tmp') {
        if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path }
+   }
+   if (Test-Path -LiteralPath 'C:\VRCRemoteTest\logs\clients') {
+       Get-ChildItem -LiteralPath 'C:\VRCRemoteTest\logs\clients' -File | ForEach-Object { Remove-Item -LiteralPath $_.FullName }
    }
    ```
 6. Bridge を有効に戻して起動する。元のログが無ければ共有の写しは作られず、次に VRChat がログを作ると公開が再開する:
@@ -529,13 +534,13 @@ Moonlight（NVIDIA GameStream/Sunshine互換のリモートデスクトップク
 
 VRChat が動いている間は、最新のファイルではなく1台目（`--watch-worlds` 付きの台のうち最も早く起動した台。Relaunch（手順9-3）では、Bridge の記録の中で最も早く起動した、まだ動いている台）のログを表示する。output_log には PID が出ないが、VRChat は自分の output_log を開いたままにしている。そこで Bridge は、更新のたびに Windows の Restart Manager で「どのプロセスがそのファイルを開いているか」を調べ、VRChat のうち1台目だけが開いているファイルを1台目のログにする。管理者権限は要らない。Restart Manager で決まらないときは、今までどおりファイル名の時刻と台の起動時刻で対応付ける。選んだファイルは、その台が動いている間は表示し続ける。表示は次のとおり。Logging の設定は手順9-2を参照。
 
-- 1台目のログファイルがまだ無いときは、「The first VRChat client (PID ...) has not created its output_log_*.txt file yet ...」という1行を表示する。起動直後の最初の更新はたいていこの1行になる（ファイルができるのは、負荷が無いときは起動の約1秒後。CPU の使用率が100%近いと、1〜2分かかったこともある）。ファイルができれば、次の更新（5秒以内）で1台目のログに切り替わる。起動から1分以上たってファイルができても、1台目だけが開いていれば表示できる。この1行が、前のセッション（閉じた台）のログの表示を置き換える
+- 1台目のログファイルがまだ無いときは、「The VRChat client in slot 0 (PID ...) has not created its output_log_*.txt file yet ...」という1行を表示する（slot は手順11-1。v0.5.x までは「The first VRChat client」だった）。起動直後の最初の更新はたいていこの1行になる（ファイルができるのは、負荷が無いときは起動の約1秒後。CPU の使用率が100%近いと、1〜2分かかったこともある）。ファイルができれば、次の更新（5秒以内）で1台目のログに切り替わる。起動から1分以上たってファイルができても、1台目だけが開いていれば表示できる。この1行が、前のセッション（閉じた台）のログの表示を置き換える
 - 1台目のログにほかの VRChat の台も書いているとき（ログを書き始めたのが同じ秒の台は、1つのファイルに書く）は、ログの代わりに「... is or was also open by other VRChat clients ...」という1行を表示する。Bridge は、2台以上の VRChat が開いているのを一度でも見たファイルを、ほかの台が終了したあとも表示しない
-- 1台目のログを特定できないときは、ログの代わりに「Could not match an output_log_*.txt file to the first VRChat client ...」という1行を表示する。Restart Manager で決まらず（下を参照）、ファイル名でも対応付けられないとき（同じ秒に起動した台がある、起動から1分以上たってログができた、ログを作ったあとに時計やタイムゾーンが変わった、など）にこうなる。別の台のログを1台目のものとして表示することはしない
+- 1台目のログを特定できないときは、ログの代わりに「Could not match an output_log_*.txt file to the VRChat client in slot 0 ...」という1行を表示する。Restart Manager で決まらず（下を参照）、ファイル名でも対応付けられないとき（同じ秒に起動した台がある、起動から1分以上たってログができた、ログを作ったあとに時計やタイムゾーンが変わった、など）にこうなる。別の台のログを1台目のものとして表示することはしない
 - Relaunch（手順9-3）で台を起動し直すときは、Bridge が台を閉じ始めてから（記録の台がもう終了していれば、閉じる前の確認を終えてから）、新しい1台目を起動して記録するまで、ログの代わりに「The Bridge is relaunching its VRChat clients with the new build (VrchatClientMode: Relaunch): ...」という1行を表示する。閉じている台のログも、全台を閉じたあとの最新のファイルも、前のセッションのログだから。記録の台が終了していても、最新のファイルはその台のログなので同じく出す（終了の途中で Bridge が止まり、送ってあった終了の要求で台が終わってから、Bridge がそのビルドをやり直したとき。手で閉じたあとの配置も同じ）。この1行は閉じ始めたときにすぐ書き、1台目を記録するとすぐログを読み直す（5秒ごとの更新を待たない）。そのあとは上のとおりで、たいてい「has not created its output_log_*.txt file yet」の1行を経て、1台目のログになる。閉じられない台があった、手で起動した台が現れた、配置や起動に失敗した、などで止まったときは、その時点でこの1行をやめ、動いている台のログ（1台も動いていなければ最新のファイル）に戻る。記録が空の配置（初回や、記録を消したあと）では出さない。手で起動した台があって何も閉じずに止まる配置でも出さない
 - VRChat が1台も動いていないときは、今までどおり最新のファイル（前回のセッションのログ）を表示する（Relaunch の起動し直しの間を除く）。Bridge が1台目を起動してから次の更新（約5秒後）までは、このファイルが残る（Reload のコールドスタートと、Relaunch で記録が空の配置。どちらも VRChat が動いていない状態から始まるので、セッションの始めに1度だけ）
 
-ファイルを選んだときは、Bridge のログに `Showing ... as the log of VRChat client <PID> (the only VRChat process that has it open).` が出る。ファイル名の時刻で選んだときは、括弧の中が `matched by the time in its name` になる。
+ファイルを選んだときは、Bridge のログに `Showing ... as the log of VRChat client <PID> in slot <n> (the only VRChat process that has it open).` が出る。ファイル名の時刻で選んだときは、括弧の中が `matched by the time in its name` になる。
 
 - ファイルを開いているプロセスのうち、VRChat 以外（Bridge 自身、エディタ、ウイルス対策ソフトなど）は数えない。VRChat かどうかは、プロセスのイメージ名（`VRChat.exe`）で見る
 - 次のときは Restart Manager では決まらないので、ファイル名の時刻で対応付ける。Restart Manager が答えない（Bridge のログに `Could not ask Windows Restart Manager ...` の警告が1度出て、答えるようになると `Windows Restart Manager answers again` が出る）、1台目がどのファイルも開いていない、ファイルを開いているプロセスを確かめられない（ちょうど終了した、など）。このときも、ほかの VRChat が開いているファイルは表示しない
@@ -550,7 +555,31 @@ VRChat はログファイルに、ログを書き始めた時刻（秒まで）�
 
 この待ちは Bridge が起動する台（`AutoLaunchVrchat: true` のコールドスタートと、Relaunch の起動し直し）だけに効く。`start-vrchat-dev.ps1 -Clients N` は決まった間隔（`-LaunchIntervalSeconds`、既定3秒）で起動するので、CPU の負荷が高いと台どうしのログが混ざりやすく、1台目のログが混ざると Log Viewer にはメッセージの1行だけが出る。Restart Manager が答えないときはファイル名の時刻だけで対応付けるので、1台目のログを表示できなかったり、ログが起動の間隔を超えて遅れたときに、終了した台のログを次の台のものとして表示したりすることもありうる。負荷の高い状態で手で起動するなら、`-LaunchIntervalSeconds 60` のように間隔を延ばす。
 
-VRChat のログには、自分の表示名やユーザー ID、訪れたワールドの情報、同じインスタンスにいた他プレイヤーの表示名が含まれる。共有に読み取り権限を持つ人はこれを読めるので、共有の資格情報は他人に渡さないこと。
+VRChat のログには、自分の表示名やユーザー ID、訪れたワールドの情報、同じインスタンスにいた他プレイヤーの表示名が含まれる。Bridge は共有に書く前にユーザー ID などを伏せる（手順11-1）が、表示名とワールドの情報は残る。共有に読み取り権限を持つ人はこれを読めるので、共有の資格情報は他人に渡さないこと。
+
+### 11-1. 台ごとのログ・マーカー行・台の一覧
+
+v0.6.0 の Bridge は、1台目だけでなく全台（最大4台）のログを、台番号（slot、0〜3）ごとに共有へ書く。Windows 側の追加設定は要らない。どれも Bridge が書き、Mac は読むだけ（共有の権限も Mac からの要求も増えない）。Unity の Log Viewer では slot を切り替えて見られ、Mac のエージェントは `scripts/vrcrt.sh` で読む。
+
+| ファイル | 中身 |
+|---|---|
+| `logs\clients\slot-<n>.log` | その台のログの最新200行（今までの `vrchat-latest.log` と同じ規則で、台ごとにファイルを選ぶ）。台が動いていないときは「No VRChat client is running in slot n.」などの1行 |
+| `logs\clients\slot-<n>.markers.log` | その台のセッションの最初から集めたマーカー行（下記）。200行から流れ落ちない |
+| `logs\clients\slot-<n>.markers.prev.log` | その slot に新しい台が起動したときの、前の台のマーカー行（1世代だけ） |
+| `status\vrchat-clients.json` | 台の一覧。slot、PID、状態（`starting`・`joining`・`joined`・`left`・`unknown`）、インスタンス、Error World にいるか、参加者、Master か、Logging の設定、ログインの行があったか、最近の出来事 |
+| `logs\vrchat-latest.log` | 今までどおり、1台目のログ（Unity 0.5.x との互換） |
+
+- **slot の決め方**: 新しく見えた台を、起動の早い順に、空いている slot に入れる。Relaunch（手順9-3）では Bridge の記録の起動順の slot に入れる。台は動いている間ずっと同じ slot にいて、Bridge を再起動しても変わらない（対応は `%LOCALAPPDATA%\VRCRemoteTest\state\observation-roster.json`。観測専用で、台を閉じたり起動したりする根拠にはしない）。終わった台の slot は、次の台が入るまで残る（たとえば Reload で slot 0 の台を閉じても、残った台は slot 1 のまま）。
+- **行の区切り**: VRChat のログの行の区切りは CRLF。ワールドが `Debug.Log` で出した文字列の中の改行（LF・CRLF）はそのまま書かれるので、Bridge は CRLF だけで行を区切り、単独の LF のあとは前の行の続きとして扱う。共有の写し（`slot-<n>.log` と `vrchat-latest.log`）では、続きの行の先頭に空白4つを付ける（v0.5.x の写しでは、続きの行や LF のあとに書かれた偽の行の頭が、独立した1行に見えていた）。
+- **マーカー行**: 行の頭（日時・レベル・`-  `）のあとの本文が、`config.json` の `LogMarkerPrefixes` のどれかで始まる行。既定は `["[VRCRT]"]`。試験のワールドの行（例: SPK-003 のプローブの `[SPK003] PLAYER_LEFT`・`PLAYER_RESTORED`）を集めるには、その接頭辞を足す:
+  ```json
+  "LogMarkerPrefixes": ["[VRCRT]", "[SPK003]"]
+  ```
+  8個まで、各1〜32文字、制御文字なし。変えたら Bridge を再起動する（`config.json` は起動時にしか読まない）。空の配列 `[]` は「書かなかった」と同じ扱いになり、既定値が使われる。各行は `<seq>\t<行>` で、タブや ESC などの制御文字はエスケープし、1行4 KiB・ファイル全体で2,000行か1 MiB までにする（超えたら古い行から捨て、捨てた数を先頭の行に書く）。
+- **状態の判定**: Logging が「完全」（手順9-2）のときの行で判定する。「エラーのみ」と「オフ」では判定できないので、状態は出さず、`vrchat-clients.json` と `slot-<n>.log` の先頭に「Logging を Full にする」という行を出す。起動から60秒たっても `User Authenticated` の行が無い台には、その profile のログインが切れている可能性があるという行を出す。
+- **偽装について**: ワールドは `Debug.Log` で、本物とまったく同じ形の行（たとえば `[Behaviour] Finished entering world.`）を出せる。Bridge は単独の LF のあとの偽の行と、本文が完全に一致しない行は使わないが、CRLF のあとに書かれた1行の偽装は見分けられない。状態は「試験するワールドが自分で偽装しない」ことを前提にした目安で、配置や台の操作の判断には使わない。
+- **伏せる情報**: 共有に書く前に、`usr_…` のユーザー ID、Windows のユーザープロファイルのパス（`C:\Users\<user>\…`）、IPv4・IPv6 のアドレス、認証ヘッダー・Cookie・token の値・URL の中の認証値を伏せる。対象は、台ごとのログ、マーカー行、`.prev`、`vrchat-latest.log`、`vrchat-clients.json`、ビルドの結果のメッセージ。伏せてから切り詰める。表示名と訪れたワールドの情報は残る。ワールドが出す任意の文字列にある秘密まで、すべて見つけられるとは限らない。
+- **読み取りの量**: 各台のログを最初から、追記された分だけ読む（1台あたり5秒で4 MiB、全体で16 MiB まで）。大きなログを読み終えるまでは `catchingUp` になる。Bridge の再起動、ファイルの入れ替わり、ファイルの縮小、接頭辞の変更のときは、最初から読み直し、`observationEpoch` を増やす。
 
 ---
 

@@ -1,5 +1,22 @@
 # Changelog
 
+## [Unreleased]
+
+The Windows Bridge now publishes every VRChat client's log, state and marker lines, not just the first client's (client-observation plan P1). It needs no new share permission and the Mac sends nothing new. An existing `config.json` keeps working.
+
+### Added
+
+- Every client (up to 4) gets a slot number (0–3) that stays while it runs, across Bridge restarts (`%LOCALAPPDATA%\VRCRemoteTest\state\observation-roster.json`, observation only). After a Reload session's slot 0 client exits, the client left keeps slot 1.
+- `logs/clients/slot-{n}.log`: each slot's last 200 lines, picked by the same rules as before. Restart Manager is asked about each file once per poll however many slots ask.
+- `logs/clients/slot-{n}.markers.log`: the lines whose message starts with one of `LogMarkerPrefixes` (new in `config.json`, default `["[VRCRT]"]`, up to 8 prefixes of 1–32 characters), collected from the start of the client's session so they never scroll out of the tail. Each record is `<seq>\t<line>` with control characters escaped; the first line is a JSON header with the slot, `clientGeneration`, `observationEpoch`, `catchingUp` and how many old records were dropped (at most 2,000 lines or 1 MiB). When a new client takes the slot, the previous one's file moves to `slot-{n}.markers.prev.log`.
+- `status/vrchat-clients.json`: per slot, the PID, whether it runs, `state` (`starting` / `joining` / `joined` / `left` / `unknown`), the instance, whether it is in the Error World, the players, whether it is master, VRChat's Logging level, whether `User Authenticated` was logged, `seq` positions and recent events. Read from Logging "Full" lines whose message matches exactly; with Logging "errors only" or "off" the state is left out and a notice says to set it to Full. `vrchat-status.json` keeps its shape.
+
+### Changed
+
+- The log copies (`vrchat-latest.log` and the slot logs) split lines at CRLF only. A world's `Debug.Log` text keeps its own LFs and CRLFs, so a line after a lone LF is a continuation, and continuation lines are now indented with four spaces. Before, every LF started a line of its own, so a header a world wrote after an LF looked like a real line.
+- User IDs (`usr_…`), Windows profile paths, IP addresses and authentication values are masked before anything from a log, or a build result's error message, reaches the share. Display names and world information stay.
+- The Log Viewer's diagnostic lines name the slot (`The VRChat client in slot 0 (PID …) has not created …`, `Could not match an output_log_*.txt file to the VRChat client in slot 0 …`) instead of "the first VRChat client".
+
 ## [0.5.1] - 2026-10-18
 
 Fixes a Windows Bridge bug that could overwrite a successful build's result with a failure. The fix is in the Bridge only and the Unity package itself has no functional changes, so **update the Windows Bridge** (`docs/setup-windows.md`, steps 1 and 6). An existing `config.json` keeps working as before.

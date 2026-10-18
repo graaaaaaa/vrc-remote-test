@@ -125,4 +125,26 @@ public sealed class BridgeOptions
     /// clients run without --watch-worlds and are always relaunched with --url.
     /// </summary>
     public int VrchatStartupSettleDelaySeconds { get; set; } = 30;
+
+    // === Client observation (client-observation plan P1, F3) ===
+
+    /// <summary>The prefixes used when <see cref="LogMarkerPrefixes"/> is omitted.</summary>
+    public static readonly IReadOnlyList<string> DefaultLogMarkerPrefixes = ["[VRCRT]"];
+
+    public const int MaxLogMarkerPrefixes = 8;
+
+    public const int MaxLogMarkerPrefixLength = 32;
+
+    /// <summary>
+    /// Lines whose message (the text after the "-  " of the line's header) starts with one
+    /// of these are collected into logs/clients/slot-{n}.markers.log from the start of each
+    /// client's session, so a world's test lines do not scroll out of the 200-line tail.
+    /// Nullable so an omitted value can be told from a given one; read it through
+    /// <see cref="ResolvedLogMarkerPrefixes"/>. The configuration binder appends to a
+    /// non-empty default array instead of replacing it, which is why the default is not
+    /// assigned here.
+    /// </summary>
+    public string[]? LogMarkerPrefixes { get; set; }
+
+    public IReadOnlyList<string> ResolvedLogMarkerPrefixes => LogMarkerPrefixes ?? DefaultLogMarkerPrefixes;
 }
