@@ -833,6 +833,31 @@ S5a の C で残った「Udon の文字列の改行がそのままログに書�
 
 **状態**: 2台（PID 11676・23268）は S5b の試験ワールドのまま動かしてある。Logging（`0x1`）と config.json は触っていない。SPK-003 の側が次に配置すれば、Relaunch で入れ替わる。
 
+### P1 の実機確認: 台ごとのログ・マーカー行・台の一覧（2026-10-18 16:00〜16:12）
+
+計画 `.claude/docs/research/client-observation-control-plan.md` の P1 の Bridge（PR #27、`0cb5e64`）を、§7「実機（Windows）P1」の項目で確かめた。Windows のセッションが行い、写しと JSON は Windows の `%LOCALAPPDATA%\VRCRemoteTest\p1\` に項目ごとのフォルダーで残してある。表示名は `<表示名#n>` に伏せた。
+
+**準備**: `0cb5e64` を Windows でビルドした（SDK 10.0.400、`--vulnerable` で脆弱なパッケージなし、exe の SHA-256 `2D55F541…30FB1`、ProductVersion `1.0.0+0cb5e64…`）。`install-bridge.ps1` で入れ替え、v0.5.1 の exe（`03BFEEDE…`）と config.json・managed-clients.json は `%LOCALAPPDATA%\VRCRemoteTest\p1-test-backup-20261018-160000` に退避した。`dotnet test` は 660 件中 655 件が成功した。失敗の5件は、シンボリックリンクの3件（従来どおり）と、VRChat が動いていたための `VrchatProcessMonitorTests` の2件で、VRChat を閉じてそのクラスだけを流すと32件とも成功した。config.json に `"LogMarkerPrefixes": ["[VRCRT]", "[SPK003]"]` を足した。Logging は「完全」。
+
+**入れた直後（S5b の試験ワールドの2台が動いていた）**: 2台を slot 0・1 として読み始めた（epoch `1792306821855`・`1792306821876`）。
+- 単独の LF のあとの偽の頭（`S5FakeNewline`）は、マーカー行の中で `\n` にエスケープされて前の記録の続きになり、出来事にも数えられなかった。
+- CRLF のあとの偽（`Joining local:s5forgedcrlf`）と1行の偽装（`Joining local:s5forged<n>`、`OnPlayerLeft S5Fake`）は出来事に数えられ、state は unknown になった（見分けられないことは計画 C6 と手順11-1のとおり）。`Finished entering world. s5forged<n>` は完全一致しないので使われなかった。
+- タブと ESC はマーカー行で `\t`・`\u001b` になり、日本語と絵文字はそのまま。続きの行は `slot-n.log` で先頭に空白4つが付いた。
+- long4k のマーカー行は 4,096 バイトで切られて ` [truncated]` が付き、long64k は `701<TAB>…[VRCRT] S5 long64k [truncated]`（本文は残らない。64 KiB を超えた行は最後の空白まで残すため）。
+
+| 項目 | 結果 |
+|---|---|
+| A. 2台（Relaunch、`VrchatProfiles [0,1]`、SPK-003 のプローブのワールド） | **isMaster 以外は合格**。16:01:25 に送り、Bridge は2台を閉じて（1.5 s、強制終了 0）profile 0（PID 25868、16:01:28.189）と profile 1（PID 14732、16:01:31.198）を起動した。`slot-0.log` と `slot-1.log` の最後の5行はそれぞれの台の output_log（`16-01-28`・`16-01-31`）にだけあり、混ざっていない。`vrchat-latest.log` は `slot-0.log` と同じ。`vrchat-clients.json` は2台とも joined、instance は同じ `local:dab8e4…5383`、参加者2人、loggingLevel full、authenticated true、catchingUp false。**isMaster は2台とも null**（下の不具合）。`slot-0.markers.log` は先頭がヘッダー（`clientGeneration 3929843941225208`、`observationEpoch 1792306888247`）で、`689<TAB>… [SPK003] START revision=playerdata-probe-v2 …`、`747 … PLAYER_JOINED id=1 local=True …`、`785 … PLAYER_RESTORED id=1 local=True` など slot 0 は27記録、slot 1 は26記録。前の S5b の台のマーカー行は `slot-0/1.markers.prev.log` に移った。Bridge のログに WRN・ERR なし |
+| B. 4台（Reload、`VrchatClientCount 4`） | **isMaster 以外は合格**。16:04:59 に送り、PID 8508・6196・26756・23284 を約3秒おきに起動した（各台の `New output_log …` も出た）。slot は起動順に 0〜3 で、各 `slot-n.log` の最後の5行はそれぞれの台の output_log にだけあった。5秒ごとに90秒見て、`observedThroughSeq` は4台とも増え続け、`catchingUp` は一度も true にならなかった。state は starting → joining → joined と進み、+28 s で4台とも joined・参加者4人・watchWorlds true。CPU は全体で 11〜41%、Bridge のプロセスは論理16コアに対して 0.21〜0.52%。`Reading … (observation epoch …)` は各台1回。そのあと Reload の配置を2回送り、4台とも `local:ce318f…` に移って joined に戻った |
+| C. 結合の材料 | B の4台のマーカー行は 191 記録（slot 0〜3 が 49・47・48・47、16:05:09〜16:05:24）。時刻順の表は Windows の `p1\C-markers-merged.csv`。時刻は秒までで seq は台ごとの番号なので、**同じ秒に複数の slot の記録がある組（7つ）は、時刻と seq だけでは台をまたいだ前後が決まらない**。Unity と `vrcrt.sh` の結合は、その場合 slot の番号順に並べる（前後関係の証明ではない） |
+| D. Bridge の再起動のあとの slot と epoch | **合格**。(1) A の2台が動いたまま 16:03:40.974 に再起動: slot と clientGeneration は変わらず、epoch は `1792306888247 → 1792307022948`、`1792306893434 → 1792307022975` に増えた（再起動の時刻の Unix ミリ秒は約 `1792307020974`）。markers.log は 16:03:42 に、同じ記録（27・26件、seq も同じ、重複なし）で epoch だけ新しいヘッダーに置き換わった。.prev は作られなかった。(2) B の slot 0 の台（PID 8508）だけを閉じて再起動: 残りの台は slot 1〜3 のまま、slot 0 は running false・state left・logStatus notRunning、`slot-0.log` は `The VRChat client in slot 0 (PID 8508) is not running.`、`slot-0.markers.log` は残った。(3) 同じ引数で1台を手で起動（PID 15300）: slot 0 に入り、`slot-0.markers.prev.log` は閉じた台（clientGeneration `4113320489605551`）の markers.log とハッシュが一致し、新しい `slot-0.markers.log` は新しい台のヘッダー（clientGeneration `4460553457177052`）で始まった |
+| E. Logging「エラーのみ」 | **合格**。空いていた slot 0 に入った台（PID 26012）は、30秒後は loggingLevel unknown・state starting、70秒後は errorsOnly・state null で、warnings と `slot-0.log` の先頭に `# VRChat's Logging is errors only for this client, …` が出た。ログインの警告は出なかった（authenticated は空）。終わったあと Logging を 1 に戻した |
+| F. 秘匿化 | **合格**。共有の `logs\` と `status\` の13ファイル（147 KB）に、`usr_***` 以外の usr_ の ID、実際の `C:\Users\<名前>`（URL エンコードを含む）、IPv4・IPv6、Windows のユーザー名は0件。`usr_***` が147件、IP は `answer from <ip>:5353` の形。リロード直後の `World Updated:` の行は `C:\Users\<user>\AppData\…` になっていた（元の output_log では実際のユーザー名）。token・cookie・authorization を含む行は写しの範囲に無かった |
+
+**不具合: isMaster が本物のログでは常に null だった**。VRChat の `[Behaviour] I am MASTER` と `I am *NOT* MASTER` は1行ではなく、単独の LF と `Actor Nr: <n>` が続くエントリだった（`… I am MASTER` のあとが `0A`、その直後に `Actor Nr: 1` と `0D 0A`）。10-17 以降のログの341件すべてがこの形で、CRLF で終わる1行の形は0件。Bridge は単独の LF を含む行を出来事に使わないので、Master の行に届かなかった。S5a の A1 でこの行を1行として書いていたのは、行を LF で分けて読んでいたため（S5a の記述の訂正は別の PR で行う）。PR #27 で、この2つの行だけ「1行目の本文が完全一致し、続きが `Actor Nr: <数字>` の1行だけ」のときに使うように直した（計画 C6・F1 の規則も同じに更新された）。修正後の実機の確認はまだ。
+
+**後片付け**: VRChat はすべて閉じた。Logging は `0x1`。config.json は確認前のもの（Relaunch、`VrchatProfiles [0,1]`、`LogMarkerPrefixes` なし）に戻し、Bridge を起動し直した（16:12:07、WRN・ERR なし）。Bridge の exe は P1 のビルド（`2D55F541…`）のまま。v0.5.1 に戻すときは退避先の exe（`03BFEEDE…`）で入れ替える。
+
 ---
 
 ## Go/No-Go 判定テーブル

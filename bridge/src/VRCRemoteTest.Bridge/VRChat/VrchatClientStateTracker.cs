@@ -34,7 +34,9 @@ internal sealed record VrchatClientLogEvent(string Kind, long Seq, DateTime Loca
 ///   (local:error_&lt;digits&gt;), so it is joined but inErrorWorld.
 /// - Only Debug lines whose whole message matches an event's grammar count: no lone LF in
 ///   the line, no truncated line, no partial match (Joining never matches "Joining or
-///   Creating Room", and "Finished entering world. x" is not the end of a join). A world can
+///   Creating Room", and "Finished entering world. x" is not the end of a join). The one
+///   exception is VRChat's own continuation of its master lines, "I am MASTER" and
+///   "I am *NOT* MASTER" followed by a lone LF and "Actor Nr: &lt;n&gt;" and nothing else. A world can
 ///   still forge a whole line after a CRLF, and its Start runs before the real "Finished
 ///   entering world." (S5b B'), so the state is an observation that assumes the world under
 ///   test does not forge it; it never authorizes anything.
@@ -142,13 +144,46 @@ internal sealed partial class VrchatClientStateTracker
             return;
         }
 
-        if (header.Level != VrchatLogLevel.Debug || body.Contains('\n'))
+        if (header.Level != VrchatLogLevel.Debug)
         {
             return;
         }
 
+        if (body.Contains('\n'))
+        {
+            // VRChat writes its master lines with one continuation of its own (P1 verification
+            // on Windows: all 341 since 2026-10-17); no other event line has one.
+            if (TrySplitMasterLine(body) is not { } master)
+            {
+                return;
+            }
+
+            body = master;
+        }
+
         OnDebugMessage(body, line.Seq, header.LocalTime);
     }
+
+    /// <summary>
+    /// "[Behaviour] I am MASTER" or "[Behaviour] I am *NOT* MASTER", then a lone LF and exactly
+    /// "Actor Nr: &lt;digits&gt;": the master line without its continuation, or null.
+    /// </summary>
+    internal static string? TrySplitMasterLine(string body)
+    {
+        var newline = body.IndexOf('\n');
+        var first = body[..newline];
+        var rest = body.AsSpan(newline + 1);
+        if (first is not (Behaviour + "I am MASTER" or Behaviour + "I am *NOT* MASTER")
+            || !rest.StartsWith(ActorNumberPrefix, StringComparison.Ordinal))
+        {
+            return null;
+        }
+
+        var number = rest[ActorNumberPrefix.Length..];
+        return number.Length is > 0 and <= 9 && number.IndexOfAnyExceptInRange('0', '9') < 0 ? first : null;
+    }
+
+    private const string ActorNumberPrefix = "Actor Nr: ";
 
     private const string UdonExceptionPrefix = "[UdonBehaviour] An exception occurred during Udon execution";
 

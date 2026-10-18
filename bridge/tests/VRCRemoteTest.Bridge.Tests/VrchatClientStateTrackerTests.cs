@@ -28,7 +28,8 @@ public class VrchatClientStateTrackerTests
         Line($"[Behaviour] Joining local:{id}");
         Line("[Behaviour] Joining or Creating Room: Local Test");
         Line("[Behaviour] Successfully joined room");
-        Line(master ? "[Behaviour] I am MASTER" : "[Behaviour] I am *NOT* MASTER");
+        // As VRChat writes them: a lone LF and the actor number follow (P1 verification on Windows).
+        Line((master ? "[Behaviour] I am MASTER" : "[Behaviour] I am *NOT* MASTER") + "\nActor Nr: 1");
         Line("[Behaviour] Finished entering world.");
         Line($"[Behaviour] OnPlayerJoined {Me}");
     }
@@ -263,5 +264,34 @@ public class VrchatClientStateTrackerTests
         Line($"[Behaviour] OnPlayerJoined Bob (usr_{new string('a', VrchatClientStateTracker.MaxUserIdLength)})");
 
         _tracker.Players.Should().Equal("Alice");
+    }
+
+    [Theory]
+    [InlineData("[Behaviour] I am MASTER\nActor Nr: 12", true)]
+    [InlineData("[Behaviour] I am *NOT* MASTER\nActor Nr: 3", false)]
+    [InlineData("[Behaviour] I am MASTER", true)]
+    public void The_master_line_is_read_with_its_actor_number(string message, bool master)
+    {
+        Line($"[Behaviour] Joining local:{Id}");
+
+        Line(message);
+
+        _tracker.IsMaster.Should().Be(master);
+    }
+
+    [Theory]
+    [InlineData("[Behaviour] I am MASTER\nActor Nr: x")]
+    [InlineData("[Behaviour] I am MASTER\nActor Nr: 1\nmore")]
+    [InlineData("[Behaviour] I am MASTER\nsomething else")]
+    [InlineData("[Behaviour] I am MASTER \nActor Nr: 1")]
+    [InlineData("[Behaviour] Finished entering world.\nActor Nr: 1")]
+    public void Any_other_continuation_is_still_not_an_event(string message)
+    {
+        Line($"[Behaviour] Joining local:{Id}");
+
+        Line(message);
+
+        _tracker.IsMaster.Should().BeNull();
+        _tracker.State.Should().Be(VrchatClientLogState.Joining);
     }
 }
