@@ -89,6 +89,8 @@ public sealed class BridgeOptionsValidator : IValidateOptions<BridgeOptions>
                 $"'{BridgeOptions.ReloadClientMode}' or '{BridgeOptions.RelaunchClientMode}' (case-insensitive).");
         }
 
+        ValidateLogMarkerPrefixes(options.LogMarkerPrefixes, failures);
+
         return failures.Count == 0
             ? ValidateOptionsResult.Success
             : ValidateOptionsResult.Fail(failures);
@@ -181,6 +183,40 @@ public sealed class BridgeOptionsValidator : IValidateOptions<BridgeOptions>
     /// absolute, non-UNC, .exe, and the basename must be exactly "VRChat.exe" so
     /// a misconfigured path can't launch an arbitrary executable.
     /// </summary>
+    /// <summary>
+    /// Same limits as the manifest's logMarkerPrefixes will have (client-observation plan
+    /// F10): at most 8 prefixes of 1 to 32 characters without control characters, which
+    /// the markers file and the Mac's scripts would otherwise have to escape in the
+    /// header they echo.
+    /// </summary>
+    private static void ValidateLogMarkerPrefixes(string[]? prefixes, List<string> failures)
+    {
+        if (prefixes is null)
+        {
+            return;
+        }
+
+        if (prefixes.Length > BridgeOptions.MaxLogMarkerPrefixes)
+        {
+            failures.Add(
+                $"LogMarkerPrefixes must list at most {BridgeOptions.MaxLogMarkerPrefixes} prefixes " +
+                $"(was {prefixes.Length}).");
+        }
+
+        foreach (var prefix in prefixes)
+        {
+            if (string.IsNullOrEmpty(prefix)
+                || prefix.Length > BridgeOptions.MaxLogMarkerPrefixLength
+                || prefix.Any(char.IsControl))
+            {
+                failures.Add(
+                    $"LogMarkerPrefixes entries must be 1 to {BridgeOptions.MaxLogMarkerPrefixLength} characters " +
+                    "without control characters.");
+                return;
+            }
+        }
+    }
+
     private static void ValidateVrchatExecutable(string vrchatExecutable, List<string> failures)
     {
         if (string.IsNullOrWhiteSpace(vrchatExecutable))

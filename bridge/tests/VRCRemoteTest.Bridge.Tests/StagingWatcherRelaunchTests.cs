@@ -426,9 +426,12 @@ public class StagingWatcherRelaunchTests : IDisposable
     private async Task<VrchatLogService> StartLogViewerAsync(
         IVrchatLogReader reader, ILogger<VrchatLogService>? logger, CancellationToken stoppingToken)
     {
+        var options = Options([0, 1], retainBuilds: 10);
         var service = new VrchatLogService(
-            Microsoft.Extensions.Options.Options.Create(Options([0, 1], retainBuilds: 10)),
+            Microsoft.Extensions.Options.Options.Create(options),
             reader,
+            new VrchatClientObserver(
+                options, new VrchatClientRoster(filePath: null), null, _ => DateTime.UtcNow, () => DateTimeOffset.UtcNow),
             _logNotice,
             logger ?? NullLogger<VrchatLogService>.Instance,
             TimeSpan.FromHours(1));
@@ -469,7 +472,7 @@ public class StagingWatcherRelaunchTests : IDisposable
         noticeWhileClosing.Should().BeTrue("the notice replaces the closing clients' log at once");
         onShareAtLaunch.First().Should().Be(VrchatRelaunchCoordinator.RelaunchNotice);
         newLogShown.Should().BeTrue("the log is read again as soon as the first client is recorded");
-        reader.ReadSnapshotCallCount.Should().Be(2, "once before the relaunch and once after the first launch");
+        reader.ReadCallCount.Should().Be(2, "once before the relaunch and once after the first launch");
         _logNotice.Message.Should().BeNull();
     }
 
@@ -569,7 +572,8 @@ public class StagingWatcherRelaunchTests : IDisposable
         WriteIncomingBuild("b1");
         await watcher.RunOnceAsync(CancellationToken.None);
         var failedWhileClosing = false;
-        RunningProcesses()[0].OnCloseMainWindow = () => failedWhileClosing = SpinWait.SpinUntil(() => Errors() == 2, PublishWait);
+        // Each file's failure is logged once: the notice's first publish fails for the slot logs.
+        RunningProcesses()[0].OnCloseMainWindow = () => failedWhileClosing = SpinWait.SpinUntil(() => Errors() > 1, PublishWait);
 
         WriteIncomingBuild("b2");
         await watcher.RunOnceAsync(CancellationToken.None);

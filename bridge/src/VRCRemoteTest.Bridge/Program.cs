@@ -95,11 +95,15 @@ try
             ? sp.GetRequiredService<VrchatRelaunchCoordinator>()
             : sp.GetRequiredService<VrchatClientCoordinator>());
 
-    // Phase 5: snapshot reader (kept on the first VRChat client's log; in Relaunch mode the
-    // first one the record lists) + its own polling BackgroundService. While a Relaunch
-    // replaces the clients, the deploy flow sets VrchatLogNotice and the service publishes it
-    // instead of the log.
+    // Phase 5: snapshot reader + its own polling BackgroundService. Since the client
+    // observation plan's P1 every client has a slot (VrchatClientRoster, observation only) and
+    // its own log, state and marker lines (VrchatClientObserver); vrchat-latest.log stays on
+    // the first VRChat client's log (in Relaunch mode the first one the record lists). While a
+    // Relaunch replaces the clients, the deploy flow sets VrchatLogNotice and the service
+    // publishes it instead of the logs.
+    builder.Services.AddSingleton<VrchatClientRoster>();
     builder.Services.AddSingleton<IVrchatLogReader, VrchatLogReader>();
+    builder.Services.AddSingleton<VrchatClientObserver>();
     builder.Services.AddSingleton<VrchatLogNotice>();
     builder.Services.AddHostedService<VrchatLogService>();
 

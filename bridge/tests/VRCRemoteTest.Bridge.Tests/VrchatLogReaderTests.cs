@@ -116,7 +116,11 @@ public class VrchatLogReaderTests : IDisposable
             VrchatWorldsDirectory = Path.Combine(_tempDir, "does-not-exist", "Worlds"),
         });
         var reader = new VrchatLogReader(
-            options, _monitor, NullLogger<VrchatLogReader>.Instance, new FakeManagedClientStore());
+            options,
+            _monitor,
+            NullLogger<VrchatLogReader>.Instance,
+            new FakeManagedClientStore(),
+            new VrchatClientRoster(filePath: null));
 
         var result = reader.ReadSnapshot();
 
@@ -157,7 +161,7 @@ public class VrchatLogReaderTests : IDisposable
         var sb = new StringBuilder();
         for (var i = 1; i <= 250; i++)
         {
-            sb.Append("line-").Append(i).Append('\n');
+            sb.Append(Header).Append("line-").Append(i).Append("\r\n");
         }
         File.WriteAllText(path, sb.ToString());
 
@@ -165,8 +169,49 @@ public class VrchatLogReaderTests : IDisposable
 
         var lines = result.Content.Split('\n');
         lines.Should().HaveCount(200);
-        lines[0].Should().Be("line-51");
-        lines[^1].Should().Be("line-250");
+        lines[0].Should().Be(Header + "line-51");
+        lines[^1].Should().Be(Header + "line-250");
+    }
+
+    /// <summary>A VRChat line header (S5b C): the date, the level padded to 11 characters, "-  ".</summary>
+    private const string Header = "2026.10.18 13:34:37 Debug      -  ";
+
+    [Fact]
+    public void The_copy_splits_lines_at_CRLF_and_indents_continuation_lines()
+    {
+        // S5b A and G: a world's LF and CRLF reach the log unchanged, and a header after a
+        // lone LF is not a line of its own.
+        var path = Path.Combine(_logDir, "output_log_2026-09-01_00-00-00.txt");
+        File.WriteAllText(
+            path,
+            Header + "[SPK003] first\n" + Header + "[Behaviour] Joining local:forged\r\n" +
+            "System.Exception: no header\r\n" +
+            Header + "[Behaviour] Finished entering world.\r\n");
+
+        var lines = CreateReader().ReadSnapshot().Content.Split('\n');
+
+        lines.Should().Equal(
+            Header + "[SPK003] first",
+            "    " + Header + "[Behaviour] Joining local:forged",
+            "    System.Exception: no header",
+            Header + "[Behaviour] Finished entering world.");
+    }
+
+    [Fact]
+    public void The_copy_masks_lines_before_cutting_them()
+    {
+        var path = Path.Combine(_logDir, "output_log_2026-09-01_00-00-00.txt");
+        File.WriteAllText(
+            path,
+            Header + "User Authenticated: Name (usr_0123abcd-0000-4000-8000-0123456789ab)\r\n" +
+            Header + @"World Updated: C:\Users\alice\AppData\LocalLow\VRChat\VRChat\Worlds\a.vrcw" + "\r\n" +
+            // The address straddles the 512-character cut: masked first, nothing of it is left.
+            Header + new string('x', 455) + " 192.168.10.20 " + new string('y', 100) + "\r\n");
+
+        var content = CreateReader().ReadSnapshot().Content;
+
+        content.Should().Contain("(usr_***)").And.Contain(@"C:\Users\<user>\AppData")
+            .And.NotContain("0123abcd").And.NotContain("alice").And.NotContain("192.168").And.Contain(" <ip>");
     }
 
     [Fact]
@@ -180,7 +225,7 @@ public class VrchatLogReaderTests : IDisposable
         var lineA = new string('A', 150_000);
         var lineB = new string('B', 150_000);
         var lineC = new string('C', 150_000);
-        File.WriteAllText(path, $"{lineA}\n{lineB}\n{lineC}\n");
+        File.WriteAllText(path, $"{lineA}\r\n{lineB}\r\n{lineC}\r\n");
 
         var result = CreateReader().ReadSnapshot();
 

@@ -637,4 +637,69 @@ public class BridgeOptionsValidatorTests : IDisposable
         options.VrchatProfiles.Should().Equal(3, 0);
         options.VrchatClientCount.Should().BeNull();
     }
+
+    // ---- LogMarkerPrefixes (client-observation plan F3) ----
+
+    private BridgeOptions ValidOptions(string[]? prefixes) => new()
+    {
+        StagingDirectory = Path.Combine(_tempDir, "staging"),
+        StateDirectory = Path.Combine(_tempDir, "state"),
+        VrchatWorldsDirectory = _tempDir,
+        LogMarkerPrefixes = prefixes,
+    };
+
+    [Fact]
+    public void LogMarkerPrefixes_default_to_VRCRT_when_omitted()
+    {
+        var options = ValidOptions(null);
+
+        _validator.Validate(name: null, options).Succeeded.Should().BeTrue();
+        options.ResolvedLogMarkerPrefixes.Should().Equal("[VRCRT]");
+    }
+
+    [Fact]
+    public void LogMarkerPrefixes_from_config_json_replace_the_default()
+    {
+        using var json = new MemoryStream(System.Text.Encoding.UTF8.GetBytes(
+            "{\"Bridge\": {\"LogMarkerPrefixes\": [\"[SPK003]\", \"[VRCRT]\"]}}"));
+        var configuration = new ConfigurationBuilder().AddJsonStream(json).Build();
+        var options = new BridgeOptions();
+
+        configuration.GetSection("Bridge").Bind(options);
+
+        options.ResolvedLogMarkerPrefixes.Should().Equal("[SPK003]", "[VRCRT]");
+    }
+
+    [Fact]
+    public void An_empty_LogMarkerPrefixes_array_in_config_json_binds_as_omitted()
+    {
+        // The JSON provider yields no key for an empty array, so the default applies
+        // (docs/setup-windows.md, step 11-1).
+        using var json = new MemoryStream(System.Text.Encoding.UTF8.GetBytes("{\"Bridge\": {\"LogMarkerPrefixes\": []}}"));
+        var configuration = new ConfigurationBuilder().AddJsonStream(json).Build();
+        var options = new BridgeOptions();
+
+        configuration.GetSection("Bridge").Bind(options);
+
+        options.ResolvedLogMarkerPrefixes.Should().Equal("[VRCRT]");
+    }
+
+    [Theory]
+    [InlineData("")]
+    [InlineData("[0123456789012345678901234567890123]")]
+    [InlineData("tab\there")]
+    public void LogMarkerPrefixes_entries_must_be_short_and_printable(string prefix)
+    {
+        var result = _validator.Validate(name: null, ValidOptions([prefix]));
+
+        result.Failures.Should().ContainSingle(f => f.Contains("LogMarkerPrefixes"));
+    }
+
+    [Fact]
+    public void LogMarkerPrefixes_list_at_most_eight()
+    {
+        var result = _validator.Validate(name: null, ValidOptions(Enumerable.Range(0, 9).Select(i => $"[P{i}]").ToArray()));
+
+        result.Failures.Should().ContainSingle(f => f.Contains("at most 8"));
+    }
 }

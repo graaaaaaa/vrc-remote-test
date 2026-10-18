@@ -1316,6 +1316,18 @@ VRChatが動いているときは、最新のファイルではなく、代表�
 - `Reload`のコールドスタート（と、`Relaunch`で記録が空の配置）では、このメッセージを出さず、すぐの読み直しもしない。1台目の起動から次の読み取り（約5秒後。実機で5.15秒）までは前回のセッションのログが残る。コールドスタートの前から、VRChatが1台も動いていないので前回のセッションのログを公開している状態で、起動済みの台へ配置するときは同じファイルに書き続けるので、この隙間はセッションの始めに1度だけ起きる（`Relaunch`の起動し直しは配置のたびに起きる）。
 - 35.1の制限: VRChatがログを開いたままにしていることを前提にする。Bridgeが混ざっているのを見る前にほかの台が終了したファイル（そのあいだBridgeが止まっていた、など）は、残った1台のログとして公開されることがある。
 
+## 35.4 台ごとのログ・マーカー行・台の一覧（v0.6.0）
+
+35.1〜35.3の規則を、代表の台だけでなく全台（最大4台）に台番号（slot、0〜3）ごとに適用する。`logs/vrchat-latest.log` は今までどおり代表の台のログ（Unity 0.5.x との互換）。どれも観測の値で、配置や台の操作の判断には使わない。
+
+- **slot**: Bridge の共有外の状態 `state/observation-roster.json`（最大4件の {slot, PID, 作成時刻}）で決める。新しく見えた台だけを、作成時刻→PIDの順に空いている slot へ入れる（Relaunch では記録の起動順の slot が空いていればそこ）。動いている台は振り直さず、終了した台の枠は次の台が入るまで残すので、Bridge を再起動しても slot は変わらない。作成時刻が分からない台と5台目には slot を付けない。台の世代（`clientGeneration`）は、P3 で起動の連番に替えるまで、PID と作成時刻から決まる値とする。
+- **問い合わせの共有**: 5秒の周期ごとに、台の列挙と候補の列挙を1回ずつ行い、各 slot が問い合わせるファイル（35.1の範囲と固定中のファイル）の和集合を、ファイルごとに1回だけ Restart Manager に問い合わせる。問い合わせに失敗したファイルを含む slot だけが35.2に戻る。混ざったファイルの判定を全 slot でまとめてから、公開するファイルを決める（slot の順番によらない）。固定は slot ごと、混ざったファイルの集合は全台で共有する。
+- **行の区切り**: 行の区切りは CRLF とし、単独の LF のあとに日時の頭があっても前の行の続きとして扱う（1台だけが書くログでは、本物の行の頭の直前は必ず CRLF かファイルの先頭だった。`docs/validation/multi-client-spike.md` の S5a C・S5b A）。頭は、日時（ASCIIの数字）、空白、空白で11文字にしたレベル、`-  ` の順に先頭から確かめる。写し（`logs/clients/slot-{n}.log`、`vrchat-latest.log`）では、続きの行（単独の LF のあとと、頭の無い行）の先頭に空白4つを付ける。200行・384 KiB・1行512文字の上限は今のまま。
+- **追記分の読み取り**: 各台のログを最初から、追記された分だけ読む（1台あたり4 MiB、全体で16 MiB / 周期、64 KiB ずつ）。完了した行すべてに連番 `seq` を振る。CRLF の無い部分が64 KiB を超えたら、先頭の4 KiB だけを残して次の CRLF まで捨て、切り詰めた印を付ける。未完の行のバイトは読み取りの間で保ち、行が完了してから UTF-8 として読む。Bridge の再起動、ファイルの入れ替わり・縮小、マーカーの接頭辞の変更のときは、最初から読み直して `observationEpoch` を増やす（共有外の状態に保存し、再起動をまたいでも減らない）。読み終えるまでは `catchingUp`。終了を確かめた台は、ファイルの終わりまで一度読む。
+- **マーカー行** `logs/clients/slot-{n}.markers.log`: 頭のある行の本文が `LogMarkerPrefixes`（§44、既定 `["[VRCRT]"]`）のどれかで始まる行を、その台のセッションの最初から集める。頭の無い続きの行は同じ記録の後ろに `\n` としてつなぐ。先頭の1行は `# ` に続く JSON（`slot`・`clientGeneration`・`observationEpoch`・`catchingUp`・`droppedRecords`・`droppedThroughSeq`・`prefixes`）、各記録は `<seq>\t<行>`。制御文字・バックスラッシュ・双方向の制御文字はエスケープする。1記録4 KiB、ファイル全体で2,000行か1 MiB まで（超えたら古い記録から捨てる）。読み直したときは、追記せず読み直した内容で原子的に置き換える。その slot に新しい世代の台が入ったときだけ、前の分を `slot-{n}.markers.prev.log` に移す。全台をまとめた表示は Mac 側（Unity と `scripts/vrcrt.sh`）で作る。
+- **台の一覧** `status/vrchat-clients.json`: slot ごとに、PID、作成時刻、`clientGeneration`、`observationEpoch`、動いているか、`state`、`requestedInstance`・`instance`（`local:<id>`、末尾の `:<n>` なし）、`inErrorWorld`、参加者、`isMaster`、`loggingLevel`、`authenticated`、`joinAttemptSeq`・`joinedSeq`・`observedThroughSeq`、`catchingUp`、最近の出来事、注意の文を出す。状態は Logging「完全」の Debug の行で、本文が文法と完全に一致するものだけで決める（`Joining local:<id>` で joining、同じ試行の `[Behaviour] Finished entering world.` で joined、`Rejoining local world:` と `OnLeftRoom` で次の `Joining` まで joining、終了を確かめたら left、形の分からない `Joining` は unknown。Error World でも joined で、`inErrorWorld` を true にする）。続きの行と切り詰めた行は使わない。Logging が「エラーのみ」「オフ」と分かれば、状態・参加者・Master は出さない。`vrchat-status.json` の形は変えない。
+- **限界**: ワールドは `Debug.Log` で本物と同じ頭とレベルの行を出せ、CRLF のあとの1行の偽装は見分けられない。ワールドの `Start` の出力は本物の `Finished entering world.` より前に書かれる（S5b B'）。状態は、試験するワールドが自分で偽装しないことを前提にした目安とする。
+
 ---
 
 # 36. Unity Log Viewer
@@ -1528,6 +1540,8 @@ AssetsやProjectSettingsへmachine-specific hostnameを保存しない。
 
 # 44. Windows config
 
+（下の例は初期の設計のもの。実際の項目は `docs/setup-windows.md` の手順4・9・11-1。v0.6.0 で `LogMarkerPrefixes`（§35.4、0〜8件、各1〜32文字、制御文字なし、省くか空なら `["[VRCRT]"]`）を足した。設定は Bridge の起動時に読み、変えたら再起動が要る。）
+
 保存場所：
 
 ```text
@@ -1711,6 +1725,12 @@ Bridge が信頼する状態（processing・archive・failed）は共有外の `
 ### Secrets
 
 password/tokenをGit repositoryへ保存しない。
+
+### 共有に書くログ由来の情報（v0.6.0）
+
+共有に書く直前に、`usr_` のユーザー ID、Windows のユーザープロファイルのパス、IPv4・IPv6 のアドレス、認証ヘッダー・Cookie・token の値・URL の中の認証値を伏せる。対象は台ごとのログ、マーカー行、`.prev`、`vrchat-latest.log`、`vrchat-clients.json`、ビルドの結果のメッセージ。伏せてから切り詰める。表示名と訪れたワールドの情報は残る（単一の操作者を前提とする残余リスク、`docs/setup-windows.md`）。ワールドが出す任意の文字列にある秘密まで、すべて見つけることは保証しない。
+
+ログ、マーカー、表示名は信頼できない入力として扱い（§35.4）、認可・プロセスの所有の確認・実行先の決定には使わない。観測の slot の対応表も、操作の権限の根拠にしない。
 
 ### Execution
 

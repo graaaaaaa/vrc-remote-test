@@ -1,5 +1,6 @@
 using System.Text.Json;
 using VRCRemoteTest.Bridge.Protocol;
+using VRCRemoteTest.Bridge.VRChat;
 
 namespace VRCRemoteTest.Bridge.Deployment;
 
@@ -23,6 +24,11 @@ public sealed class ResultWriter : IResultWriter
             resultsDirectory);
     }
 
+    /// <summary>
+    /// The message is masked before it reaches the share, like everything else the Bridge
+    /// publishes (client-observation plan C5): it can name paths under the Windows user's
+    /// profile.
+    /// </summary>
     public void WriteFailure(string buildId, string errorCode, string errorMessage, string resultsDirectory)
     {
         Write(
@@ -33,7 +39,7 @@ public sealed class ResultWriter : IResultWriter
                 BuildId = buildId,
                 Status = "failed",
                 ErrorCode = errorCode,
-                ErrorMessage = errorMessage,
+                ErrorMessage = LogRedactor.Redact(errorMessage),
                 UpdatedAtUtc = DateTimeOffset.UtcNow,
             },
             resultsDirectory);

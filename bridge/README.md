@@ -42,6 +42,7 @@ Bridgeは「フルオーケストレーションサービス」ではなく「�
   - 台を閉じ始めてから新しい1台目を記録するまで、Log Viewer はログの代わりに起動し直し中の1行を書く（`VrchatLogNotice`）。記録の台がもう終了していても書く（記録が空の配置と、管理下でない台で止まる配置では書かない）。共有へ書くのは`VrchatLogService`だけで、配置の流れは1行を出す・消すと同時にその読み取りを起こすだけなので、書き込みの失敗で配置は止まらない
   - 数える VRChat は Bridge と同じ対話セッションのものだけで、`--watch-worlds`はコマンドラインを引数に分けて完全一致で判定する（`VrchatProcessMonitor`）。コマンドラインは観測ごとに1回の WMI の問い合わせでまとめて読み、行の作成時刻をプロセスの起動時刻と照合する。WMI が答えない・時間内に返らない台は「確かめられない台」として扱う
 - **VRChatログ配信（`VrchatLogService`）**: 5秒間隔で`output_log_*.txt`の末尾を再読み込みし、直近200行を`logs/vrchat-latest.log`へ書き出す。VRChat が動いている間は、最新のファイルではなく1台目（`--watch-worlds`付きで作成時刻が最も古い台）のファイルを使い、その台が終了するかファイルが消えるまで使い続ける。どのファイルかは、まず Windows の Restart Manager で各ファイルを開いているプロセスを調べ、VRChat のうち1台目（PID と作成時刻が一致）だけが開いているファイルに決める（`VrchatLogOwners`、P/Invoke は `RestartManagerFileOwners`）。決まらなければ、ファイル名の時刻と作成時刻で対応付ける（`VrchatLogMatcher`）。ほかの VRChat も開いている（混ざった）ファイルは使わない。対応付けられなければ、ログの代わりに診断の1行を書く。VRChat がログファイルを作るのは、負荷が無いときは起動の約0.8秒後、CPU の負荷が高いと20秒〜2分ほど後になる（実測）ので、Bridge が起動する台は前の台のファイルができてから起動し、ファイルどうしが混ざらないようにしている。VRChat が動いていないときだけ最新のファイルを使う。Unity側Log Viewer（表示専用）のためのもので、readiness判定には一切使用しない
+- **台ごとの観測（v0.6.0、`VrchatClientRoster`・`VrchatClientObserver`）**: 全台（最大4台）に台番号（slot）を付け、同じ規則で台ごとにファイルを選んで `logs/clients/slot-{n}.log` に書く。Restart Manager にはファイルごとに周期内で1回だけ問い合わせる。各台のログを最初から追記分だけ読み（`VrchatLogScanner`、CRLF で行を区切る `VrchatLogLine`）、状態（`VrchatClientStateTracker`）を `status/vrchat-clients.json` に、`LogMarkerPrefixes` で始まる行（`VrchatMarkerLog`）を `logs/clients/slot-{n}.markers.log` に書く。共有に書く前に `LogRedactor` でユーザー ID・プロファイルのパス・IP・認証の値を伏せる。slot の対応は共有外の `observation-roster.json` に保存し、観測専用で操作の根拠にはしない（仕様書§35.4、`docs/setup-windows.md` 手順11-1）
 - **二重起動の防止**: 起動時に`%LOCALAPPDATA%\VRCRemoteTest\state\bridge.lock`を`FileShare.None`で開き、終了まで持ち続ける。開けなければ起動を拒否する（Task Scheduler の設定だけに頼らない）。ロックは Windows アカウントごとなので、共有と Worlds は Bridge 用のアカウント1つで使う
 - **自動起動**: `scripts/install-bridge.ps1`でWindows Task Scheduler（Trigger: At log on、Principal: Interactive/Limitedで非elevated）へ登録できる。実行体はSMB共有の外側（既定`%LOCALAPPDATA%\Programs\VRCRemoteTest\Bridge\`）に配置する — 共有への書き込み権限を持つ者が実行体を差し替えてログオン時の自動実行を乗っ取れないようにするため、意図的にSMB共有の外に配置する。共有の drop から配置するときは、配置先の中に作った候補ファイルの SHA-256 を、共有以外の経路で用意した `-ExpectedSha256` と照合してから置き換える。手順は`docs/setup-windows.md`、詳細は`scripts/install-bridge.ps1 -?`を参照
 - **配布**: `v*.*.*` タグのリリースでは、GitHub Actions（`.github/workflows/release-package.yml` の `bridge` ジョブ）がタグ付きコミットから win-x64 の単一ファイル exe をビルドし、テストを通したうえで、ビルドの来歴（artifact attestation）を署名して Release に添付する。SHA-256 はリリースノートに載る。Windows では `gh attestation verify` で来歴を確認してから `install-bridge.ps1 -ExpectedSha256` に渡す（`docs/setup-windows.md` の手順1-A）。ビルドは再現可能ではないので、同じタグを全体再実行して exe を作り直しても、公開済みの exe は置き換えない
@@ -108,12 +109,14 @@ SMB 共有（`StagingDirectory`）と、Bridge 専用の状態ディレクトリ
 ├── incoming/     — Unity側からのアップロード先 (.vrcw + .ready.json)。取り込み後に消費される
 ├── _bridge-drop/ — Bridge 実行体の受け渡し用（install-bridge.ps1 がハッシュを照合して取り込む）
 ├── results/      — ビルドごとの結果ファイル (Unity側がポーリング)
-├── status/       — VrchatMonitorServiceが10秒間隔で上書きするvrchat-status.json
+├── status/       — VrchatMonitorServiceが10秒間隔で上書きするvrchat-status.json と、VrchatLogServiceが5秒間隔で上書きするvrchat-clients.json
 └── logs/         — VrchatLogServiceが5秒間隔で上書きするvrchat-latest.log（表示専用）
+    └── clients/  — 台ごとの slot-{n}.log・slot-{n}.markers.log・slot-{n}.markers.prev.log
 
 %LOCALAPPDATA%\VRCRemoteTest\state/   — Bridge 専用（共有しない）
 ├── bridge.lock   — 二重起動の防止用。Bridge が動いている間、開いたままにする
 ├── managed-clients.json — Relaunch で Bridge が起動した VRChat の記録。.tmp は書き込み途中のもの（次の書き込みで上書きされる）
+├── observation-roster.json — 台番号（slot）と PID・作成時刻の対応と、最後の observationEpoch。観測専用
 ├── processing/   — claim 済みの manifest と artifact の private コピー。.part は書き込み途中で、起動時に削除される
 ├── archive/      — 処理完了した manifest（冪等性判定に使用）。artifact は Worlds にあるので残さない
 └── failed/       — 検証失敗・quarantine。artifact は新しいものから RetainBuilds 件だけ残す

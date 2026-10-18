@@ -34,6 +34,12 @@ public class VrchatLogServiceTests : IDisposable
         new(
             Options.Create(new BridgeOptions { StagingDirectory = _tempDir }),
             logReader,
+            new VrchatClientObserver(
+                new BridgeOptions { StagingDirectory = _tempDir },
+                new VrchatClientRoster(filePath: null),
+                managedClients: null,
+                _ => DateTime.UtcNow,
+                () => DateTimeOffset.UtcNow),
             notice ?? new VrchatLogNotice(),
             logger ?? NullLogger<VrchatLogService>.Instance,
             pollInterval ?? TimeSpan.FromMilliseconds(10));
@@ -64,7 +70,7 @@ public class VrchatLogServiceTests : IDisposable
 
         using var cts = new CancellationTokenSource();
         await service.StartAsync(cts.Token);
-        await WaitUntil(() => logReader.ReadSnapshotCallCount >= 3, TimeSpan.FromSeconds(2));
+        await WaitUntil(() => logReader.ReadCallCount >= 3, TimeSpan.FromSeconds(2));
         cts.Cancel();
         await service.StopAsync(CancellationToken.None);
 
@@ -76,17 +82,17 @@ public class VrchatLogServiceTests : IDisposable
     {
         var logReader = new FakeVrchatLogReader
         {
-            ThrowOnReadSnapshot = new InvalidOperationException("simulated read failure"),
+            ThrowOnRead = new InvalidOperationException("simulated read failure"),
         };
         var service = CreateService(logReader);
 
         using var cts = new CancellationTokenSource();
         await service.StartAsync(cts.Token);
-        await WaitUntil(() => logReader.ReadSnapshotCallCount >= 3, TimeSpan.FromSeconds(2));
+        await WaitUntil(() => logReader.ReadCallCount >= 3, TimeSpan.FromSeconds(2));
         cts.Cancel();
         await service.StopAsync(CancellationToken.None);
 
-        logReader.ReadSnapshotCallCount.Should().BeGreaterThanOrEqualTo(3);
+        logReader.ReadCallCount.Should().BeGreaterThanOrEqualTo(3);
     }
 
     /// <summary>
@@ -115,7 +121,7 @@ public class VrchatLogServiceTests : IDisposable
 
         using var cts = new CancellationTokenSource();
         await service.StartAsync(cts.Token);
-        await WaitUntil(() => logReader.ReadSnapshotCallCount >= 3, TimeSpan.FromSeconds(2));
+        await WaitUntil(() => logReader.ReadCallCount >= 3, TimeSpan.FromSeconds(2));
         cts.Cancel();
         await service.StopAsync(CancellationToken.None);
 
@@ -150,7 +156,7 @@ public class VrchatLogServiceTests : IDisposable
         await service.StopAsync(CancellationToken.None);
 
         Published().Should().Be("relaunching");
-        logReader.ReadSnapshotCallCount.Should().Be(0);
+        logReader.ReadCallCount.Should().Be(0);
     }
 
     [Fact]
@@ -169,7 +175,7 @@ public class VrchatLogServiceTests : IDisposable
         await service.StopAsync(CancellationToken.None);
 
         Published().Should().Be("relaunching");
-        logReader.ReadSnapshotCallCount.Should().Be(1);
+        logReader.ReadCallCount.Should().Be(1);
     }
 
     [Fact]
@@ -189,7 +195,7 @@ public class VrchatLogServiceTests : IDisposable
         await service.StopAsync(CancellationToken.None);
 
         Published().Should().Be("new client's log");
-        logReader.ReadSnapshotCallCount.Should().Be(1);
+        logReader.ReadCallCount.Should().Be(1);
     }
 
     [Fact]
@@ -202,39 +208,45 @@ public class VrchatLogServiceTests : IDisposable
 
         using var cts = new CancellationTokenSource();
         await service.StartAsync(cts.Token);
-        await WaitUntil(() => logReader.ReadSnapshotCallCount == 1, TimeSpan.FromSeconds(2));
+        await WaitUntil(() => logReader.ReadCallCount == 1, TimeSpan.FromSeconds(2));
         notice.Clear();
         notice.Clear();
         await Task.Delay(100);
         cts.Cancel();
         await service.StopAsync(CancellationToken.None);
 
-        logReader.ReadSnapshotCallCount.Should().Be(1);
+        logReader.ReadCallCount.Should().Be(1);
     }
 
     [Fact]
     public async Task Showing_and_clearing_the_notice_keep_working_while_the_share_cannot_be_written()
     {
-        // A file where the logs directory should be: every publish throws.
+        // A file where the logs directory should be: every log copy fails to publish.
         File.WriteAllText(Path.Combine(_tempDir, "logs"), "not a directory");
         var notice = new VrchatLogNotice();
         var logger = new ListLogger<VrchatLogService>();
         var logReader = new FakeVrchatLogReader { ResultToReturn = LogSnapshotResult.Success("log") };
         var service = CreateService(logReader, logger, notice, NoPollDuringTest);
 
+        int Errors() => logger.Entries.Count(e => e.Level == LogLevel.Error);
+
         using var cts = new CancellationTokenSource();
         await service.StartAsync(cts.Token);
-        await WaitUntil(() => logger.Entries.Count(e => e.Level == LogLevel.Error) == 1, TimeSpan.FromSeconds(2));
+        await WaitUntil(() => Errors() == 1, TimeSpan.FromSeconds(2));
         var show = () => notice.Show("relaunching");
         show.Should().NotThrow();
-        await WaitUntil(() => logger.Entries.Count(e => e.Level == LogLevel.Error) == 2, TimeSpan.FromSeconds(2));
+
+        // The notice goes to the four slot logs too, each failing once.
+        await WaitUntil(() => Errors() == 5, TimeSpan.FromSeconds(2));
         notice.Clear();
-        await WaitUntil(() => logger.Entries.Count(e => e.Level == LogLevel.Error) == 3, TimeSpan.FromSeconds(2));
+        await WaitUntil(() => logReader.ReadCallCount == 2, TimeSpan.FromSeconds(2));
         cts.Cancel();
         await service.StopAsync(CancellationToken.None);
 
-        logger.Entries.Count(e => e.Level == LogLevel.Error).Should().Be(3, "the loop keeps running and waking");
-        logReader.ReadSnapshotCallCount.Should().Be(2, "once before the notice and once after it");
+        Errors().Should().Be(5, "each file's failure is logged once, not on every poll");
+        logReader.ReadCallCount.Should().Be(2, "once before the notice and once after it");
+        File.Exists(Path.Combine(_tempDir, "status", "vrchat-clients.json")).Should().BeTrue(
+            "the files that can be written still are");
     }
 
     private static async Task WaitUntil(Func<bool> condition, TimeSpan timeout)
