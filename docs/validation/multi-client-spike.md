@@ -505,7 +505,7 @@ PR #5（Log Viewer が、1台目だけが開いている output_log を Windows 
 | 6. VRChat 以外のプロセスが開いているとき | 合格 | 手順3の4台で、pwsh（PID 28280）から1台目のログを `[System.IO.File]::Open(..., 'Open', 'Read', 'ReadWrite, Delete')` で20秒開いたままにした。Restart Manager は 23712（VRChat）と 28280（pwsh）の2つを返したが、写しは5秒ごとの4回とも1台目のログのままで、Bridge のログにも何も出なかった。閉じたあとは 23712 だけに戻った |
 | 7. 同じ秒の起動（Bridge は止めない） | 合格 | `start-vrchat-dev.ps1 -Clients 2 -LaunchIntervalSeconds 0`（2台の差は 6〜11ms）を9回。8回は1つのファイルに混ざり（PID 2つ）、そのたびに `... is open by several VRChat processes; ...` と `... is or was also open by other VRChat clients ...` が出て、写しはその1行になった。1回（起動 21:42:22.549 / .559）はログが `21-42-22` と `21-42-23` に分かれ、`Showing ...output_log_2026-10-17_21-42-22.txt as the log of VRChat client 30180 (the only VRChat process that has it open).` になった。写しの中身が `21-42-22`（Restart Manager で 30180 だけが開いているファイル）のものであることも確かめた。以前はこの場合 `Could not match` だった |
 | 8. Restart Manager のセッションの閉じ忘れ | 合格 | 手順3の4台を 21:20:28 から 21:31:30 まで（11 分）動かしたまま、`Could not ask Windows Restart Manager` は0件、`[ERR]`・`[WRN]` も0件。Bridge の CPU 使用率は 30 秒ごとの19回で平均 0.22%、最大 0.30%（16 論理 CPU 全体に対して）。ワーキングセット 50MB、ハンドル 515 |
-| 9. Unity の Result Timeout 120 秒で負荷ありのコールドスタート | 未実施 | Mac の Unity が要る |
+| 9. Unity の Result Timeout 120 秒で負荷ありのコールドスタート | 未実施（あとで Windows 側は合格） | Mac の Unity が要る。2026-10-18 に main `870893e` で確かめた（下の「PR #5 の手順9（Unity の Result Timeout）の確認」） |
 
 気づいたこと:
 
@@ -681,6 +681,29 @@ S4 の準備: `state\managed-clients.json` に、前の節の Unity の確認（
 この間の Bridge のログの `[WRN]` は、上の強制終了の1件だけ。`[ERR]` は無かった。
 
 後片付け: 写しの観察を止め、VRChat を全部閉じた。`config.json` は確認前の値（Reload、`VrchatClientMode`・`VrchatProfiles`・`VrchatClientCount` なし）に戻し、Bridge を起動し直した。Bridge の exe は main `870893e` のビルドのまま。VRChat の画面の設定（ScreenManager）は確認前の値に戻した。
+
+### PR #5 の手順9（Unity の Result Timeout）の確認（2026-10-18 03:26〜03:35）
+
+PR #5 の手順9（任意。Unity の Result Timeout を 120 秒にし、手順4と同じ負荷で4台のコールドスタートを送って `RESULT_TIMEOUT` にならない）を、main `870893e` のビルド（SHA-256 `0557CD0E…`）で確かめた。
+- `config.json` は Reload、`VrchatClientCount: 4`、settle 30 秒。Logging は「完全」
+- 負荷は手順4と同じで、論理 CPU の数（16）の `Start-Job { while ($true) {} }`。送る前からかけ、結果が出てから 20〜30 秒後に止めた
+- 送信は、Mac の Unity（パッケージ v0.5.0、Result Timeout 120 秒、Poll Interval 2 秒）で、ユーザーがウィンドウの Remote Build & Test を押した
+- 「受け取り」は Bridge が manifest を取り込んだ時刻（`state\archive` の写しの時刻）、「作成」は buildId の時刻（Mac の時計）
+
+| 回 | 結果 | 記録 |
+|----|------|------|
+| 1回目 | やり直し（Unity が待つのをやめた） | build `20261017T182815250Z-bf6df781`。作成 03:28:15.250、受け取り 03:28:23.465。`Launched VRChat client 1/4 (PID 4264)` は 03:28:38.114。03:28:42.062 に `Waiting for VRChat client 1/4 to create its output_log file before launching the next client (up to 56s more) ...`、03:29:39.616 に `[WRN] VRChat client 1/4 has not created an output_log file within 60s of the first launch; launching the remaining clients 3s apart. ...`。`2/4` 03:29:42.143、`3/4` 47.357、`4/4` 52.640、`deployed` 03:29:56.346（受け取りから 92.9 秒、作成から 101.1 秒）。Unity の Last Deployment は、それより前の 03:28:54 に `UNKNOWN_ERROR: Deploy cancelled.` になっていた。Unity は、ウィンドウの Cancel か、ウィンドウが無効になったとき（`OnDisable`。閉じた、スクリプトを読み込み直した、など）に待つのをやめてこの表示を出す（`RemoteBuildCoordinator.DeployArtifactAsync` の `OperationCanceledException`）。何が起きたかは分からない。このあと Mac で 03:29:03.363 に作られた2件目（`20261017T182903363Z-7aed386d`、Last Deployment には出ていない）も届き、1件目のあとに受け取られ（03:30:12.174）、settle の待ちのあと 03:30:20.711 に4台のリロードで `deployed` になった |
+| やり直し | 合格（Windows 側） | VRChat の4台を閉じ、負荷をかけ直した（03:31:54）。build `20261017T183303855Z-92a99fc6`。作成 03:33:03.855、受け取り 03:33:07.546。`Launched 1/4 (PID 8332)` は 03:33:20.901。1回目と同じく、03:34:18.568 に 60 秒の `[WRN]` が出て、`2/4` 03:34:21.343、`3/4` 26.702、`4/4` 32.000 と続いた。`deployed` は 03:34:32.280 で、受け取りから 84.7 秒、作成から 88.4 秒。Unity の 120 秒には収まった。手順4（90.3 秒）とほぼ同じ。届いたのはこの1件だけだった。Unity の Last Deployment は見ていない |
+
+やり直しの4台のログ:
+- 負荷を止めた直後に、1台目のログ（`output_log_2026-10-18_03-34-18.txt`）ができた。ファイルが作られたのは 03:35:03 で、1台目の起動から 105 秒後
+- 残りの3台は、1つのファイル（`03-35-03`）を一緒に書いた
+- 03:35:06 に `... 03-35-03.txt is open by several VRChat processes; it is not shown as any one client's log.` と `Showing ... 03-34-18.txt as the log of VRChat client 8332 (the only ...)` が出た
+- 4台とも `local:dab8e4…` に入った
+
+手順4と同じく、負荷が高いと1台目のログが 60 秒を過ぎてもできず、残りの台のログが混ざる。それでも配置は 120 秒に収まった。
+
+後片付け: VRChat を全部閉じ、`config.json` を確認前の値（Reload、`VrchatClientCount` なし）に戻し、Bridge を起動し直した。負荷のジョブは残っていない。VRChat の画面の設定（ScreenManager）は確認前の値に戻した。そのあと、Bridge を v0.5.1 の Release の exe（SHA-256 `03BFEEDE055A8F8D6C9E3F96D5D007136B95EC9D082AA920A438F0C2A9FEC47E`、来歴の検証つき）に入れ替えた。
 
 ---
 
