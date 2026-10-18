@@ -42,8 +42,30 @@ namespace VRCRemoteTest
         private const float LogTopThresholdPixels = 20f;
 
         private static readonly string[] LogCategories = { "All", "Error", "Exception", "Udon", "Shader", "Warning" };
+        private static readonly string[] LogViews = { "Log", "Markers" };
+
+        // The per-slot files are read at most this often while the viewer is
+        // drawn: OnGUI runs several times per frame, and a markers file can be
+        // 1 MiB per slot.
+        private const double ClientFilesCacheSeconds = 1.0;
 
         private bool _logFoldout;
+
+        // Client-observation plan F8: with a Bridge that writes
+        // vrchat-clients.json (v0.6.0), the viewer can show one slot's log or
+        // the marker lines; without it, only vrchat-latest.log, as before.
+        private int _logSourceIndex;
+        private bool _showMarkers;
+
+        // What the toolbars asked for; taken over at the next Layout event.
+        private int _requestedLogSourceIndex;
+        private bool _requestedShowMarkers;
+        private VrchatClients _clients;
+        private bool _clientsStale;
+        private double _lastClientsRead = double.NegativeInfinity;
+        private string _clientFileCacheKey = string.Empty;
+        private string _clientFileContent;
+        private double _lastClientFilesRead = double.NegativeInfinity;
         private string _logCategory = "All";
         private Vector2 _logScrollPosition;
 
@@ -268,7 +290,9 @@ namespace VRCRemoteTest
         /// <summary>
         /// Foldout (default closed), category toolbar filter, Auto Refresh
         /// toggle, and a scrollable read-only view of the Bridge's published
-        /// vrchat-latest.log (spec section 47, "Unity log viewer"). Never
+        /// vrchat-latest.log (spec section 47, "Unity log viewer"), or, with a
+        /// Bridge that writes vrchat-clients.json, of one slot's log or the
+        /// marker lines (spec section 36, client-observation plan F8). Never
         /// wired into readiness detection — display only (Phase 5 plan,
         /// explicit non-goal).
         /// </summary>
@@ -280,8 +304,8 @@ namespace VRCRemoteTest
                 return;
             }
 
-            var rawLog = RemoteBuildCommand.GetCoordinator().VrchatLog;
-            var lines = string.IsNullOrEmpty(rawLog) ? Array.Empty<string>() : rawLog.Split('\n');
+            var coordinator = RemoteBuildCommand.GetCoordinator();
+            var lines = ReadSelectedLog(coordinator);
 
             var selectedIndex = Array.IndexOf(LogCategories, _logCategory);
             var newSelectedIndex = GUILayout.Toolbar(Math.Max(0, selectedIndex), LogCategories);
@@ -347,6 +371,115 @@ namespace VRCRemoteTest
 
             _logPinnedToTop = _logScrollPosition.y <= LogTopThresholdPixels;
         }
+
+        /// <summary>
+        /// The lines of the selected source, oldest first. Without a clients
+        /// list (Bridge 0.5.x) that is vrchat-latest.log, and nothing else is
+        /// drawn. Otherwise a source toolbar (Latest or a slot; for markers,
+        /// all slots merged or a slot) and the selected client's summary come
+        /// first.
+        /// </summary>
+        private string[] ReadSelectedLog(RemoteBuildCoordinator coordinator)
+        {
+            // Only during Layout: what decides how many controls are drawn
+            // must not change between a Layout event and the event after it.
+            var now = EditorApplication.timeSinceStartup;
+            var layout = Event.current.type == EventType.Layout;
+            if (layout && now - _lastClientsRead >= ClientFilesCacheSeconds)
+            {
+                _lastClientsRead = now;
+                _clients = coordinator.VrchatClients;
+                _clientsStale = ClientLogView.IsStale(_clients, DateTimeOffset.UtcNow);
+            }
+
+            var slots = ClientLogView.Slots(_clients);
+            if (layout)
+            {
+                _showMarkers = _clients != null && _requestedShowMarkers;
+                _logSourceIndex = Math.Min(Math.Max(0, _requestedLogSourceIndex), slots.Length);
+            }
+
+            if (_clients == null)
+            {
+                return SplitLines(coordinator.VrchatLog);
+            }
+
+            // A click changes what is drawn only from the next Layout on, so the
+            // controls of one Layout and the event after it stay the same.
+            var requestedMarkers = GUILayout.Toolbar(_showMarkers ? 1 : 0, LogViews) == 1;
+            var requestedSource = GUILayout.Toolbar(_logSourceIndex, ClientLogView.SourceLabels(slots, _showMarkers));
+            if (requestedMarkers != _showMarkers || requestedSource != _logSourceIndex)
+            {
+                _requestedShowMarkers = requestedMarkers;
+                _requestedLogSourceIndex = requestedSource;
+                Repaint();
+            }
+
+            int? slot = _logSourceIndex == 0 || _logSourceIndex > slots.Length ? (int?)null : slots[_logSourceIndex - 1];
+
+            DrawClientSummary(slot);
+
+            if (!_showMarkers && slot == null)
+            {
+                return SplitLines(coordinator.VrchatLog);
+            }
+
+            var key = $"{_showMarkers}:{slot}";
+            if (layout && (key != _clientFileCacheKey || now - _lastClientFilesRead >= ClientFilesCacheSeconds))
+            {
+                _clientFileCacheKey = key;
+                _lastClientFilesRead = now;
+                _clientFileContent = _showMarkers
+                    ? ReadMarkers(coordinator, slot, slots)
+                    : coordinator.GetClientLog(slot.Value);
+            }
+
+            return SplitLines(_clientFileContent);
+        }
+
+        private static string ReadMarkers(RemoteBuildCoordinator coordinator, int? slot, int[] slots)
+        {
+            var files = (slot.HasValue ? new[] { slot.Value } : slots)
+                .Select(s => ClientLogView.ParseMarkers(s, coordinator.GetClientMarkers(s)))
+                .ToArray();
+            var notes = files
+                .Where(f => f.Header != null && (f.Header.CatchingUp || f.Header.DroppedRecords > 0))
+                .Select(f => f.Header.CatchingUp
+                    ? $"(slot {f.Header.Slot}: still reading its log; markers may be missing)"
+                    : $"(slot {f.Header.Slot}: {f.Header.DroppedRecords} older markers were dropped)");
+            var records = ClientLogView.Merge(files.Select(f => f.Records))
+                .Select(r => ClientLogView.FormatRecord(r, withSlot: !slot.HasValue));
+            // Last, so that the newest-first view shows them on top.
+            return string.Join("\n", records.Concat(notes));
+        }
+
+        private void DrawClientSummary(int? slot)
+        {
+            if (_clientsStale)
+            {
+                EditorGUILayout.HelpBox(
+                    "The Bridge's client list is more than 15 s old; what is shown may be out of date.",
+                    MessageType.Warning);
+            }
+
+            if (slot == null)
+            {
+                return;
+            }
+
+            var client = _clients.Clients?.FirstOrDefault(c => c != null && c.Slot == slot.Value);
+            EditorGUILayout.LabelField(ClientLogView.Describe(client), EditorStyles.wordWrappedMiniLabel);
+            if (client?.Warnings != null)
+            {
+                foreach (var warning in client.Warnings.Where(w => !string.IsNullOrEmpty(w)))
+                {
+                    EditorGUILayout.HelpBox(warning, MessageType.Warning);
+                }
+            }
+        }
+
+        private static string[] SplitLines(string content) =>
+            string.IsNullOrEmpty(content) ? Array.Empty<string>() : content.Split('\n');
 
         /// <summary>
         /// Internal (not private) so RemoteTestWindowFilterTests can exercise

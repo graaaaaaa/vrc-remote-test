@@ -31,6 +31,16 @@ namespace VRCRemoteTest
         // file can never fail this guard.
         private const long MaxVrchatLogFileBytes = 512 * 1024;
 
+        // The Bridge keeps vrchat-clients.json to four entries of a few KiB each.
+        private const long MaxVrchatClientsFileBytes = 256 * 1024;
+
+        // The Bridge caps a markers file at 1 MiB (client-observation plan F3);
+        // the rest is headroom, as for the log above.
+        internal const long MaxClientMarkersFileBytes = 1280 * 1024;
+
+        /// <summary>Slots are 0-3, the Bridge's client limit.</summary>
+        internal const int SlotCount = 4;
+
         private string IncomingDir => Path.Combine(_sharePath, "incoming");
         private string ResultsDir => Path.Combine(_sharePath, "results");
         private string StatusDir => Path.Combine(_sharePath, "status");
@@ -168,6 +178,75 @@ namespace VRCRemoteTest
                 return File.ReadAllText(logPath);
             }
             catch (IOException)
+            {
+                return null;
+            }
+        }
+
+        /// <summary>
+        /// Advisory, like <see cref="PollVrchatStatus"/>: never gates a build.
+        /// </summary>
+        public VrchatClients PollVrchatClients()
+        {
+            var json = ReadBoundedText(CombineUnderRoot(StatusDir, "vrchat-clients.json"), MaxVrchatClientsFileBytes);
+            if (json == null)
+            {
+                return null;
+            }
+
+            try
+            {
+                return JsonConvert.DeserializeObject<VrchatClients>(json, new JsonSerializerSettings
+                {
+                    TypeNameHandling = TypeNameHandling.None,
+                    MaxDepth = 8,
+                });
+            }
+            catch (JsonException)
+            {
+                return null;
+            }
+        }
+
+        public string PollClientLog(int slot) =>
+            ReadBoundedText(ClientFile(slot, ".log"), MaxVrchatLogFileBytes);
+
+        public string PollClientMarkers(int slot) =>
+            ReadBoundedText(ClientFile(slot, ".markers.log"), MaxClientMarkersFileBytes);
+
+        private string ClientFile(int slot, string suffix)
+        {
+            if (slot < 0 || slot >= SlotCount)
+            {
+                throw new ArgumentOutOfRangeException(nameof(slot), slot, $"Slots are 0 to {SlotCount - 1}.");
+            }
+
+            return CombineUnderRoot(Path.Combine(LogsDir, "clients"), $"slot-{slot}{suffix}");
+        }
+
+        /// <summary>
+        /// Reads at most <paramref name="maxBytes"/> + 1 bytes, so a file that grows past
+        /// the guard between a size check and the read is still refused, and decodes them
+        /// as UTF-8. Null when the file is missing, unreadable or larger than the guard.
+        /// </summary>
+        internal static string ReadBoundedText(string path, long maxBytes)
+        {
+            try
+            {
+                using (var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+                {
+                    var buffer = new byte[maxBytes + 1];
+                    var total = 0;
+                    int read;
+                    while (total < buffer.Length && (read = stream.Read(buffer, total, buffer.Length - total)) > 0)
+                    {
+                        total += read;
+                    }
+
+                    return total > maxBytes ? null : new System.Text.UTF8Encoding(false).GetString(buffer, 0, total);
+                }
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
             {
                 return null;
             }

@@ -46,5 +46,26 @@ namespace VRCRemoteTest
         /// "no log available", never as an error.
         /// </summary>
         string PollVrchatLog();
+
+        /// <summary>
+        /// Reads status/vrchat-clients.json (Bridge v0.6.0 and later): one entry per
+        /// slot. Returns null if the file does not exist (an older Bridge), could not be
+        /// read or parsed, or exceeds the size guard — callers then show
+        /// vrchat-latest.log alone, as before.
+        /// </summary>
+        VrchatClients PollVrchatClients();
+
+        /// <summary>
+        /// Reads logs/clients/slot-{slot}.log: that client's last 200 lines, or why it is
+        /// not shown. Null under the same conditions as <see cref="PollVrchatLog"/>.
+        /// </summary>
+        string PollClientLog(int slot);
+
+        /// <summary>
+        /// Reads logs/clients/slot-{slot}.markers.log: the marker lines of that client's
+        /// session, up to 1 MiB, with a size guard of its own. Null when missing,
+        /// unreadable or over the guard.
+        /// </summary>
+        string PollClientMarkers(int slot);
     }
 }

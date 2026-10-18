@@ -17,6 +17,12 @@ The Windows Bridge now publishes every VRChat client's log, state and marker lin
 - User IDs (`usr_…`), Windows profile paths, IP addresses and authentication values are masked before anything from a log, or a build result's error message, reaches the share. Display names and world information stay.
 - The Log Viewer's diagnostic lines name the slot (`The VRChat client in slot 0 (PID …) has not created …`, `Could not match an output_log_*.txt file to the VRChat client in slot 0 …`) instead of "the first VRChat client".
 
+### Added (Unity package and Mac script)
+
+- The Log Viewer switches between `Log` and `Markers`, and between `Latest` (vrchat-latest.log, as before) and `Slot 0`–`Slot 3`. `Markers` shows a slot's marker lines, or `All slots` merged by time, then slot, then seq. Choosing a slot shows its state (PID, state, instance, players, master, Logging level) and the Bridge's warnings, and a client list older than 15 s is flagged. With a Bridge older than v0.6.0 the viewer stays as it was.
+- `IRemoteTransport` gains `PollVrchatClients()`, `PollClientLog(slot)` and `PollClientMarkers(slot)` (a bounded read of up to 1.25 MiB, separate from the log's 512 KiB guard).
+- `scripts/vrcrt.sh` reads the same files from the mounted share for agents and terminals: `status`, `log <slot> [--markers]`, `log all --markers`, `cursor`, `wait-marker <slot|all> <regex> <seconds> [--after <cursor>]` and `wait-same-instance <seconds> [--slots] [--after <cursor>]`. It needs python3 3.9 or later (standard library only), escapes control characters, and stops a regular expression after 2 s. `scripts/test-vrcrt.sh` checks it against a fake share.
+
 ## [0.5.1] - 2026-10-18
 
 Fixes a Windows Bridge bug that could overwrite a successful build's result with a failure. The fix is in the Bridge only and the Unity package itself has no functional changes, so **update the Windows Bridge** (`docs/setup-windows.md`, steps 1 and 6). An existing `config.json` keeps working as before.
