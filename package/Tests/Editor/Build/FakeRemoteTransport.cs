@@ -50,5 +50,17 @@ namespace VRCRemoteTest.Tests
         public string VrchatLogToReturn { get; set; }
 
         public string PollVrchatLog() => VrchatLogToReturn;
+
+        public VrchatClients VrchatClientsToReturn { get; set; }
+
+        public VrchatClients PollVrchatClients() => VrchatClientsToReturn;
+
+        public Dictionary<int, string> ClientLogs { get; } = new Dictionary<int, string>();
+
+        public string PollClientLog(int slot) => ClientLogs.TryGetValue(slot, out var log) ? log : null;
+
+        public Dictionary<int, string> ClientMarkers { get; } = new Dictionary<int, string>();
+
+        public string PollClientMarkers(int slot) => ClientMarkers.TryGetValue(slot, out var markers) ? markers : null;
     }
 }

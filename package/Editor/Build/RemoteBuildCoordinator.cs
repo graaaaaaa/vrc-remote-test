@@ -57,6 +57,13 @@ namespace VRCRemoteTest
         /// </summary>
         public string VrchatLog => _transport.PollVrchatLog();
 
+        /// <summary>Null with a Bridge older than v0.6.0; see IRemoteTransport.PollVrchatClients.</summary>
+        public VrchatClients VrchatClients => _transport.PollVrchatClients();
+
+        public string GetClientLog(int slot) => _transport.PollClientLog(slot);
+
+        public string GetClientMarkers(int slot) => _transport.PollClientMarkers(slot);
+
         /// <summary>
         /// Set as soon as SHA-256 has been computed for a successful SDK
         /// build, even if the subsequent upload/poll fails — a build that got

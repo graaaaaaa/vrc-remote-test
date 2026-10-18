@@ -1359,6 +1359,8 @@ ON / OFF
 
 default ON。
 
+v0.6.0（Bridge が `status/vrchat-clients.json` を書くとき）からは、`Log` / `Markers` と、`Latest`（`vrchat-latest.log`）か `Slot 0`〜`Slot 3`（`logs/clients/slot-{n}.log`）を切り替えられる。`Markers` は `logs/clients/slot-{n}.markers.log` を読み（1 MiB 用の別の上限つき読み取り）、`All slots` で全台を時刻・slot・seq の順に結合して表示する。台を選ぶと、`vrchat-clients.json` のその台の状態と注意を表示し、一覧が15秒より古ければ警告する。ファイルが無ければ（Bridge 0.5.x）、今までの表示だけにする。読み取りは `IRemoteTransport` の `PollVrchatClients()`・`PollClientLog(slot)`・`PollClientMarkers(slot)`。Mac のスクリプト `scripts/vrcrt.sh`（`status`・`log`・`cursor`・`wait-marker`・`wait-same-instance`）も同じファイルを読む（README）。
+
 ---
 
 # 37. Unity Editor Window

@@ -240,5 +240,97 @@ namespace VRCRemoteTest.Tests
             var transport = new SmbRemoteTransport(_shareRoot);
             Assert.IsNull(transport.PollVrchatLog());
         }
+    
+        // ---- Per-slot files (Bridge v0.6.0, client-observation plan F8) ----
+
+        private string ClientsDir()
+        {
+            var dir = Path.Combine(_shareRoot, "logs", "clients");
+            Directory.CreateDirectory(dir);
+            return dir;
+        }
+
+        [Test]
+        public void PollVrchatClients_returns_null_without_the_file_as_with_an_older_Bridge()
+        {
+            Assert.IsNull(new SmbRemoteTransport(_shareRoot).PollVrchatClients());
+        }
+
+        [Test]
+        public void PollVrchatClients_reads_the_slots_the_Bridge_wrote()
+        {
+            var statusDir = Path.Combine(_shareRoot, "status");
+            Directory.CreateDirectory(statusDir);
+            File.WriteAllText(
+                Path.Combine(statusDir, "vrchat-clients.json"),
+                "{\"schemaVersion\":1,\"logMarkerPrefixes\":[\"[VRCRT]\"],\"processListReadable\":true," +
+                "\"unassignedClients\":0,\"clients\":[{\"slot\":1,\"clientGeneration\":5866502486200147," +
+                "\"observationEpoch\":3,\"processId\":200,\"running\":true,\"state\":\"joined\"," +
+                "\"instance\":\"local:dab8e405\",\"playersInInstance\":[\"Alice\",\"Bob\"],\"isMaster\":null," +
+                "\"loggingLevel\":\"full\",\"catchingUp\":false,\"futureField\":1}]," +
+                "\"updatedAtUtc\":\"2026-10-18T04:34:37+00:00\"}");
+
+            var clients = new SmbRemoteTransport(_shareRoot).PollVrchatClients();
+
+            Assert.IsNotNull(clients);
+            Assert.AreEqual(1, clients.Clients.Count);
+            var client = clients.Clients[0];
+            Assert.AreEqual(1, client.Slot);
+            Assert.AreEqual(5866502486200147L, client.ClientGeneration);
+            Assert.AreEqual("joined", client.State);
+            Assert.AreEqual(2, client.PlayersInInstance.Count);
+            Assert.IsNull(client.IsMaster);
+            Assert.AreEqual(true, client.Running);
+        }
+
+        [Test]
+        public void PollVrchatClients_returns_null_for_corrupt_json()
+        {
+            var statusDir = Path.Combine(_shareRoot, "status");
+            Directory.CreateDirectory(statusDir);
+            File.WriteAllText(Path.Combine(statusDir, "vrchat-clients.json"), "{ not json");
+
+            Assert.IsNull(new SmbRemoteTransport(_shareRoot).PollVrchatClients());
+        }
+
+        [Test]
+        public void PollClientLog_reads_the_slots_file()
+        {
+            File.WriteAllText(Path.Combine(ClientsDir(), "slot-2.log"), "2026.10.18 13:34:37 Debug      -  hi\n    continued");
+
+            var transport = new SmbRemoteTransport(_shareRoot);
+
+            Assert.AreEqual("2026.10.18 13:34:37 Debug      -  hi\n    continued", transport.PollClientLog(2));
+            Assert.IsNull(transport.PollClientLog(1));
+        }
+
+        [Test]
+        public void Slots_outside_0_to_3_are_refused()
+        {
+            var transport = new SmbRemoteTransport(_shareRoot);
+
+            Assert.Throws<ArgumentOutOfRangeException>(() => transport.PollClientLog(4));
+            Assert.Throws<ArgumentOutOfRangeException>(() => transport.PollClientMarkers(-1));
+        }
+
+        [Test]
+        public void PollClientMarkers_reads_a_full_1_MiB_markers_file()
+        {
+            // Above PollVrchatLog's 512 KiB guard: markers have a guard of their own.
+            var content = "# {}\n" + new string('m', 1024 * 1024 - 5);
+            File.WriteAllText(Path.Combine(ClientsDir(), "slot-0.markers.log"), content);
+
+            Assert.AreEqual(content, new SmbRemoteTransport(_shareRoot).PollClientMarkers(0));
+        }
+
+        [Test]
+        public void PollClientMarkers_returns_null_over_its_size_guard()
+        {
+            File.WriteAllText(
+                Path.Combine(ClientsDir(), "slot-0.markers.log"),
+                new string('m', (int)SmbRemoteTransport.MaxClientMarkersFileBytes + 1));
+
+            Assert.IsNull(new SmbRemoteTransport(_shareRoot).PollClientMarkers(0));
+        }
     }
 }
