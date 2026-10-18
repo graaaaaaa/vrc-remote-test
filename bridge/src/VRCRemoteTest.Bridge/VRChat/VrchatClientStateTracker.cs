@@ -49,6 +49,16 @@ internal sealed partial class VrchatClientStateTracker
 {
     internal const int MaxEvents = 20;
 
+    /// <summary>
+    /// A world can write any number of OnPlayerJoined lines. Past this many players the list
+    /// and the master flag are given up until the next Joining rather than kept growing.
+    /// </summary>
+    internal const int MaxPlayers = 256;
+
+    /// <summary>Longer names and IDs are not VRChat's, so such a line is not an event.</summary>
+    internal const int MaxNameLength = 128;
+    internal const int MaxUserIdLength = 64;
+
     private const string Behaviour = "[Behaviour] ";
     private const string LocalPrefix = "local:";
     private const string ErrorWorldPrefix = "local:error_";
@@ -62,6 +72,9 @@ internal sealed partial class VrchatClientStateTracker
     /// <summary>The latest attempt has not finished yet.</summary>
     private bool _awaitingFinish;
 
+    /// <summary>More than <see cref="MaxPlayers"/> joined in this attempt.</summary>
+    private bool _playersOverflowed;
+
     public VrchatClientLogState State { get; private set; } = VrchatClientLogState.Starting;
 
     /// <summary>local:&lt;id&gt; without the trailing ":&lt;n&gt;".</summary>
@@ -71,7 +84,13 @@ internal sealed partial class VrchatClientStateTracker
 
     public bool? InErrorWorld { get; private set; }
 
-    public bool? IsMaster { get; private set; }
+    public bool? IsMaster
+    {
+        get => _playersOverflowed ? null : _isMaster;
+        private set => _isMaster = value;
+    }
+
+    private bool? _isMaster;
 
     public long? JoinAttemptSeq { get; private set; }
 
@@ -88,8 +107,9 @@ internal sealed partial class VrchatClientStateTracker
 
     public bool SawError { get; private set; }
 
-    /// <summary>The players after the latest Joining, or null between attempts.</summary>
-    public IReadOnlyList<string>? Players => _inAttempt ? _players.Select(p => p.Name).ToList() : null;
+    /// <summary>The players after the latest Joining, or null between attempts and once there were too many.</summary>
+    public IReadOnlyList<string>? Players =>
+        _inAttempt && !_playersOverflowed ? _players.Select(p => p.Name).ToList() : null;
 
     public IReadOnlyCollection<VrchatClientLogEvent> Events => _events;
 
@@ -211,16 +231,24 @@ internal sealed partial class VrchatClientStateTracker
         {
             if (joined)
             {
-                if (_inAttempt)
+                if (_inAttempt && !_playersOverflowed)
                 {
-                    _players.Add((name, userId));
+                    if (_players.Count == MaxPlayers)
+                    {
+                        _playersOverflowed = true;
+                        _players.Clear();
+                    }
+                    else
+                    {
+                        _players.Add((name, userId));
+                    }
                 }
 
                 AddEvent("OnPlayerJoined", seq, time, player: name);
             }
             else
             {
-                if (_inAttempt)
+                if (_inAttempt && !_playersOverflowed)
                 {
                     var index = _players.FindIndex(p => p.Name == name && p.UserId == userId);
                     if (index >= 0)
@@ -250,6 +278,7 @@ internal sealed partial class VrchatClientStateTracker
     private void OnJoining(string value, long seq, DateTime time)
     {
         _players.Clear();
+        _playersOverflowed = false;
         _inAttempt = true;
         IsMaster = null;
         Instance = null;
@@ -283,6 +312,7 @@ internal sealed partial class VrchatClientStateTracker
     private void LeaveAttempt()
     {
         _inAttempt = false;
+        _playersOverflowed = false;
         _awaitingFinish = false;
         _players.Clear();
         IsMaster = null;
@@ -342,7 +372,8 @@ internal sealed partial class VrchatClientStateTracker
         }
 
         var id = text.AsSpan(open + 2, text.Length - open - 3);
-        if (id.Length <= "usr_".Length || id["usr_".Length..].ContainsAnyExcept(UserIdCharacters))
+        if (id.Length <= "usr_".Length || id.Length > MaxUserIdLength || open > MaxNameLength
+            || id["usr_".Length..].ContainsAnyExcept(UserIdCharacters))
         {
             return false;
         }

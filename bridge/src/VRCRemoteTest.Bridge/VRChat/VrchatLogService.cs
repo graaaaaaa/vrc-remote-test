@@ -17,9 +17,14 @@ namespace VRCRemoteTest.Bridge.VRChat;
 /// (client-observation plan F1-F3):
 /// - logs/vrchat-latest.log, the first client's log as before slots (Unity 0.5.x);
 /// - logs/clients/slot-{n}.log for slots 0-3, each slot's log tail or why it is not shown;
-/// - logs/clients/slot-{n}.markers.log when its content changed, after moving the previous
-///   client's file to slot-{n}.markers.prev.log when a new client took the slot;
+/// - logs/clients/slot-{n}.markers.log when its content changed, after keeping the previous
+///   client's markers as slot-{n}.markers.prev.log when a new client took the slot;
 /// - status/vrchat-clients.json.
+///
+/// A log copy whose content did not change since it was last written is not written again.
+/// A markers or .prev file counts as written only when SharedFileWriter replaced it (not when
+/// a reader kept it busy), and the observer offers it again until then; a slot's new markers
+/// wait until its .prev is in place.
 ///
 /// Every iteration is wrapped in try/catch: an unhandled exception escaping
 /// BackgroundService.ExecuteAsync stops the entire Generic Host by default (.NET
@@ -37,9 +42,6 @@ public sealed class VrchatLogService : BackgroundService
 {
     private static readonly TimeSpan DefaultPollInterval = TimeSpan.FromSeconds(5);
 
-    /// <summary>A previous client's markers file larger than this was not written by the Bridge and is not kept.</summary>
-    private const int MaxPreviousMarkersBytes = 2 * VrchatMarkerLog.MaxFileBytes;
-
     private static readonly JsonSerializerOptions SerializerOptions = new() { WriteIndented = true };
 
     private readonly BridgeOptions _options;
@@ -53,6 +55,9 @@ public sealed class VrchatLogService : BackgroundService
     private readonly Dictionary<string, SharedFileWriter> _writers = new(StringComparer.OrdinalIgnoreCase);
 
     private readonly Dictionary<string, string> _lastWriteProblem = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>What each log copy was last written with.</summary>
+    private readonly Dictionary<string, string> _written = new(StringComparer.OrdinalIgnoreCase);
 
     public VrchatLogService(
         IOptions<BridgeOptions> options,
@@ -139,7 +144,7 @@ public sealed class VrchatLogService : BackgroundService
 
         if (read.Latest.IsAvailable)
         {
-            Publish(Path.Combine(LogsDirectory, "vrchat-latest.log"), read.Latest.Content);
+            PublishIfChanged(Path.Combine(LogsDirectory, "vrchat-latest.log"), read.Latest.Content);
         }
 
         foreach (var slot in read.Slots)
@@ -152,17 +157,28 @@ public sealed class VrchatLogService : BackgroundService
             var content = observation.SlotNotices.TryGetValue(slot.Slot, out var notices)
                 ? string.Join("\n", notices.Select(n => "# " + n).Append(slot.Content.Content))
                 : slot.Content.Content;
-            Publish(SlotLogPath(slot.Slot), content);
+            PublishIfChanged(SlotLogPath(slot.Slot), content);
         }
 
-        foreach (var slot in observation.NewGenerations)
+        var waiting = new HashSet<int>();
+        foreach (var previous in observation.PreviousMarkers)
         {
-            KeepPreviousMarkers(slot);
+            if (KeepPreviousMarkers(previous))
+            {
+                _observer.AcknowledgePrevious(previous);
+            }
+            else
+            {
+                waiting.Add(previous.Slot);
+            }
         }
 
-        foreach (var (slot, content) in observation.MarkerFiles)
+        foreach (var markers in observation.MarkerFiles)
         {
-            Publish(MarkersPath(slot), content);
+            if (!waiting.Contains(markers.Slot) && Publish(MarkersPath(markers.Slot), markers.Content))
+            {
+                _observer.AcknowledgeMarkers(markers.Slot, markers.Key);
+            }
         }
 
         Publish(
@@ -172,10 +188,10 @@ public sealed class VrchatLogService : BackgroundService
 
     private void PublishNotice(string message)
     {
-        Publish(Path.Combine(LogsDirectory, "vrchat-latest.log"), message);
+        PublishIfChanged(Path.Combine(LogsDirectory, "vrchat-latest.log"), message);
         for (var slot = 0; slot < VrchatClientRoster.SlotCount; slot++)
         {
-            Publish(SlotLogPath(slot), message);
+            PublishIfChanged(SlotLogPath(slot), message);
         }
     }
 
@@ -186,31 +202,57 @@ public sealed class VrchatLogService : BackgroundService
     private string PreviousMarkersPath(int slot) => Path.Combine(ClientLogsDirectory, $"slot-{slot}.markers.prev.log");
 
     /// <summary>
-    /// The slot's markers file is the previous client's; it replaces the older .prev, so only
-    /// the one generation before is kept (client-observation plan C5). Its content is only
-    /// copied, never interpreted.
+    /// Keeps the previous client's markers as slot-{n}.markers.prev.log, replacing the older
+    /// one, so only the one generation before is kept (client-observation plan C5). Without
+    /// the markers in memory (that client ran before this Bridge started), the published file
+    /// is moved there as it is, without being read: the share's logs directory is the
+    /// Bridge's to write, not the SMB account's. True once done.
     /// </summary>
-    private void KeepPreviousMarkers(int slot)
+    private bool KeepPreviousMarkers(PreviousMarkers previous)
     {
-        var current = MarkersPath(slot);
-        string content;
+        var previousPath = PreviousMarkersPath(previous.Slot);
+        if (previous.Content is { } content)
+        {
+            return Publish(previousPath, content);
+        }
+
+        var current = MarkersPath(previous.Slot);
         try
         {
-            var info = new FileInfo(current);
-            if (!info.Exists || info.Length > MaxPreviousMarkersBytes)
+            if (File.Exists(current))
             {
-                return;
+                File.Move(current, previousPath, overwrite: true);
             }
 
-            content = File.ReadAllText(current);
+            return true;
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
-            _logger.LogWarning(ex, "Could not keep {Path} as the previous client's markers.", current);
+            if (!_lastWriteProblem.TryGetValue(previousPath, out var problem) || problem != ex.Message)
+            {
+                _logger.LogWarning(ex, "Could not move {Path} to {Previous}; trying again on the next poll.", current, previousPath);
+                _lastWriteProblem[previousPath] = ex.Message;
+            }
+
+            return false;
+        }
+    }
+
+    private void PublishIfChanged(string path, string content)
+    {
+        if (_written.TryGetValue(path, out var written) && written == content)
+        {
             return;
         }
 
-        Publish(PreviousMarkersPath(slot), content);
+        if (Publish(path, content))
+        {
+            _written[path] = content;
+        }
+        else
+        {
+            _written.Remove(path);
+        }
     }
 
     /// <summary>
@@ -218,7 +260,7 @@ public sealed class VrchatLogService : BackgroundService
     /// Mac's SMB client is replaced with POSIX semantics rather than failing every poll
     /// (see SharedFileWriter). A failure is logged once per file and problem.
     /// </summary>
-    private void Publish(string path, string content)
+    private bool Publish(string path, string content)
     {
         try
         {
@@ -229,8 +271,9 @@ public sealed class VrchatLogService : BackgroundService
                 _writers[path] = writer;
             }
 
-            writer.Write(path, content);
+            var outcome = writer.Write(path, content);
             _lastWriteProblem.Remove(path);
+            return outcome != SharedFileWriteOutcome.DestinationBusy;
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
@@ -239,6 +282,8 @@ public sealed class VrchatLogService : BackgroundService
                 _logger.LogError(ex, "Could not publish {Path}.", path);
                 _lastWriteProblem[path] = ex.Message;
             }
+
+            return false;
         }
     }
 }

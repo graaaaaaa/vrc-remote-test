@@ -89,17 +89,31 @@ public class VrchatLogScannerTests : IDisposable
     }
 
     [Fact]
-    public void A_truncated_line_is_cut_at_a_character_boundary()
+    public void A_truncated_line_ends_at_a_whole_character_and_its_last_space()
     {
+        // "あい " is 7 bytes, so the 4 KiB cut falls inside an "あ".
         var path = PathOf("a.txt");
-        File.WriteAllText(path, new string('あ', 30_000) + "\r\n");
+        File.WriteAllText(path, string.Concat(Enumerable.Repeat("あい ", 12_000)) + "\r\n");
         var scanner = new VrchatLogScanner(path, DateTime.UnixEpoch);
 
         var line = scanner.Read(1024 * 1024, CancellationToken.None).Lines.Single();
 
         line.Truncated.Should().BeTrue();
-        line.Text.Should().NotContain("�").And.MatchRegex("^あ+$");
+        line.Text.Should().NotContain("\uFFFD").And.EndWith("あい").And.MatchRegex("^(あい )+あい$");
         Encoding.UTF8.GetByteCount(line.Text).Should().BeLessOrEqualTo(VrchatLogScanner.TruncatedKeepBytes);
+    }
+
+    [Fact]
+    public void A_truncated_line_without_a_space_keeps_nothing_of_it()
+    {
+        // One 64 KiB token (a secret, maybe) is not kept in part.
+        var path = PathOf("a.txt");
+        File.WriteAllText(path, new string('k', 70_000) + "\r\n");
+        var scanner = new VrchatLogScanner(path, DateTime.UnixEpoch);
+
+        var line = scanner.Read(1024 * 1024, CancellationToken.None).Lines.Single();
+
+        line.Should().Be(new VrchatLogPhysicalLine(1, string.Empty, true));
     }
 
     [Fact]

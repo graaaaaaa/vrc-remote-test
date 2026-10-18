@@ -185,4 +185,20 @@ public class VrchatClientRosterTests : IDisposable
         entry.ClientGeneration.Should().NotBe(new RosterEntry(0, 100, T0.AddTicks(1)).ClientGeneration);
         entry.ClientGeneration.Should().BeInRange(1, (1L << 53) - 1);
     }
+
+    [Fact]
+    public void An_epoch_that_could_not_be_saved_is_not_handed_out_again_after_a_restart()
+    {
+        // The state directory is a file: nothing can be saved.
+        var blocked = Path.Combine(_stateDir, "blocked");
+        File.WriteAllText(blocked, string.Empty);
+        var path = Path.Combine(blocked, VrchatClientRoster.FileName);
+        var start = DateTimeOffset.UtcNow;
+
+        var before = new VrchatClientRoster(path, utcNow: () => start).AllocateEpoch();
+        var after = new VrchatClientRoster(path, utcNow: () => start.AddSeconds(5)).AllocateEpoch();
+
+        after.Should().BeGreaterThan(before);
+        before.Should().BeGreaterOrEqualTo(start.ToUnixTimeMilliseconds()).And.BeLessThan(1L << 53);
+    }
 }

@@ -63,11 +63,12 @@ public sealed record RosterView(
 /// free when it is empty or its client is confirmed gone. A client whose creation time is
 /// unknown gets no slot.
 ///
-/// The file also keeps the last observation epoch handed out, so epochs keep increasing
-/// across restarts. A file that is missing or not one this Bridge wrote starts an empty
-/// roster; when it was not one this Bridge wrote, epochs restart above the current Unix
-/// time in seconds, so none is handed out twice. Failing to save is logged and the roster
-/// carries on in memory.
+/// Observation epochs are never handed out twice, across restarts too: each is the larger of
+/// the last one plus one and the current Unix time in milliseconds, so one that could not be
+/// saved before a restart is still below every epoch after it (epochs are rare, far fewer
+/// than one per millisecond). The file keeps the last one as well, against the clock going
+/// back. A file that is missing or not one this Bridge wrote starts an empty roster. Failing
+/// to save is logged and the roster carries on in memory.
 ///
 /// Thread-safe, though only VrchatLogService's loop uses it.
 /// </summary>
@@ -91,6 +92,7 @@ public sealed class VrchatClientRoster
     private readonly object _gate = new();
     private readonly string? _filePath;
     private readonly ILogger _logger;
+    private readonly Func<DateTimeOffset> _utcNow;
     private readonly RosterEntry?[] _entries = new RosterEntry?[SlotCount];
     private long _lastEpoch;
     private bool _loaded;
@@ -102,10 +104,11 @@ public sealed class VrchatClientRoster
     }
 
     /// <summary>Test seam; a null <paramref name="filePath"/> keeps the roster in memory only.</summary>
-    internal VrchatClientRoster(string? filePath, ILogger? logger = null)
+    internal VrchatClientRoster(string? filePath, ILogger? logger = null, Func<DateTimeOffset>? utcNow = null)
     {
         _filePath = filePath;
         _logger = logger ?? NullLogger.Instance;
+        _utcNow = utcNow ?? (() => DateTimeOffset.UtcNow);
     }
 
     internal static long GenerationOf(int processId, DateTime creationTimeUtc)
@@ -195,15 +198,15 @@ public sealed class VrchatClientRoster
     }
 
     /// <summary>
-    /// A new epoch, higher than every one handed out before (also before a restart), saved
-    /// with the roster.
+    /// A new epoch, higher than every one handed out before (also before a restart, saved or
+    /// not), saved with the roster.
     /// </summary>
     public long AllocateEpoch()
     {
         lock (_gate)
         {
             EnsureLoadedLocked();
-            _lastEpoch++;
+            _lastEpoch = Math.Max(_lastEpoch + 1, _utcNow().ToUnixTimeMilliseconds());
             SaveLocked();
             return _lastEpoch;
         }
@@ -311,7 +314,7 @@ public sealed class VrchatClientRoster
                 "{Path} is not an observation roster this Bridge wrote ({Problem}); starting with empty slots.",
                 _filePath, ex.Message);
             Array.Clear(_entries);
-            _lastEpoch = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+            _lastEpoch = 0;
         }
     }
 

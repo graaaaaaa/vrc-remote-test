@@ -753,8 +753,11 @@ public sealed class VrchatLogReader : IVrchatLogReader
     ///
     /// The window is split at CRLF (<see cref="VrchatLogLine"/>). When it does not start at
     /// byte 0, everything up to its first CRLF may be part of a line (the read seeked into
-    /// the middle of the file) and is discarded rather than published as a fragment. The
-    /// last line is kept even without its CRLF yet, as before.
+    /// the middle of the file) and is discarded rather than published as a fragment, and so
+    /// is the last line until its CRLF is written (VRChat may be writing it; a value at its
+    /// end may be incomplete and not yet recognizable to mask). Each whole line is masked
+    /// before it is split into display lines, so a value after a lone LF is still masked
+    /// (client-observation plan C5).
     /// </summary>
     private static List<string> ReadTailLines(string path)
     {
@@ -786,12 +789,9 @@ public sealed class VrchatLogReader : IVrchatLogReader
         }
 
         var physical = VrchatLogLine.SplitPhysicalLines(window);
-        if (physical.Count > 0 && physical[^1].Length == 0)
-        {
-            physical.RemoveAt(physical.Count - 1);
-        }
+        physical.RemoveAt(physical.Count - 1);
 
-        var lines = physical.SelectMany(VrchatLogLine.ToDisplayLines).ToList();
+        var lines = physical.Select(LogRedactor.Redact).SelectMany(VrchatLogLine.ToDisplayLines).ToList();
 
         // A trailing lone LF leaves an empty last part; it is not a line.
         if (lines.Count > 0 && lines[^1].Length == 0)
@@ -802,10 +802,10 @@ public sealed class VrchatLogReader : IVrchatLogReader
         return lines;
     }
 
-    /// <summary>Masks each line, then cuts it and the whole copy to their limits (client-observation plan C5).</summary>
+    /// <summary>Cuts each masked line, then the whole copy, to their limits.</summary>
     private static string BuildBoundedOutput(List<string> lines)
     {
-        var selected = lines.TakeLast(PublishedLineLimit).Select(l => TruncateLine(LogRedactor.Redact(l))).ToArray();
+        var selected = lines.TakeLast(PublishedLineLimit).Select(TruncateLine).ToArray();
 
         var outputLines = new List<string>();
         var totalBytes = 0;

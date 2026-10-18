@@ -25,6 +25,11 @@ public class LogRedactorTests
     [InlineData("{\"token\": \"abc123\"}", "{\"token\": \"<redacted>\"}")]
     [InlineData("value authcookie_0f1e2d3c-aaaa", "value authcookie_<redacted>")]
     [InlineData("https://user:pa55@host/path", "https://<redacted>@host/path")]
+    [InlineData("{\"password\":\"correct horse battery staple\"}", "{\"password\":\"<redacted>\"}")]
+    [InlineData("password='abc123' next", "password='<redacted>' next")]
+    [InlineData("{\"Cookie\":\"opaque-session\"}", "{\"Cookie\":\"<redacted>\"}")]
+    [InlineData("token: \"cut off before its quote", "token: \"<redacted>")]
+    [InlineData(@"C:\Users\O'Brien\AppData", @"C:\Users\<user>\AppData")]
     public void Masks_each_kind_of_value(string input, string expected)
     {
         LogRedactor.Redact(input).Should().Be(expected);
@@ -40,5 +45,24 @@ public class LogRedactorTests
     public void Leaves_ordinary_lines_alone(string line)
     {
         LogRedactor.Redact(line).Should().Be(line);
+    }
+
+    [Fact]
+    public void Digits_of_other_scripts_neither_count_nor_throw()
+    {
+        // .NET's \d matches them, and int.Parse would refuse them.
+        LogRedactor.Redact("\u0661.\u0661.\u0661.\u0661 and 10.0.0.1").Should().Be("\u0661.\u0661.\u0661.\u0661 and <ip>");
+    }
+
+    [Fact]
+    public void A_long_run_that_looks_like_a_URL_scheme_stays_fast()
+    {
+        // The backtracking engine took quadratic time on this (Codex review, perspective C).
+        var line = string.Concat(Enumerable.Repeat("a-", 32 * 1024)) + "://x";
+        var watch = System.Diagnostics.Stopwatch.StartNew();
+
+        LogRedactor.Redact(line).Should().Be(line);
+
+        watch.Elapsed.Should().BeLessThan(TimeSpan.FromSeconds(1));
     }
 }

@@ -101,4 +101,57 @@ public class VrchatMarkerLogTests
         Encoding.UTF8.GetByteCount(content).Should().BeLessOrEqualTo(VrchatMarkerLog.MaxFileBytes);
         _markers.DroppedRecords.Should().BeGreaterThan(0);
     }
+
+    [Fact]
+    public void Only_the_open_record_keeps_unmasked_text_and_only_up_to_a_cap()
+    {
+        Line(Header + "[VRCRT] token=" + new string('s', 60_000));
+        _markers.RetainedRawChars.Should().Be(0, "a line over the cap is formatted and released at once");
+
+        Line(Header + "[VRCRT] open");
+        for (var i = 0; i < 100; i++)
+        {
+            Line(new string('c', 1_000));
+        }
+
+        _markers.RetainedRawChars.Should().Be(0, "past the cap the record is closed");
+        Records().Should().HaveCount(2).And.OnlyContain(r => r.EndsWith(VrchatMarkerLog.TruncationMark));
+
+        Line(Header + "[VRCRT] another");
+        Line("continued");
+        _markers.RetainedRawChars.Should().BeGreaterThan(0);
+        Line(Header + "[Behaviour] a header closes it");
+        _markers.RetainedRawChars.Should().Be(0);
+    }
+
+    [Fact]
+    public void A_masked_value_is_never_shown_in_part()
+    {
+        Line(Header + "[VRCRT] token=" + new string('s', 60_000));
+
+        Records().Single().Should().NotContain("sss");
+    }
+
+    [Fact]
+    public void The_file_stays_under_1_MiB_with_the_longest_header()
+    {
+        // 8 prefixes of 32 characters that JSON escapes to 6 bytes each.
+        var prefixes = Enumerable.Range(0, 8).Select(i => new string((char)('\u3042' + i), 32)).ToArray();
+        var markers = new VrchatMarkerLog(prefixes);
+        for (var i = 0; i < 1_000; i++)
+        {
+            markers.OnLine(new VrchatLogPhysicalLine(i + 1, Header + prefixes[0] + new string('x', 3_000), false));
+        }
+
+        var content = markers.Render(new MarkerFileHeader
+        {
+            ClientGeneration = long.MaxValue,
+            ObservationEpoch = long.MaxValue,
+            DroppedRecords = long.MaxValue,
+            DroppedThroughSeq = long.MaxValue,
+            Prefixes = prefixes,
+        });
+
+        Encoding.UTF8.GetByteCount(content).Should().BeLessOrEqualTo(VrchatMarkerLog.MaxFileBytes);
+    }
 }

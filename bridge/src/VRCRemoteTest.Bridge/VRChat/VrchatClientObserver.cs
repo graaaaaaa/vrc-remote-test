@@ -6,16 +6,26 @@ using VRCRemoteTest.Bridge.Protocol;
 
 namespace VRCRemoteTest.Bridge.VRChat;
 
+/// <summary>A slot's markers file to write; acknowledged with <see cref="VrchatClientObserver.AcknowledgeMarkers"/> once written.</summary>
+public sealed record MarkerPublication(int Slot, string Content, object Key);
+
+/// <summary>
+/// The previous client's markers for slot-{n}.markers.prev.log, to write before the slot's
+/// new markers file: <paramref name="Content"/> when this Bridge followed that client, or
+/// null when it did not (it ran before a restart), in which case the published file is
+/// moved there as it is. Acknowledged with <see cref="VrchatClientObserver.AcknowledgePrevious"/>.
+/// </summary>
+public sealed record PreviousMarkers(int Slot, string? Content);
+
 /// <summary>What one observation produced for VrchatLogService to publish.</summary>
-/// <param name="MarkerFiles">The markers files whose content changed, by slot.</param>
-/// <param name="NewGenerations">
-/// Slots that a new client took: the published markers file is the previous client's and
-/// moves to slot-{n}.markers.prev.log before anything new is written for the slot.
-/// </param>
+/// <param name="MarkerFiles">The markers files whose content changed and was not acknowledged yet.</param>
+/// <param name="PreviousMarkers">The slots whose previous client's markers still have to be kept.</param>
+/// <param name="NewGenerations">Slots that a new client took in this observation.</param>
 /// <param name="SlotNotices">Lines to put above a slot's log (Logging not Full, login maybe expired).</param>
 public sealed record VrchatObservation(
     VrchatClients Clients,
-    IReadOnlyDictionary<int, string> MarkerFiles,
+    IReadOnlyList<MarkerPublication> MarkerFiles,
+    IReadOnlyList<PreviousMarkers> PreviousMarkers,
     IReadOnlySet<int> NewGenerations,
     IReadOnlyDictionary<int, IReadOnlyList<string>> SlotNotices);
 
@@ -25,14 +35,18 @@ public sealed record VrchatObservation(
 /// every complete line goes to the slot's <see cref="VrchatClientStateTracker"/> and
 /// <see cref="VrchatMarkerLog"/>, and the result is vrchat-clients.json and the markers files.
 ///
-/// A slot's log is read again from its start, under a new observation epoch, when the
-/// Bridge starts, when the slot's client gets another file, when the file shrinks or is
-/// replaced (another creation time), and when the marker prefixes change. Past lines read
-/// again are not new events: the epoch tells readers that seq values start over. Reading is
-/// bounded per poll (<see cref="PerClientBudgetBytes"/> per client and
-/// <see cref="TotalBudgetBytes"/> in all); a client whose log is not read to its end is
-/// catchingUp. A client confirmed to have exited is read once more to the end of its file,
-/// so its last lines are not lost.
+/// Each slot's client gets an observation epoch when this Bridge starts following it, and a
+/// new one whenever its log is read again from its start: when the client gets another
+/// file, when the file shrinks or is replaced (another creation time), and when the marker
+/// prefixes change. Past lines read again are not new events: the epoch tells readers that
+/// seq values start over. Reading is bounded per poll (<see cref="PerClientBudgetBytes"/> per
+/// client and <see cref="TotalBudgetBytes"/> in all); a client whose log is not read to its
+/// end, or could not be read this time, is catchingUp. A client confirmed to have exited is
+/// read once more to the end of its file, and so is one whose slot a new client takes in the
+/// same poll, so its last lines are not lost; its markers then become the slot's .prev.
+///
+/// Markers files and .prev files count as published only once VrchatLogService acknowledges
+/// them, so one that could not be written is offered again on the next poll.
 ///
 /// Only VrchatLogService's loop uses it.
 /// </summary>
@@ -53,6 +67,7 @@ public sealed class VrchatClientObserver
     private readonly Func<DateTimeOffset> _utcNow;
     private readonly ILogger _logger;
     private readonly SlotObservation?[] _slots = new SlotObservation?[SlotCount];
+    private readonly PreviousMarkers?[] _pendingPrevious = new PreviousMarkers?[SlotCount];
 
     public VrchatClientObserver(
         IOptions<BridgeOptions> options,
@@ -86,7 +101,7 @@ public sealed class VrchatClientObserver
     {
         var now = _utcNow();
         var budget = TotalBudgetBytes;
-        var markerFiles = new Dictionary<int, string>();
+        var markerFiles = new List<MarkerPublication>();
         var notices = new Dictionary<int, IReadOnlyList<string>>();
         var newGenerations = new HashSet<int>();
         var entries = new List<VrchatClientEntry>();
@@ -96,29 +111,39 @@ public sealed class VrchatClientObserver
         {
             var rosterSlot = read.Roster.Slots[slot];
             var log = read.Slots[slot];
-            if (rosterSlot.Entry is not { } entry)
-            {
-                _slots[slot] = null;
-                continue;
-            }
-
+            var entry = rosterSlot.Entry;
             var observation = _slots[slot];
             var isNewGeneration = read.Roster.NewGenerations.Contains(slot);
             if (observation is not null && (isNewGeneration || observation.Entry != entry))
             {
+                // The slot's previous client, which may have exited in the same poll: what it
+                // wrote last is read before its markers are kept as .prev.
+                if (observation.Scanner is not null && !observation.Drained)
+                {
+                    budget -= ReadInto(observation, Math.Min(budget, PerClientBudgetBytes), exited: true, cancellationToken);
+                }
+
+                _pendingPrevious[slot] = new PreviousMarkers(slot, observation.RenderMarkers(slot));
                 observation = null;
+                _slots[slot] = null;
+            }
+
+            if (entry is null)
+            {
+                continue;
             }
 
             if (isNewGeneration)
             {
                 newGenerations.Add(slot);
+                _pendingPrevious[slot] ??= new PreviousMarkers(slot, null);
             }
 
             // An exited client seen first now (e.g. before a Bridge restart) is not read: its
             // file is unknown, and its markers file stays as it was published.
             if (observation is null && rosterSlot.Liveness != RosterLiveness.Exited)
             {
-                observation = new SlotObservation(entry, Prefixes);
+                observation = new SlotObservation(entry, Prefixes, _roster.AllocateEpoch());
                 _slots[slot] = observation;
             }
 
@@ -127,7 +152,7 @@ public sealed class VrchatClientObserver
                 budget -= Scan(observation, rosterSlot, log, Math.Min(budget, PerClientBudgetBytes), cancellationToken);
                 if (observation.MarkersChanged)
                 {
-                    markerFiles[slot] = observation.RenderMarkers(slot);
+                    markerFiles.Add(new MarkerPublication(slot, observation.RenderMarkers(slot), observation.CurrentKey));
                 }
             }
 
@@ -150,19 +175,33 @@ public sealed class VrchatClientObserver
             UpdatedAtUtc = now,
         };
 
-        return new VrchatObservation(clients, markerFiles, newGenerations, notices);
+        var previous = _pendingPrevious.Where(p => p is not null).Select(p => p!).ToList();
+        return new VrchatObservation(clients, markerFiles, previous, newGenerations, notices);
+    }
+
+    /// <summary>The slot's markers file was written; it is not offered again until it changes.</summary>
+    public void AcknowledgeMarkers(int slot, object key) => _slots[slot]?.Acknowledge(key);
+
+    /// <summary>The previous client's markers were kept as .prev.</summary>
+    public void AcknowledgePrevious(PreviousMarkers previous)
+    {
+        if (ReferenceEquals(_pendingPrevious[previous.Slot], previous))
+        {
+            _pendingPrevious[previous.Slot] = null;
+        }
     }
 
     /// <summary>Reads what the slot's file gained, restarting the epoch when the file is another one. Returns the bytes read.</summary>
     private long Scan(
         SlotObservation observation, RosterSlot rosterSlot, SlotLogResult log, long budget, CancellationToken cancellationToken)
     {
+        var exited = rosterSlot.Liveness == RosterLiveness.Exited;
         string? path = null;
         if (log.Status == SlotLogStatus.Shown)
         {
             path = log.Path;
         }
-        else if (rosterSlot.Liveness == RosterLiveness.Exited && observation.Scanner is { } last && !observation.Drained)
+        else if (exited && observation.Scanner is { } last && !observation.Drained)
         {
             path = last.Path;
         }
@@ -181,27 +220,45 @@ public sealed class VrchatClientObserver
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
+            observation.ReadFailed = true;
+            observation.CatchingUp = true;
             return 0;
         }
 
-        if (observation.Scanner is not { } scanner
-            || !string.Equals(scanner.Path, path, StringComparison.OrdinalIgnoreCase)
-            || scanner.FileCreationUtc != created
+        if (observation.Scanner is null)
+        {
+            observation.StartReading(new VrchatLogScanner(path, created), Prefixes, observation.Epoch);
+            _logger.LogInformation(
+                "Reading {Path} for VRChat client {ProcessId} in slot {Slot} (observation epoch {Epoch}).",
+                path, observation.Entry.ProcessId, observation.Entry.Slot, observation.Epoch);
+        }
+        else if (!string.Equals(observation.Scanner.Path, path, StringComparison.OrdinalIgnoreCase)
+            || observation.Scanner.FileCreationUtc != created
             || !observation.Prefixes.SequenceEqual(Prefixes))
         {
-            Restart(observation, path, created, observation.Scanner is null ? "first read" : "another file or marker prefixes");
+            Restart(observation, path, created, "another file or other marker prefixes");
         }
 
+        return ReadInto(observation, budget, exited, cancellationToken, path, created);
+    }
+
+    /// <summary>
+    /// Reads from the observation's scanner and passes every line read on, including those
+    /// read before a read failed (the scanner has moved past them).
+    /// </summary>
+    private long ReadInto(
+        SlotObservation observation,
+        long budget,
+        bool exited,
+        CancellationToken cancellationToken,
+        string? path = null,
+        DateTime created = default)
+    {
         var result = observation.Scanner!.Read(budget, cancellationToken);
-        if (result.Outcome == VrchatLogScanOutcome.Shrunk)
+        if (result.Outcome == VrchatLogScanOutcome.Shrunk && path is not null)
         {
             Restart(observation, path, created, "the file shrank");
             result = observation.Scanner!.Read(budget, cancellationToken);
-        }
-
-        if (result.Outcome == VrchatLogScanOutcome.Unreadable)
-        {
-            return result.BytesRead;
         }
 
         foreach (var line in result.Lines)
@@ -210,8 +267,10 @@ public sealed class VrchatClientObserver
             observation.Markers.OnLine(line);
         }
 
-        observation.CatchingUp = !result.ReachedEnd;
-        if (rosterSlot.Liveness == RosterLiveness.Exited && result.ReachedEnd)
+        observation.Markers.Flush();
+        observation.ReadFailed = result.Outcome != VrchatLogScanOutcome.Read;
+        observation.CatchingUp = observation.ReadFailed || !result.ReachedEnd;
+        if (exited && result.Outcome == VrchatLogScanOutcome.Read && result.ReachedEnd)
         {
             observation.Drained = true;
         }
@@ -222,7 +281,7 @@ public sealed class VrchatClientObserver
     private void Restart(SlotObservation observation, string path, DateTime created, string reason)
     {
         var epoch = _roster.AllocateEpoch();
-        observation.Restart(new VrchatLogScanner(path, created), Prefixes, epoch);
+        observation.StartReading(new VrchatLogScanner(path, created), Prefixes, epoch);
         _logger.LogInformation(
             "Reading {Path} from its start for VRChat client {ProcessId} in slot {Slot} (observation epoch {Epoch}, {Reason}).",
             path, observation.Entry.ProcessId, observation.Entry.Slot, epoch, reason);
@@ -257,6 +316,7 @@ public sealed class VrchatClientObserver
             default:
                 state = log.Status switch
                 {
+                    SlotLogStatus.Shown when observation is { ReadFailed: true } => "unknown",
                     SlotLogStatus.Shown when !loggingReadable => null,
                     SlotLogStatus.Shown => StateName(tracker?.State ?? VrchatClientLogState.Starting),
                     SlotLogStatus.NotYet => "starting",
@@ -271,6 +331,11 @@ public sealed class VrchatClientObserver
         if (rosterSlot.Liveness == RosterLiveness.Running && log.Status is not (SlotLogStatus.Shown or SlotLogStatus.NotRunning))
         {
             warnings.Add(LogRedactor.Redact(log.Content.Content));
+        }
+
+        if (rosterSlot.Liveness == RosterLiveness.Running && observation is { ReadFailed: true })
+        {
+            warnings.Add("The Bridge could not read this client's log this time; it tries again on the next poll.");
         }
 
         if (rosterSlot.Liveness == RosterLiveness.Running && !loggingReadable)
@@ -296,7 +361,7 @@ public sealed class VrchatClientObserver
         {
             Slot = slot,
             ClientGeneration = entry.ClientGeneration,
-            ObservationEpoch = observation?.Scanner is null ? null : observation.Epoch,
+            ObservationEpoch = observation?.Epoch,
             ProcessId = entry.ProcessId,
             CreationTimeUtc = started,
             Running = rosterSlot.Liveness switch
@@ -382,13 +447,15 @@ public sealed class VrchatClientObserver
         _ => "unavailable",
     };
 
-    private sealed class SlotObservation(RosterEntry entry, IReadOnlyList<string> prefixes)
+    private sealed class SlotObservation(RosterEntry entry, IReadOnlyList<string> prefixes, long epoch)
     {
+        private object? _acknowledged;
+
         public RosterEntry Entry { get; } = entry;
 
         public IReadOnlyList<string> Prefixes { get; private set; } = prefixes;
 
-        public long Epoch { get; private set; }
+        public long Epoch { get; private set; } = epoch;
 
         public VrchatLogScanner? Scanner { get; private set; }
 
@@ -398,14 +465,23 @@ public sealed class VrchatClientObserver
 
         public bool CatchingUp { get; set; }
 
+        /// <summary>The last read failed; the next poll tries again.</summary>
+        public bool ReadFailed { get; set; }
+
         /// <summary>The exited client's file was read to its end.</summary>
         public bool Drained { get; set; }
 
-        private (long Epoch, bool CatchingUp, long Version)? _published;
+        /// <summary>Until the log is read, the markers file says it may be incomplete.</summary>
+        private bool HeaderCatchingUp => Scanner is null || CatchingUp;
 
-        public bool MarkersChanged => Scanner is not null && _published != (Epoch, CatchingUp, Markers.Version);
+        public object CurrentKey => (Epoch, HeaderCatchingUp, Markers.Version);
 
-        public void Restart(VrchatLogScanner scanner, IReadOnlyList<string> prefixes, long epoch)
+        public bool MarkersChanged => !Equals(_acknowledged, CurrentKey);
+
+        public void Acknowledge(object key) => _acknowledged = key;
+
+        /// <summary>Starts reading <paramref name="scanner"/>'s file from its start, with fresh state, under <paramref name="epoch"/>.</summary>
+        public void StartReading(VrchatLogScanner scanner, IReadOnlyList<string> prefixes, long epoch)
         {
             Scanner = scanner;
             Prefixes = prefixes;
@@ -413,22 +489,19 @@ public sealed class VrchatClientObserver
             Tracker = new VrchatClientStateTracker();
             Markers = new VrchatMarkerLog(prefixes);
             CatchingUp = true;
+            ReadFailed = false;
             Drained = false;
         }
 
-        public string RenderMarkers(int slot)
+        public string RenderMarkers(int slot) => Markers.Render(new MarkerFileHeader
         {
-            _published = (Epoch, CatchingUp, Markers.Version);
-            return Markers.Render(new MarkerFileHeader
-            {
-                Slot = slot,
-                ClientGeneration = Entry.ClientGeneration,
-                ObservationEpoch = Epoch,
-                CatchingUp = CatchingUp,
-                DroppedRecords = Markers.DroppedRecords,
-                DroppedThroughSeq = Markers.DroppedThroughSeq,
-                Prefixes = Prefixes,
-            });
-        }
+            Slot = slot,
+            ClientGeneration = Entry.ClientGeneration,
+            ObservationEpoch = Epoch,
+            CatchingUp = HeaderCatchingUp,
+            DroppedRecords = Markers.DroppedRecords,
+            DroppedThroughSeq = Markers.DroppedThroughSeq,
+            Prefixes = Prefixes,
+        });
     }
 }

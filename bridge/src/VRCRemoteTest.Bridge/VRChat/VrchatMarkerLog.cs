@@ -32,6 +32,20 @@ internal sealed class VrchatMarkerLog
     internal const string HeaderPrefix = "# ";
     internal const string TruncationMark = " [truncated]";
 
+    /// <summary>
+    /// The unmasked text kept for the record continuation lines are still added to. Past
+    /// this, the record is closed and marked cut: masking can shorten text, but a record is
+    /// published as at most <see cref="MaxRecordBytes"/> anyway.
+    /// </summary>
+    internal const int MaxRawChars = 16 * 1024;
+
+    /// <summary>
+    /// Room for the header line. Its largest form is 8 prefixes of 32 characters that JSON
+    /// escapes to 6 bytes each (1,536 bytes with their quotes and commas well under 1,600),
+    /// plus fixed fields under 300 bytes.
+    /// </summary>
+    internal const int HeaderAllowance = 4 * 1024;
+
     private static readonly JsonSerializerOptions HeaderOptions = new()
     {
         DefaultIgnoreCondition = JsonIgnoreCondition.Never,
@@ -39,6 +53,8 @@ internal sealed class VrchatMarkerLog
 
     private readonly LinkedList<Record> _records = new();
     private readonly IReadOnlyList<string> _prefixes;
+
+    /// <summary>The published size of the records, newlines included.</summary>
     private long _bytes;
 
     /// <summary>The record continuation lines are added to, while the last line read was part of it.</summary>
@@ -58,10 +74,12 @@ internal sealed class VrchatMarkerLog
 
     public int Count => _records.Count;
 
+    /// <summary>The unmasked characters still kept, for tests: only the open record keeps any.</summary>
+    internal int RetainedRawChars => _open?.Raw?.Length ?? 0;
+
     public void OnLine(VrchatLogPhysicalLine line)
     {
-        var hasHeader = VrchatLogLine.TryParseHeader(line.Text, out _);
-        if (!hasHeader)
+        if (!VrchatLogLine.TryParseHeader(line.Text, out _))
         {
             if (_open is not null && line.Text.Length > 0)
             {
@@ -71,36 +89,84 @@ internal sealed class VrchatMarkerLog
             return;
         }
 
-        _open = null;
+        Close();
         var body = VrchatLogLine.Body(line.Text);
         if (!_prefixes.Any(p => body.StartsWith(p, StringComparison.Ordinal)))
         {
             return;
         }
 
-        var record = new Record(line.Seq, line.Text, line.Truncated);
-        record.Format();
+        var record = new Record(line.Seq, line.Truncated);
         _records.AddLast(record);
-        _bytes += record.Bytes;
-        _open = line.Truncated || record.Full ? null : record;
-        Trim();
         Version++;
+        if (line.Truncated || line.Text.Length > MaxRawChars)
+        {
+            record.Truncated = true;
+            Format(record, line.Text.Length > MaxRawChars ? line.Text[..MaxRawChars] : line.Text);
+            return;
+        }
+
+        record.Raw = new StringBuilder(line.Text);
+        _open = record;
+    }
+
+    /// <summary>Formats the open record, so what <see cref="Render"/> shows and the limits count is current.</summary>
+    public void Flush()
+    {
+        if (_open is { Dirty: true } open)
+        {
+            Format(open, open.Raw!.ToString());
+            if (open.Full)
+            {
+                Close();
+            }
+        }
     }
 
     private void Continue(Record record, VrchatLogPhysicalLine line)
     {
-        _bytes -= record.Bytes;
-        record.Raw += "\n" + line.Text;
-        record.Truncated |= line.Truncated;
-        record.Format();
-        _bytes += record.Bytes;
-        if (record.Full)
+        Version++;
+        var raw = record.Raw!;
+        if (line.Truncated || raw.Length + 1 + line.Text.Length > MaxRawChars)
         {
-            _open = null;
+            record.Truncated = true;
+            raw.Append('\n').Append(line.Text, 0, Math.Max(0, Math.Min(line.Text.Length, MaxRawChars - raw.Length - 1)));
+            Close();
+            return;
         }
 
+        raw.Append('\n').Append(line.Text);
+        record.Dirty = true;
+    }
+
+    /// <summary>The open record is formatted and its unmasked text released.</summary>
+    private void Close()
+    {
+        if (_open is not { } open)
+        {
+            return;
+        }
+
+        _open = null;
+        Format(open, open.Raw!.ToString());
+        open.Raw = null;
+    }
+
+    /// <summary>Masks first and cuts afterwards (client-observation plan C5), then applies the file's limits.</summary>
+    private void Format(Record record, string raw)
+    {
+        var prefix = record.Seq.ToString(CultureInfo.InvariantCulture) + "\t";
+        var budget = MaxRecordBytes - prefix.Length - TruncationMark.Length;
+        var masked = LogRedactor.Redact(raw);
+        var (text, cut) = Escape(masked, budget);
+        record.Full = cut || LogRedactor.IsWithheld(masked);
+        record.Dirty = false;
+        var line = prefix + text + (cut || record.Truncated ? TruncationMark : string.Empty);
+        var bytes = Encoding.UTF8.GetByteCount(line) + 1;
+        _bytes += bytes - record.Bytes;
+        record.Line = line;
+        record.Bytes = bytes;
         Trim();
-        Version++;
     }
 
     private void Trim()
@@ -119,16 +185,17 @@ internal sealed class VrchatMarkerLog
         }
     }
 
-    /// <summary>Room left for the header line.</summary>
-    private const int HeaderAllowance = 1024;
-
     public string Render(MarkerFileHeader header)
     {
+        Flush();
         var builder = new StringBuilder((int)Math.Min(_bytes + HeaderAllowance, MaxFileBytes));
         builder.Append(HeaderPrefix).Append(JsonSerializer.Serialize(header, HeaderOptions)).Append('\n');
         foreach (var record in _records)
         {
-            builder.Append(record.Line).Append('\n');
+            if (record.Line.Length > 0)
+            {
+                builder.Append(record.Line).Append('\n');
+            }
         }
 
         return builder.ToString();
@@ -197,31 +264,24 @@ internal sealed class VrchatMarkerLog
         char.IsControl(c)
         || c is '\u061c' or '\u200e' or '\u200f' or (>= '\u202a' and <= '\u202e') or (>= '\u2066' and <= '\u2069');
 
-    private sealed class Record(long seq, string raw, bool truncated)
+    private sealed class Record(long seq, bool truncated)
     {
         public long Seq { get; } = seq;
 
-        public string Raw { get; set; } = raw;
-
         public bool Truncated { get; set; } = truncated;
 
-        public string Line { get; private set; } = string.Empty;
+        /// <summary>The unmasked text, kept only while the record is open.</summary>
+        public StringBuilder? Raw { get; set; }
 
-        public long Bytes { get; private set; }
+        /// <summary>Text was added since the record was last formatted.</summary>
+        public bool Dirty { get; set; } = true;
 
-        /// <summary>The record reached <see cref="MaxRecordBytes"/>; nothing more is added to it.</summary>
-        public bool Full { get; private set; }
+        public string Line { get; set; } = string.Empty;
 
-        /// <summary>Masks first and cuts afterwards (client-observation plan C5).</summary>
-        public void Format()
-        {
-            var prefix = Seq.ToString(CultureInfo.InvariantCulture) + "\t";
-            var budget = MaxRecordBytes - prefix.Length - TruncationMark.Length;
-            var (text, cut) = Escape(LogRedactor.Redact(Raw), budget);
-            Full = cut;
-            Line = prefix + text + (cut || Truncated ? TruncationMark : string.Empty);
-            Bytes = Encoding.UTF8.GetByteCount(Line) + 1;
-        }
+        public long Bytes { get; set; }
+
+        /// <summary>The record reached <see cref="MaxRecordBytes"/>, or was withheld; nothing more is added to it.</summary>
+        public bool Full { get; set; }
     }
 }
 

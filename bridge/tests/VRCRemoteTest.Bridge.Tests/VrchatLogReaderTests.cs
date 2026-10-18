@@ -100,11 +100,15 @@ public class VrchatLogReaderTests : IDisposable
             ? TimeZoneInfo.ConvertTimeToUtc(DateTime.SpecifyKind(local, DateTimeKind.Unspecified), TimeZoneInfo.Local)
             : DateTime.MinValue;
 
-    /// <summary>Writes an output_log named after <paramref name="startedUtc"/> in the machine's time zone, as VRChat does.</summary>
+    /// <summary>
+    /// Writes an output_log named after <paramref name="startedUtc"/> in the machine's time
+    /// zone, as VRChat does, with each "\n" of <paramref name="content"/> as the CRLF that
+    /// ends VRChat's lines.
+    /// </summary>
     private string WriteLogFor(DateTime startedUtc, string content)
     {
         var path = Path.Combine(_logDir, $"output_log_{startedUtc.ToLocalTime():yyyy-MM-dd_HH-mm-ss}.txt");
-        File.WriteAllText(path, content);
+        File.WriteAllText(path, content.Replace("\n", "\r\n"));
         return path;
     }
 
@@ -142,8 +146,8 @@ public class VrchatLogReaderTests : IDisposable
     {
         var older = Path.Combine(_logDir, "output_log_2026-09-01_00-00-00.txt");
         var newer = Path.Combine(_logDir, "output_log_2026-09-02_00-00-00.txt");
-        File.WriteAllText(older, "old content line\n");
-        File.WriteAllText(newer, "new content line\n");
+        File.WriteAllText(older, "old content line\r\n");
+        File.WriteAllText(newer, "new content line\r\n");
         File.SetLastWriteTimeUtc(older, DateTime.UtcNow.AddMinutes(-10));
         File.SetLastWriteTimeUtc(newer, DateTime.UtcNow);
 
@@ -215,6 +219,27 @@ public class VrchatLogReaderTests : IDisposable
     }
 
     [Fact]
+    public void The_last_line_is_shown_once_its_CRLF_is_written()
+    {
+        var path = Path.Combine(_logDir, "output_log_2026-09-01_00-00-00.txt");
+        File.WriteAllText(path, Header + "line one\r\n" + Header + "https://user:pa");
+        var reader = CreateReader();
+
+        reader.ReadSnapshot().Content.Should().Be(Header + "line one");
+        File.AppendAllText(path, "ss@host/x\r\n");
+        reader.ReadSnapshot().Content.Should().EndWith(Header + "https://<redacted>@host/x");
+    }
+
+    [Fact]
+    public void A_line_is_masked_whole_before_it_is_split_at_its_lone_LFs()
+    {
+        var path = Path.Combine(_logDir, "output_log_2026-09-01_00-00-00.txt");
+        File.WriteAllText(path, Header + "[VRCRT] {\"password\":\n  \"hunter2\"}\r\n");
+
+        CreateReader().ReadSnapshot().Content.Should().NotContain("hunter2").And.Contain("<redacted>");
+    }
+
+    [Fact]
     public void ReadSnapshot_discards_the_partial_first_line_when_seeking_mid_file()
     {
         // Three ~150KB lines -> total > the 256KB tail window, so the window
@@ -237,7 +262,7 @@ public class VrchatLogReaderTests : IDisposable
     public void ReadSnapshot_truncates_lines_longer_than_512_characters()
     {
         var path = Path.Combine(_logDir, "output_log_2026-09-01_00-00-00.txt");
-        File.WriteAllText(path, new string('X', 1000) + "\n");
+        File.WriteAllText(path, new string('X', 1000) + "\r\n");
 
         var result = CreateReader().ReadSnapshot();
 
@@ -252,7 +277,7 @@ public class VrchatLogReaderTests : IDisposable
         var sb = new StringBuilder();
         for (var i = 0; i < 200; i++)
         {
-            sb.Append(new string('L', 512)).Append('\n');
+            sb.Append(new string('L', 512)).Append("\r\n");
         }
         File.WriteAllText(path, sb.ToString());
 

@@ -65,7 +65,28 @@ public class VrchatClientObserverTests : IDisposable
 
     private void RestartBridge() => (_roster, _reader, _observer) = StartBridge();
 
-    private VrchatObservation Poll() => _observer.Observe(_reader.Read(), CancellationToken.None);
+    /// <summary>One poll, acknowledging what it offered as VrchatLogService does once the writes succeed.</summary>
+    private VrchatObservation Poll(bool published = true)
+    {
+        var observation = _observer.Observe(_reader.Read(), CancellationToken.None);
+        if (published)
+        {
+            foreach (var previous in observation.PreviousMarkers)
+            {
+                _observer.AcknowledgePrevious(previous);
+            }
+
+            foreach (var markers in observation.MarkerFiles)
+            {
+                _observer.AcknowledgeMarkers(markers.Slot, markers.Key);
+            }
+        }
+
+        return observation;
+    }
+
+    private static string MarkerFile(VrchatObservation observation, int slot) =>
+        observation.MarkerFiles.Single(m => m.Slot == slot).Content;
 
     private static DateTime CreationTimeFromName(string path) =>
         VrchatLogMatcher.ParseNameTime(Path.GetFileName(path)) is { } local
@@ -122,7 +143,7 @@ public class VrchatClientObserverTests : IDisposable
             entry.CatchingUp.Should().BeFalse();
             entry.Running.Should().BeTrue();
             entry.ObservedThroughSeq.Should().Be(6);
-            var (header, records) = Markers(observation.MarkerFiles[slot]);
+            var (header, records) = Markers(MarkerFile(observation, slot));
             header.GetProperty("slot").GetInt32().Should().Be(slot);
             header.GetProperty("clientGeneration").GetInt64().Should().Be(entry.ClientGeneration);
             header.GetProperty("observationEpoch").GetInt64().Should().Be(entry.ObservationEpoch!.Value);
@@ -146,7 +167,7 @@ public class VrchatClientObserverTests : IDisposable
         var third = Poll();
 
         Entry(second, 0).ObservationEpoch.Should().Be(Entry(first, 0).ObservationEpoch);
-        Markers(second.MarkerFiles[0]).Records.Should().HaveCount(2);
+        Markers(MarkerFile(second, 0)).Records.Should().HaveCount(2);
         Entry(second, 0).State.Should().Be("joining", "OnLeftRoom goes back to joining until the next Joining");
         Entry(second, 0).Instance.Should().BeNull();
         third.MarkerFiles.Should().BeEmpty("nothing changed, so nothing is rewritten");
@@ -174,7 +195,7 @@ public class VrchatClientObserverTests : IDisposable
         }
 
         after.NewGenerations.Should().BeEmpty("the same clients keep their markers; nothing moves to .prev");
-        Markers(after.MarkerFiles[1]).Records.Should().Equal(Markers(before.MarkerFiles[1]).Records);
+        Markers(MarkerFile(after, 1)).Records.Should().Equal(Markers(MarkerFile(before, 1)).Records);
     }
 
     [Fact]
@@ -194,7 +215,7 @@ public class VrchatClientObserverTests : IDisposable
         Entry(after, 1).State.Should().Be("joined");
         Entry(after, 0).Running.Should().BeFalse();
         Entry(after, 0).State.Should().Be("left");
-        after.MarkerFiles.Should().NotContainKey(0, "the exited client's markers file stays as it was");
+        after.MarkerFiles.Should().NotContain(m => m.Slot == 0, "the exited client's markers file stays as it was");
     }
 
     [Fact]
@@ -209,7 +230,7 @@ public class VrchatClientObserverTests : IDisposable
         var after = Poll();
 
         Entry(after, 0).ObservationEpoch.Should().BeGreaterThan(Entry(before, 0).ObservationEpoch!.Value);
-        Markers(after.MarkerFiles[0]).Records.Should().Equal("1\t2026.10.18 13:34:37 Debug      -  [SPK003] after");
+        Markers(MarkerFile(after, 0)).Records.Should().Equal("1\t2026.10.18 13:34:37 Debug      -  [SPK003] after");
         Entry(after, 0).State.Should().Be("starting");
     }
 
@@ -245,7 +266,7 @@ public class VrchatClientObserverTests : IDisposable
         var exited = Poll();
 
         Entry(exited, 0).State.Should().Be("left");
-        Markers(exited.MarkerFiles[0]).Records.Should().ContainSingle().Which.Should().EndWith("last words");
+        Markers(MarkerFile(exited, 0)).Records.Should().ContainSingle().Which.Should().EndWith("last words");
     }
 
     [Fact]
@@ -309,9 +330,9 @@ public class VrchatClientObserverTests : IDisposable
         var second = Poll();
 
         Entry(first, 0).CatchingUp.Should().BeTrue();
-        Markers(first.MarkerFiles[0]).Header.GetProperty("catchingUp").GetBoolean().Should().BeTrue();
+        Markers(MarkerFile(first, 0)).Header.GetProperty("catchingUp").GetBoolean().Should().BeTrue();
         Entry(second, 0).CatchingUp.Should().BeFalse();
-        Markers(second.MarkerFiles[0]).Records.Should().HaveCount(2).And.Subject.Last().Should().EndWith("last");
+        Markers(MarkerFile(second, 0)).Records.Should().HaveCount(2).And.Subject.Last().Should().EndWith("last");
         Entry(second, 0).ObservationEpoch.Should().Be(Entry(first, 0).ObservationEpoch);
     }
 
@@ -340,5 +361,96 @@ public class VrchatClientObserverTests : IDisposable
         {
             client.TryGetProperty(property, out _).Should().BeTrue(property);
         }
+    }
+
+    [Fact]
+    public void A_client_that_exits_as_its_successor_appears_keeps_its_last_markers_in_prev()
+    {
+        // Codex review, perspective A: the exit and the successor fell into one poll.
+        _monitor.AddClient(100, T0);
+        var path = LogPath(T0);
+        File.WriteAllText(path, JoinLines("Alice", "usr_aaaaaaaa-0000"));
+        Poll();
+
+        Append(path, Lines("[SPK003] last words"));
+        _monitor.Clients.Clear();
+        _monitor.AddClient(300, T0.AddMinutes(10));
+        File.WriteAllText(LogPath(T0.AddMinutes(10)), JoinLines("Alice", "usr_aaaaaaaa-0000"));
+        _now = new DateTimeOffset(T0.AddMinutes(10).AddSeconds(5));
+        var replaced = Poll();
+
+        var previous = replaced.PreviousMarkers.Should().ContainSingle().Subject;
+        previous.Slot.Should().Be(0);
+        Markers(previous.Content!).Records.Should().ContainSingle().Which.Should().EndWith("last words");
+        Entry(replaced, 0).ProcessId.Should().Be(300);
+        Markers(MarkerFile(replaced, 0)).Header.GetProperty("clientGeneration").GetInt64()
+            .Should().Be(Entry(replaced, 0).ClientGeneration);
+    }
+
+    [Fact]
+    public void A_new_client_replaces_the_markers_file_before_its_log_appears()
+    {
+        _monitor.AddClient(100, T0);
+        File.WriteAllText(LogPath(T0), JoinLines("Alice", "usr_aaaaaaaa-0000") + Lines("[SPK003] one"));
+        Poll();
+
+        _monitor.Clients.Clear();
+        _monitor.AddClient(300, T0.AddMinutes(10));
+        _now = new DateTimeOffset(T0.AddMinutes(10).AddSeconds(2));
+        var replaced = Poll();
+
+        Markers(replaced.PreviousMarkers.Single().Content!).Records.Should().ContainSingle();
+        var (header, records) = Markers(MarkerFile(replaced, 0));
+        header.GetProperty("clientGeneration").GetInt64().Should().Be(Entry(replaced, 0).ClientGeneration);
+        header.GetProperty("catchingUp").GetBoolean().Should().BeTrue("its log has not been read yet");
+        records.Should().BeEmpty();
+        Entry(replaced, 0).State.Should().NotBe("joined", "nothing of the new client's log was read");
+    }
+
+    [Fact]
+    public void Markers_that_were_not_written_are_offered_again()
+    {
+        _monitor.AddClient(100, T0);
+        File.WriteAllText(LogPath(T0), JoinLines("Alice", "usr_aaaaaaaa-0000") + Lines("[SPK003] one"));
+
+        var failed = Poll(published: false);
+        var retried = Poll(published: false);
+        Poll();
+        var done = Poll();
+
+        MarkerFile(retried, 0).Should().Be(MarkerFile(failed, 0));
+        retried.PreviousMarkers.Should().ContainSingle("the .prev of the new generation is offered again too");
+        done.MarkerFiles.Should().BeEmpty();
+        done.PreviousMarkers.Should().BeEmpty();
+    }
+
+    [Fact]
+    public void A_log_that_cannot_be_read_is_unknown_and_catching_up()
+    {
+        if (OperatingSystem.IsWindows())
+        {
+            return; // Unix file modes make the file unreadable for this test.
+        }
+
+        _monitor.AddClient(100, T0);
+        var path = LogPath(T0);
+        File.WriteAllText(path, JoinLines("Alice", "usr_aaaaaaaa-0000"));
+        Entry(Poll(), 0).State.Should().Be("joined");
+
+        File.SetUnixFileMode(path, UnixFileMode.None);
+        try
+        {
+            var entry = Entry(Poll(), 0);
+
+            entry.State.Should().Be("unknown");
+            entry.CatchingUp.Should().BeTrue();
+            entry.Warnings.Should().Contain(w => w.Contains("could not read this client's log"));
+        }
+        finally
+        {
+            File.SetUnixFileMode(path, UnixFileMode.UserRead | UnixFileMode.UserWrite);
+        }
+
+        Entry(Poll(), 0).State.Should().Be("joined");
     }
 }

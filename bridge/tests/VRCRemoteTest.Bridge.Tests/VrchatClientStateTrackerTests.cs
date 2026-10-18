@@ -237,4 +237,31 @@ public class VrchatClientStateTrackerTests
     {
         VrchatClientStateTracker.NormalizeInstance(value).Should().Be(expected);
     }
+
+    [Fact]
+    public void A_flood_of_joins_gives_up_the_player_list_until_the_next_Joining()
+    {
+        Join();
+        for (var i = 0; i < VrchatClientStateTracker.MaxPlayers + 10; i++)
+        {
+            Line($"[Behaviour] OnPlayerJoined A (usr_{i:D8}-0000)");
+        }
+
+        _tracker.Players.Should().BeNull();
+        _tracker.IsMaster.Should().BeNull();
+
+        Join();
+        _tracker.Players.Should().Equal("Alice");
+        _tracker.IsMaster.Should().BeTrue();
+    }
+
+    [Fact]
+    public void Names_and_IDs_longer_than_VRChat_writes_are_not_events()
+    {
+        Join();
+        Line($"[Behaviour] OnPlayerJoined {new string('n', VrchatClientStateTracker.MaxNameLength + 1)} (usr_aaaaaaaa)");
+        Line($"[Behaviour] OnPlayerJoined Bob (usr_{new string('a', VrchatClientStateTracker.MaxUserIdLength)})");
+
+        _tracker.Players.Should().Equal("Alice");
+    }
 }

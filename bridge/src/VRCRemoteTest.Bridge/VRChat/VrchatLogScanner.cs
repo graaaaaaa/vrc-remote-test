@@ -27,6 +27,9 @@ internal sealed record VrchatLogScanResult(
 /// A line longer than <see cref="MaxLineBytes"/> without a CRLF keeps its first
 /// <see cref="TruncatedKeepBytes"/> and the rest is dropped up to the next CRLF; it is
 /// marked truncated. A world can write such a line: S5b F wrote 65,593 bytes in one line.
+/// What is kept ends at its last space or tab, so a value the cut went through (a token, a
+/// URL whose "@" was cut off) is dropped whole rather than kept where masking could no
+/// longer recognize it.
 ///
 /// One instance belongs to one file of one client and is used from one loop; whoever owns
 /// it decides when the file has been replaced and starts a new instance.
@@ -36,9 +39,6 @@ internal sealed class VrchatLogScanner
     internal const int MaxLineBytes = 64 * 1024;
     internal const int TruncatedKeepBytes = 4 * 1024;
     internal const int ChunkBytes = 64 * 1024;
-
-    /// <summary>A truncated line is cut back to a space within this many bytes, so half a value is not kept unmasked.</summary>
-    private const int TokenBoundarySearchBytes = 128;
 
     private readonly byte[] _line = new byte[MaxLineBytes];
     private int _lineLength;
@@ -174,7 +174,8 @@ internal sealed class VrchatLogScanner
 
     /// <summary>
     /// Backs off to a UTF-8 character boundary (<paramref name="next"/> is the first byte
-    /// that was dropped), then to the last space near the end.
+    /// that was dropped), then to the last space, tab or LF. A line's header has spaces, so
+    /// at least the header stays.
     /// </summary>
     private static int CutForTruncation(ReadOnlySpan<byte> kept, byte next)
     {
@@ -192,8 +193,7 @@ internal sealed class VrchatLogScanner
             }
         }
 
-        var searchFrom = Math.Max(0, length - TokenBoundarySearchBytes);
-        var space = kept[searchFrom..length].LastIndexOfAny((byte)' ', (byte)'\t', (byte)'\n');
-        return space >= 0 ? searchFrom + space : length;
+        var space = kept[..length].LastIndexOfAny((byte)' ', (byte)'\t', (byte)'\n');
+        return Math.Max(space, 0);
     }
 }
