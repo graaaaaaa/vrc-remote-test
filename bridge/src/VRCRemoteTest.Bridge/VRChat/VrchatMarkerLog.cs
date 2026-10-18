@@ -102,7 +102,7 @@ internal sealed class VrchatMarkerLog
         if (line.Truncated || line.Text.Length > MaxRawChars)
         {
             record.Truncated = true;
-            Format(record, line.Text.Length > MaxRawChars ? line.Text[..MaxRawChars] : line.Text);
+            Format(record, CutAtSpace(line.Text, MaxRawChars));
             return;
         }
 
@@ -130,13 +130,29 @@ internal sealed class VrchatMarkerLog
         if (line.Truncated || raw.Length + 1 + line.Text.Length > MaxRawChars)
         {
             record.Truncated = true;
-            raw.Append('\n').Append(line.Text, 0, Math.Max(0, Math.Min(line.Text.Length, MaxRawChars - raw.Length - 1)));
+            raw.Append('\n').Append(CutAtSpace(line.Text, Math.Max(0, MaxRawChars - raw.Length - 1)));
             Close();
             return;
         }
 
         raw.Append('\n').Append(line.Text);
         record.Dirty = true;
+    }
+
+    /// <summary>
+    /// At most <paramref name="max"/> characters, ending at the last space or tab before the
+    /// cut, so a value the cut went through (a URL whose "@" was cut off) is dropped whole
+    /// rather than kept where masking could no longer recognize it.
+    /// </summary>
+    internal static string CutAtSpace(string text, int max)
+    {
+        if (text.Length <= max)
+        {
+            return text;
+        }
+
+        var space = text.AsSpan(0, max).LastIndexOfAny(' ', '\t');
+        return space < 0 ? string.Empty : text[..space];
     }
 
     /// <summary>The open record is formatted and its unmasked text released.</summary>

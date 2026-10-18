@@ -187,18 +187,27 @@ public class VrchatClientRosterTests : IDisposable
     }
 
     [Fact]
-    public void An_epoch_that_could_not_be_saved_is_not_handed_out_again_after_a_restart()
+    public void No_epoch_is_handed_out_that_could_not_be_saved()
     {
         // The state directory is a file: nothing can be saved.
         var blocked = Path.Combine(_stateDir, "blocked");
         File.WriteAllText(blocked, string.Empty);
-        var path = Path.Combine(blocked, VrchatClientRoster.FileName);
+        var roster = new VrchatClientRoster(Path.Combine(blocked, VrchatClientRoster.FileName));
+
+        var allocate = () => roster.AllocateEpoch();
+
+        allocate.Should().Throw<IOException>();
+    }
+
+    [Fact]
+    public void Epochs_keep_increasing_after_a_restart_with_the_clock_set_back()
+    {
         var start = DateTimeOffset.UtcNow;
+        var before = new VrchatClientRoster(FilePath, utcNow: () => start).AllocateEpoch();
 
-        var before = new VrchatClientRoster(path, utcNow: () => start).AllocateEpoch();
-        var after = new VrchatClientRoster(path, utcNow: () => start.AddSeconds(5)).AllocateEpoch();
+        var after = new VrchatClientRoster(FilePath, utcNow: () => start.AddMinutes(-10)).AllocateEpoch();
 
-        after.Should().BeGreaterThan(before);
         before.Should().BeGreaterOrEqualTo(start.ToUnixTimeMilliseconds()).And.BeLessThan(1L << 53);
+        after.Should().Be(before + 1);
     }
 }

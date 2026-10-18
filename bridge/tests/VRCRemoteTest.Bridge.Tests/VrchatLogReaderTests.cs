@@ -221,13 +221,24 @@ public class VrchatLogReaderTests : IDisposable
     [Fact]
     public void The_last_line_is_shown_once_its_CRLF_is_written()
     {
-        var path = Path.Combine(_logDir, "output_log_2026-09-01_00-00-00.txt");
+        var path = WriteLogFor(T0, string.Empty);
         File.WriteAllText(path, Header + "line one\r\n" + Header + "https://user:pa");
+        _monitor.AddClient(100, T0);
         var reader = CreateReader();
 
         reader.ReadSnapshot().Content.Should().Be(Header + "line one");
         File.AppendAllText(path, "ss@host/x\r\n");
         reader.ReadSnapshot().Content.Should().EndWith(Header + "https://<redacted>@host/x");
+    }
+
+    [Fact]
+    public void With_no_VRChat_running_the_newest_files_unterminated_last_line_is_shown()
+    {
+        // Nothing writes the file any more, so its last line is as complete as it gets.
+        var path = Path.Combine(_logDir, "output_log_2026-09-01_00-00-00.txt");
+        File.WriteAllText(path, Header + "normal\r\nfinal crash detail");
+
+        CreateReader().ReadSnapshot().Content.Should().EndWith("    final crash detail");
     }
 
     [Fact]

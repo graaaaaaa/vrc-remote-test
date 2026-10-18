@@ -453,4 +453,70 @@ public class VrchatClientObserverTests : IDisposable
 
         Entry(Poll(), 0).State.Should().Be("joined");
     }
+
+    [Fact]
+    public void A_replaced_client_with_a_large_backlog_is_read_to_its_end_before_its_prev_is_kept()
+    {
+        // Codex review, round 2: one bounded read could stop before the last marker.
+        _monitor.AddClient(100, T0);
+        var path = LogPath(T0);
+        File.WriteAllText(path, JoinLines("Alice", "usr_aaaaaaaa-0000"));
+        Poll();
+
+        var backlog = new StringBuilder();
+        var filler = Lines(new string('x', 1000));
+        while (backlog.Length < 5 * 1024 * 1024)
+        {
+            backlog.Append(filler);
+        }
+
+        Append(path, backlog + Lines("[SPK003] last words"));
+        _monitor.Clients.Clear();
+        _monitor.AddClient(300, T0.AddMinutes(10));
+        File.WriteAllText(LogPath(T0.AddMinutes(10)), JoinLines("Alice", "usr_aaaaaaaa-0000"));
+        _now = new DateTimeOffset(T0.AddMinutes(10).AddSeconds(5));
+
+        var first = Poll();
+        first.PreviousMarkers.Should().BeEmpty("the replaced client's file is still being read");
+        first.MarkerFiles.Should().NotContain(m => m.Slot == 0, "its markers file stays until its .prev is kept");
+
+        var second = Poll();
+        Markers(second.PreviousMarkers.Single().Content!).Records.Should().ContainSingle().Which.Should().EndWith("last words");
+        MarkerFile(second, 0).Should().Contain("\"clientGeneration\":" + Entry(second, 0).ClientGeneration);
+    }
+
+    [Fact]
+    public void A_log_that_disappears_is_no_longer_reported_as_current()
+    {
+        _monitor.AddClient(100, T0);
+        var path = LogPath(T0);
+        File.WriteAllText(path, JoinLines("Alice", "usr_aaaaaaaa-0000"));
+        Poll();
+        var log = _reader.Read();
+
+        File.Delete(path);
+        var entry = _observer.Observe(log, CancellationToken.None).Clients.Clients.Single();
+
+        entry.State.Should().Be("unknown");
+        entry.CatchingUp.Should().BeTrue();
+    }
+
+    [Fact]
+    public void No_client_is_observed_while_no_epoch_can_be_saved()
+    {
+        var blocked = Path.Combine(_tempDir, "blocked");
+        File.WriteAllText(blocked, string.Empty);
+        var roster = new VrchatClientRoster(Path.Combine(blocked, VrchatClientRoster.FileName));
+        var reader = new VrchatLogReader(
+            Microsoft.Extensions.Options.Options.Create(Options), _monitor, NullLogger<VrchatLogReader>.Instance,
+            CreationTimeFromName, queryOwners: null, managedClients: null, roster);
+        var observer = new VrchatClientObserver(Options, roster, null, CreationTimeFromName, () => _now);
+        _monitor.AddClient(100, T0);
+        File.WriteAllText(LogPath(T0), JoinLines("Alice", "usr_aaaaaaaa-0000") + Lines("[SPK003] one"));
+
+        var observation = observer.Observe(reader.Read(), CancellationToken.None);
+
+        observation.MarkerFiles.Should().BeEmpty();
+        observation.Clients.Clients.Single().ObservationEpoch.Should().BeNull();
+    }
 }

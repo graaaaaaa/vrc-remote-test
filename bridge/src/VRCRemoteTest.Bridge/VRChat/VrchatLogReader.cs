@@ -641,14 +641,15 @@ public sealed class VrchatLogReader : IVrchatLogReader
             return ScanCappedDiagnostic();
         }
 
-        return newestFile is null ? LogSnapshotResult.Empty() : ReadLog(newestFile);
+        // No VRChat runs, so nothing writes this file any more: its last line is as complete as it gets.
+        return newestFile is null ? LogSnapshotResult.Empty() : ReadLog(newestFile, keepUnterminated: true);
     }
 
-    private LogSnapshotResult ReadLog(string path)
+    private LogSnapshotResult ReadLog(string path, bool keepUnterminated = false)
     {
         try
         {
-            return LogSnapshotResult.Success(BuildBoundedOutput(ReadTailLines(path)));
+            return LogSnapshotResult.Success(BuildBoundedOutput(ReadTailLines(path, keepUnterminated)));
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
@@ -755,11 +756,12 @@ public sealed class VrchatLogReader : IVrchatLogReader
     /// byte 0, everything up to its first CRLF may be part of a line (the read seeked into
     /// the middle of the file) and is discarded rather than published as a fragment, and so
     /// is the last line until its CRLF is written (VRChat may be writing it; a value at its
-    /// end may be incomplete and not yet recognizable to mask). Each whole line is masked
+    /// end may be incomplete and not yet recognizable to mask), unless
+    /// <paramref name="keepUnterminated"/> says no VRChat writes the file any more. Each whole line is masked
     /// before it is split into display lines, so a value after a lone LF is still masked
     /// (client-observation plan C5).
     /// </summary>
-    private static List<string> ReadTailLines(string path)
+    private static List<string> ReadTailLines(string path, bool keepUnterminated)
     {
         using var fs = new FileStream(
             path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
@@ -789,7 +791,10 @@ public sealed class VrchatLogReader : IVrchatLogReader
         }
 
         var physical = VrchatLogLine.SplitPhysicalLines(window);
-        physical.RemoveAt(physical.Count - 1);
+        if (!keepUnterminated || physical[^1].Length == 0)
+        {
+            physical.RemoveAt(physical.Count - 1);
+        }
 
         var lines = physical.Select(LogRedactor.Redact).SelectMany(VrchatLogLine.ToDisplayLines).ToList();
 

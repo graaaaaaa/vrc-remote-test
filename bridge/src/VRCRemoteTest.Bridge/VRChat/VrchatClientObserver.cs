@@ -42,8 +42,13 @@ public sealed record VrchatObservation(
 /// seq values start over. Reading is bounded per poll (<see cref="PerClientBudgetBytes"/> per
 /// client and <see cref="TotalBudgetBytes"/> in all); a client whose log is not read to its
 /// end, or could not be read this time, is catchingUp. A client confirmed to have exited is
-/// read once more to the end of its file, and so is one whose slot a new client takes in the
-/// same poll, so its last lines are not lost; its markers then become the slot's .prev.
+/// read on to the end of its file, so its last lines are not lost. So is one whose slot a new
+/// client takes, over as many polls as that needs (giving up only when its file is gone or
+/// keeps failing for <see cref="MaxRetiringFailures"/> polls): its markers then become the
+/// slot's .prev, and the new client's markers file waits until then.
+///
+/// An epoch is used only once the roster has saved it; when it cannot, the client is not
+/// observed (or its log not read again) until it can.
 ///
 /// Markers files and .prev files count as published only once VrchatLogService acknowledges
 /// them, so one that could not be written is offered again on the next poll.
@@ -60,6 +65,9 @@ public sealed class VrchatClientObserver
 
     private const int SlotCount = VrchatClientRoster.SlotCount;
 
+    /// <summary>A replaced client's file that fails this many polls in a row is given up, and its .prev kept as it is.</summary>
+    internal const int MaxRetiringFailures = 12;
+
     private readonly BridgeOptions _options;
     private readonly VrchatClientRoster _roster;
     private readonly IManagedClientStore? _managedClients;
@@ -68,6 +76,11 @@ public sealed class VrchatClientObserver
     private readonly ILogger _logger;
     private readonly SlotObservation?[] _slots = new SlotObservation?[SlotCount];
     private readonly PreviousMarkers?[] _pendingPrevious = new PreviousMarkers?[SlotCount];
+
+    /// <summary>Clients whose slot a new client took, still being read to the end of their file.</summary>
+    private readonly SlotObservation?[] _retiring = new SlotObservation?[SlotCount];
+
+    private string? _lastEpochProblem;
 
     public VrchatClientObserver(
         IOptions<BridgeOptions> options,
@@ -117,15 +130,21 @@ public sealed class VrchatClientObserver
             if (observation is not null && (isNewGeneration || observation.Entry != entry))
             {
                 // The slot's previous client, which may have exited in the same poll: what it
-                // wrote last is read before its markers are kept as .prev.
-                if (observation.Scanner is not null && !observation.Drained)
+                // wrote last is read before its markers are kept as .prev. Two replacements
+                // before the first is read to its end keep only the later one, as .prev does.
+                _retiring[slot] = observation.Scanner is null ? null : observation;
+                if (_retiring[slot] is null)
                 {
-                    budget -= ReadInto(observation, Math.Min(budget, PerClientBudgetBytes), exited: true, cancellationToken);
+                    _pendingPrevious[slot] = new PreviousMarkers(slot, observation.RenderMarkers(slot));
                 }
 
-                _pendingPrevious[slot] = new PreviousMarkers(slot, observation.RenderMarkers(slot));
                 observation = null;
                 _slots[slot] = null;
+            }
+
+            if (_retiring[slot] is { } retiring)
+            {
+                budget -= Retire(slot, retiring, Math.Min(budget, PerClientBudgetBytes), cancellationToken);
             }
 
             if (entry is null)
@@ -136,21 +155,27 @@ public sealed class VrchatClientObserver
             if (isNewGeneration)
             {
                 newGenerations.Add(slot);
-                _pendingPrevious[slot] ??= new PreviousMarkers(slot, null);
+                if (_retiring[slot] is null)
+                {
+                    _pendingPrevious[slot] ??= new PreviousMarkers(slot, null);
+                }
             }
 
             // An exited client seen first now (e.g. before a Bridge restart) is not read: its
             // file is unknown, and its markers file stays as it was published.
-            if (observation is null && rosterSlot.Liveness != RosterLiveness.Exited)
+            if (observation is null && rosterSlot.Liveness != RosterLiveness.Exited
+                && TryAllocateEpoch() is { } epoch)
             {
-                observation = new SlotObservation(entry, Prefixes, _roster.AllocateEpoch());
+                observation = new SlotObservation(entry, Prefixes, epoch);
                 _slots[slot] = observation;
             }
 
             if (observation is not null)
             {
                 budget -= Scan(observation, rosterSlot, log, Math.Min(budget, PerClientBudgetBytes), cancellationToken);
-                if (observation.MarkersChanged)
+
+                // The previous client's file stays until its .prev is in place.
+                if (observation.MarkersChanged && _retiring[slot] is null)
                 {
                     markerFiles.Add(new MarkerPublication(slot, observation.RenderMarkers(slot), observation.CurrentKey));
                 }
@@ -177,6 +202,61 @@ public sealed class VrchatClientObserver
 
         var previous = _pendingPrevious.Where(p => p is not null).Select(p => p!).ToList();
         return new VrchatObservation(clients, markerFiles, previous, newGenerations, notices);
+    }
+
+    /// <summary>
+    /// Reads a replaced client's file on toward its end; once there (or once it is gone or
+    /// keeps failing), its markers become the slot's pending .prev. Returns the bytes read.
+    /// </summary>
+    private long Retire(int slot, SlotObservation retiring, long budget, CancellationToken cancellationToken)
+    {
+        long read = 0;
+        var path = retiring.Scanner!.Path;
+        if (!File.Exists(path))
+        {
+            retiring.RetiringFailures = MaxRetiringFailures;
+        }
+        else if (budget > 0)
+        {
+            read = ReadInto(retiring, budget, exited: true, cancellationToken);
+            retiring.RetiringFailures = retiring.ReadFailed ? retiring.RetiringFailures + 1 : 0;
+        }
+
+        if (retiring.Drained || retiring.RetiringFailures >= MaxRetiringFailures)
+        {
+            if (!retiring.Drained)
+            {
+                _logger.LogWarning(
+                    "Gave up reading {Path} to its end for the VRChat client that had slot {Slot}; its markers are kept as they are.",
+                    path, slot);
+            }
+
+            _pendingPrevious[slot] = new PreviousMarkers(slot, retiring.RenderMarkers(slot));
+            _retiring[slot] = null;
+        }
+
+        return read;
+    }
+
+    /// <summary>A saved epoch, or null when the roster cannot save one now (logged once per problem).</summary>
+    private long? TryAllocateEpoch()
+    {
+        try
+        {
+            var epoch = _roster.AllocateEpoch();
+            _lastEpochProblem = null;
+            return epoch;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            if (ex.Message != _lastEpochProblem)
+            {
+                _logger.LogWarning(ex, "No observation epoch can be saved; clients are not observed until it can.");
+                _lastEpochProblem = ex.Message;
+            }
+
+            return null;
+        }
     }
 
     /// <summary>The slot's markers file was written; it is not offered again until it changes.</summary>
@@ -206,10 +286,32 @@ public sealed class VrchatClientObserver
             path = last.Path;
         }
 
-        // A file that just disappeared is released by the reader on its next poll; it is not
-        // a reason to start a new epoch.
-        if (path is null || budget <= 0 || !File.Exists(path))
+        if (path is null)
         {
+            return 0;
+        }
+
+        if (!File.Exists(path))
+        {
+            // Released by the reader on its next poll, and not a reason for a new epoch; until
+            // then what was read is not current.
+            if (exited)
+            {
+                observation.Drained = true;
+            }
+            else
+            {
+                observation.ReadFailed = true;
+                observation.CatchingUp = true;
+            }
+
+            return 0;
+        }
+
+        if (budget <= 0)
+        {
+            // Not read this time: it may be behind.
+            observation.CatchingUp = true;
             return 0;
         }
 
@@ -232,11 +334,12 @@ public sealed class VrchatClientObserver
                 "Reading {Path} for VRChat client {ProcessId} in slot {Slot} (observation epoch {Epoch}).",
                 path, observation.Entry.ProcessId, observation.Entry.Slot, observation.Epoch);
         }
-        else if (!string.Equals(observation.Scanner.Path, path, StringComparison.OrdinalIgnoreCase)
-            || observation.Scanner.FileCreationUtc != created
-            || !observation.Prefixes.SequenceEqual(Prefixes))
+        else if ((!string.Equals(observation.Scanner.Path, path, StringComparison.OrdinalIgnoreCase)
+                || observation.Scanner.FileCreationUtc != created
+                || !observation.Prefixes.SequenceEqual(Prefixes))
+            && !Restart(observation, path, created, "another file or other marker prefixes"))
         {
-            Restart(observation, path, created, "another file or other marker prefixes");
+            return 0;
         }
 
         return ReadInto(observation, budget, exited, cancellationToken, path, created);
@@ -255,9 +358,9 @@ public sealed class VrchatClientObserver
         DateTime created = default)
     {
         var result = observation.Scanner!.Read(budget, cancellationToken);
-        if (result.Outcome == VrchatLogScanOutcome.Shrunk && path is not null)
+        if (result.Outcome == VrchatLogScanOutcome.Shrunk && path is not null
+            && Restart(observation, path, created, "the file shrank"))
         {
-            Restart(observation, path, created, "the file shrank");
             result = observation.Scanner!.Read(budget, cancellationToken);
         }
 
@@ -278,13 +381,22 @@ public sealed class VrchatClientObserver
         return result.BytesRead;
     }
 
-    private void Restart(SlotObservation observation, string path, DateTime created, string reason)
+    /// <summary>False when no epoch could be saved: the log is read again once one can, and nothing is current until then.</summary>
+    private bool Restart(SlotObservation observation, string path, DateTime created, string reason)
     {
-        var epoch = _roster.AllocateEpoch();
+        if (TryAllocateEpoch() is not { } epoch)
+        {
+            observation.ReadFailed = true;
+            observation.CatchingUp = true;
+            return false;
+        }
+
         observation.StartReading(new VrchatLogScanner(path, created), Prefixes, epoch);
         _logger.LogInformation(
             "Reading {Path} from its start for VRChat client {ProcessId} in slot {Slot} (observation epoch {Epoch}, {Reason}).",
             path, observation.Entry.ProcessId, observation.Entry.Slot, epoch, reason);
+
+        return true;
     }
 
     private (VrchatClientEntry Entry, IReadOnlyList<string> Notices) Describe(
@@ -470,6 +582,9 @@ public sealed class VrchatClientObserver
 
         /// <summary>The exited client's file was read to its end.</summary>
         public bool Drained { get; set; }
+
+        /// <summary>Polls in a row that a replaced client's file could not be read.</summary>
+        public int RetiringFailures { get; set; }
 
         /// <summary>Until the log is read, the markers file says it may be incomplete.</summary>
         private bool HeaderCatchingUp => Scanner is null || CatchingUp;

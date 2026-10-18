@@ -64,11 +64,11 @@ public sealed record RosterView(
 /// unknown gets no slot.
 ///
 /// Observation epochs are never handed out twice, across restarts too: each is the larger of
-/// the last one plus one and the current Unix time in milliseconds, so one that could not be
-/// saved before a restart is still below every epoch after it (epochs are rare, far fewer
-/// than one per millisecond). The file keeps the last one as well, against the clock going
-/// back. A file that is missing or not one this Bridge wrote starts an empty roster. Failing
-/// to save is logged and the roster carries on in memory.
+/// the last one plus one and the current Unix time in milliseconds, and it is handed out
+/// only once the file holding it is saved, so a restart, even with the clock set back, goes
+/// on above it. A file that is missing or not one this Bridge wrote starts an empty roster
+/// (its epochs then start from the clock). Failing to save the slots is logged and the
+/// roster carries on in memory; failing to save an epoch throws.
 ///
 /// Thread-safe, though only VrchatLogService's loop uses it.
 /// </summary>
@@ -198,16 +198,23 @@ public sealed class VrchatClientRoster
     }
 
     /// <summary>
-    /// A new epoch, higher than every one handed out before (also before a restart, saved or
-    /// not), saved with the roster.
+    /// A new epoch, higher than every one handed out before (also before a restart), saved
+    /// with the roster before it is returned. Throws IOException or
+    /// UnauthorizedAccessException when it cannot be saved; nothing is handed out then.
     /// </summary>
     public long AllocateEpoch()
     {
         lock (_gate)
         {
             EnsureLoadedLocked();
+            var previous = _lastEpoch;
             _lastEpoch = Math.Max(_lastEpoch + 1, _utcNow().ToUnixTimeMilliseconds());
-            SaveLocked();
+            if (!SaveLocked())
+            {
+                _lastEpoch = previous;
+                throw new IOException($"Could not save {_filePath}, so no observation epoch can be handed out.");
+            }
+
             return _lastEpoch;
         }
     }
@@ -374,11 +381,12 @@ public sealed class VrchatClientRoster
         return new RosterFileContent(file.LastObservationEpoch, parsed);
     }
 
-    private void SaveLocked()
+    /// <summary>True when saved (or kept in memory only, for tests).</summary>
+    private bool SaveLocked()
     {
         if (_filePath is null)
         {
-            return;
+            return true;
         }
 
         var file = new RosterFile
@@ -409,6 +417,8 @@ public sealed class VrchatClientRoster
                 _logger.LogInformation("{Path} can be saved again.", _filePath);
                 _lastSaveProblem = null;
             }
+
+            return true;
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
@@ -418,6 +428,8 @@ public sealed class VrchatClientRoster
                     ex, "Could not save {Path}; slots are kept in memory until it can be saved.", _filePath);
                 _lastSaveProblem = ex.Message;
             }
+
+            return false;
         }
     }
 

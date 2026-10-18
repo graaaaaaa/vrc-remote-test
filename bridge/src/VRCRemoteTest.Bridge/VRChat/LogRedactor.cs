@@ -51,10 +51,11 @@ internal static class LogRedactor
 
     /// <summary>
     /// "password": "correct horse", 'token' = 'x': a quoted value is masked to its closing
-    /// quote, spaces and all, or to the end of the line when the quote is missing (a cut line).
+    /// quote, spaces, escaped quotes (\") and LFs included, or to the end of the text when
+    /// the quote is missing (a cut line).
     /// </summary>
     private static readonly Regex QuotedSecretValue = new(
-        @"(?i)(?<![A-Za-z0-9_-])([""']?)(" + SecretNames + @")([""']?\s*[=:]\s*)([""'])(?:(?!\4)[^\r\n])*(\4?)",
+        @"(?i)(?<![A-Za-z0-9_-])([""']?)(" + SecretNames + @")([""']?\s*[=:]\s*)([""'])(?:\\[\s\S]|(?!\4)[^\\\r])*(\4?)",
         Options,
         MatchTimeout);
 

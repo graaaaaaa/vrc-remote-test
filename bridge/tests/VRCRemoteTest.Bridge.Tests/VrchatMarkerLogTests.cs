@@ -154,4 +154,17 @@ public class VrchatMarkerLogTests
 
         Encoding.UTF8.GetByteCount(content).Should().BeLessOrEqualTo(VrchatMarkerLog.MaxFileBytes);
     }
+
+    [Fact]
+    public void A_record_cut_at_its_cap_drops_the_value_the_cut_went_through()
+    {
+        // Codex review, round 2: the cut fell between "alice:" and its "@".
+        Line(Header + "[VRCRT] login https://alice:" + new string('p', 20_000) + "@example.com/");
+        Line(Header + "[VRCRT] open");
+        Line("continued https://bob:" + new string('q', 20_000) + "@example.com/");
+
+        var records = Records();
+        records.Should().HaveCount(2).And.OnlyContain(r => !r.Contains("alice") && !r.Contains("bob") && !r.Contains("ppp") && !r.Contains("qqq"));
+        records[0].Should().EndWith("[VRCRT] login" + VrchatMarkerLog.TruncationMark);
+    }
 }

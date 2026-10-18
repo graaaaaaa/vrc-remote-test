@@ -30,6 +30,8 @@ public class LogRedactorTests
     [InlineData("{\"Cookie\":\"opaque-session\"}", "{\"Cookie\":\"<redacted>\"}")]
     [InlineData("token: \"cut off before its quote", "token: \"<redacted>")]
     [InlineData(@"C:\Users\O'Brien\AppData", @"C:\Users\<user>\AppData")]
+    [InlineData("{\"password\":\"correct \\\"horse\\\" battery\"} next", "{\"password\":\"<redacted>\"} next")]
+    [InlineData("password=\"correct\nhorse\" next", "password=\"<redacted>\" next")]
     public void Masks_each_kind_of_value(string input, string expected)
     {
         LogRedactor.Redact(input).Should().Be(expected);
