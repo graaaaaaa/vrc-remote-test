@@ -854,9 +854,25 @@ S5a の C で残った「Udon の文字列の改行がそのままログに書�
 | E. Logging「エラーのみ」 | **合格**。空いていた slot 0 に入った台（PID 26012）は、30秒後は loggingLevel unknown・state starting、70秒後は errorsOnly・state null で、warnings と `slot-0.log` の先頭に `# VRChat's Logging is errors only for this client, …` が出た。ログインの警告は出なかった（authenticated は空）。終わったあと Logging を 1 に戻した |
 | F. 秘匿化 | **合格**。共有の `logs\` と `status\` の13ファイル（147 KB）に、`usr_***` 以外の usr_ の ID、実際の `C:\Users\<名前>`（URL エンコードを含む）、IPv4・IPv6、Windows のユーザー名は0件。`usr_***` が147件、IP は `answer from <ip>:5353` の形。リロード直後の `World Updated:` の行は `C:\Users\<user>\AppData\…` になっていた（元の output_log では実際のユーザー名）。token・cookie・authorization を含む行は写しの範囲に無かった |
 
-**不具合: isMaster が本物のログでは常に null だった**。VRChat の `[Behaviour] I am MASTER` と `I am *NOT* MASTER` は1行ではなく、単独の LF と `Actor Nr: <n>` が続くエントリだった（`… I am MASTER` のあとが `0A`、その直後に `Actor Nr: 1` と `0D 0A`）。10-17 以降のログの341件すべてがこの形で、CRLF で終わる1行の形は0件。Bridge は単独の LF を含む行を出来事に使わないので、Master の行に届かなかった。S5a の A1 でこの行を1行として書いていたのは、行を LF で分けて読んでいたため（S5a の記述の訂正は別の PR で行う）。PR #27 で、この2つの行だけ「1行目の本文が完全一致し、続きが `Actor Nr: <数字>` の1行だけ」のときに使うように直した（計画 C6・F1 の規則も同じに更新された）。修正後の実機の確認はまだ。
+**不具合: isMaster が本物のログでは常に null だった**。VRChat の `[Behaviour] I am MASTER` と `I am *NOT* MASTER` は1行ではなく、単独の LF と `Actor Nr: <n>` が続くエントリだった（`… I am MASTER` のあとが `0A`、その直後に `Actor Nr: 1` と `0D 0A`）。10-17 以降のログの341件すべてがこの形で、CRLF で終わる1行の形は0件。Bridge は単独の LF を含む行を出来事に使わないので、Master の行に届かなかった。S5a の A1 でこの行を1行として書いていたのは、行を LF で分けて読んでいたため（S5a の記述の訂正は別の PR で行う）。PR #27 で、この2つの行だけ「1行目の本文が完全一致し、続きが `Actor Nr: <数字>` の1行だけ」のときに使うように直した（計画 C6・F1 の規則も同じに更新された）。修正後の確認は下の「isMaster の修正の確認」。
 
 **後片付け**: VRChat はすべて閉じた。Logging は `0x1`。config.json は確認前のもの（Relaunch、`VrchatProfiles [0,1]`、`LogMarkerPrefixes` なし）に戻し、Bridge を起動し直した（16:12:07、WRN・ERR なし）。Bridge の exe は P1 のビルド（`2D55F541…`）のまま。v0.5.1 に戻すときは退避先の exe（`03BFEEDE…`）で入れ替える。
+
+#### isMaster の修正の確認と、Mac 側の確認（2026-10-18 16:21〜16:31）
+
+`d47cd27` を Windows でビルドして入れ替えた（exe の SHA-256 `96F78924…4A97`、ProductVersion `1.0.0+d47cd27…`）。VRChat を閉じて流した `dotnet test` は 668 件中 665 件が成功し、失敗はシンボリックリンクの3件だけ。config.json は Relaunch・`VrchatProfiles [0,1]`・`LogMarkerPrefixes ["[VRCRT]","[SPK003]"]`、Logging は「完全」。
+
+| 項目 | 結果 |
+|---|---|
+| G1. Relaunch で SPK-003 のプローブのワールドを送る（16:21:25） | **合格**。PID 29492（profile 0、16:21:26.794）と 23596（profile 1、16:21:29.534）が joined・同じ `local:dab8e4…`・参加者2人。slot 0 は isMaster true（16:21:41 の `I am MASTER` と `Actor Nr: 1`）、slot 1 は false（16:21:42 の `I am *NOT* MASTER`）。warnings は空 |
+| G2. Master の台（slot 0）を `CloseMainWindow` で閉じる（16:22:18.282） | **合格**。残った slot 1 は `OnMasterClientSwitched`（seq 872）→ `OnPlayerLeftRoom`（877）→ `OnPlayerLeft <表示名#1>`（881）のあと、参加者1人で isMaster true になった。閉じた slot 0 は running false・state left |
+| G3. 閉じた台と同じ引数（`--profile=0`）で手で起動し直す（16:22:45.620、PID 32180） | **合格**。同じ slot 0 に入り（`Showing output_log_2026-10-18_16-22-46.txt as the log of VRChat client 32180 in slot 0 (the only VRChat process that has it open)`、epoch `1792308169541`）、joined・参加者2人・isMaster false（16:22:54 の `I am *NOT* MASTER`）。slot 1 は master のまま。slot 0 の profile は null（手で起動した台は Bridge の記録に載らない）。`slot-0.markers.prev.log` は閉じた台の分で、新しい `slot-0.markers.log` は新しい台のヘッダーで始まった。前回の4台の slot 2・3 は running false・left のまま一覧に残っていた（observation-roster.json の、終わった台の枠） |
+| Mac: `scripts/vrcrt.sh`（本物の共有） | **合格**。Claude のシェルからは `/Volumes/VRCRemoteTest` を読めない（macOS のネットワークボリュームの保護）ので、アプリのターミナルのタブで動かした。`status` は Windows の報告と同じ表（slot 0 PID 32180 joined master no、slot 1 PID 23596 profile 1 joined master yes、slot 2・3 left）。`cursor` は4 slot の世代・epoch・seq（running の2台は epoch つき、終わった2台は epoch null）。`log 1 --lines 5`、`log 0 --markers --lines 5`、`log all --markers --lines 8`（時刻 → slot → seq の順）。`wait-same-instance 10` は即座に成功（`slots 0,1 are in local:dab8e4…`）、`--after <cursor>` では入り直しが無いので3秒で時間切れ（終了コード 1）。`wait-marker 1 PLAYER_RESTORED 3 --after <cursor>` は新しい記録が無いので時間切れ（1）。カーソルの seq を 0 にすると、`wait-marker 1 'PLAYER_JOINED id=\d'` は `807 … PLAYER_JOINED id=1 local=False …`、`wait-marker all START` は両台の `START revision=playerdata-probe-v2 …` で成功（0） |
+| Mac: Unity の Log Viewer（開いている `Vrc-remote-test` のパッケージのシンボリックリンクを、確認の間だけ PR #28 のチェックアウトに向けた） | **合格**。Log / Markers と Latest / Slot 0〜3 のツールバーが出た。Slot 1 の要約は `PID 23596 · profile 1 · joined · local:dab8e405… · 2 players · master · Logging full`。Markers の All slots は `[slot n] seq` つきで新しい順に結合し、`vrcrt.sh log all --markers` と同じ順。Slot 2 は `PID 26756 · not running · Logging unknown` で、終わった台のマーカー行が残っていた。コンソールの新しいエラーは無し（2件のエラーは 14:28 の UdonSharp の「VRChat data directory」で、確認の前から出ていたもの）。確認のあと、シンボリックリンクを元の `/Users/gra/Documents/graaaaa/vrc-remote-test/package` に戻した |
+
+マーカー行には、ワールドが自分で書いた表示名（`observer=…`、`peer=…`、`owner=…`）がそのまま残る。手順11-1と計画 C5 の残余リスクのとおりで、Bridge の秘匿化の対象ではない。
+
+Windows の2台は 16:53 ごろに閉じて、config.json を戻す（`LogMarkerPrefixes` は残す）。Bridge の exe は `d47cd27` のビルドのまま。
 
 ---
 
