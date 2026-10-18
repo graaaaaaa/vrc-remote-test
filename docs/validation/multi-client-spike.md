@@ -684,6 +684,7 @@ profile 0 の台（Master）:
 2026.10.18 13:34:39 Debug      -  [Behaviour] Successfully joined room
 2026.10.18 13:34:41 Debug      -  [Behaviour] Waiting to discover master client.
 2026.10.18 13:34:43 Debug      -  [Behaviour] I am MASTER
+Actor Nr: 1
 2026.10.18 13:34:43 Debug      -  [Behaviour] Finished entering world.
 2026.10.18 13:34:43 Debug      -  [Behaviour] OnPlayerJoined <表示名#1> (usr_***)
 2026.10.18 13:34:47 Debug      -  [Behaviour] OnPlayerJoined <表示名#2> (usr_***)
@@ -694,6 +695,7 @@ profile 1 の台も同じ順（13:34:40 `User Authenticated` → 13:34:42 `Joini
 - `Joining` の local ID の末尾に `:1` は無い。`:1` が付くのは `Destination fetching` と `Destination set` だけで、初回の `Destination requested` にも付かない。
 - `OnJoinedRoom` という行は無い。部屋に入ったことを示すのは `Entering Room: <名前>` → `Joining or Creating Room: <名前>` → `Successfully joined room`。
 - `I am MASTER` / `I am *NOT* MASTER` は `Finished entering world.` の直前に1回だけ出る。`OnPlayerJoined`（自分を含む）はそのあと。
+- 訂正（S5b のあと、Windows のセッションが確かめた）: `I am MASTER` / `I am *NOT* MASTER` は 1 行ではなく、単独の LF のあとに `Actor Nr: <n>` が続く 2 行のエントリ（`[Behaviour] I am MASTER\nActor Nr: 1\r\n`）。10-17 以降のログの 341 件がすべてこの形で、CRLF で終わる 1 行の形は 0 件。S5a では行を LF で分けて読んでいたので、続きの行を見落としていた。ほかの入室まわりの行（`Destination set`、`Joining`、`Successfully joined room`、`Finished entering world.`、`OnPlayerJoined` / `OnPlayerLeft`、`OnMasterClientSwitched`、`User Authenticated`）は、1 行で CRLF で終わる。この節のほかの抜粋の `I am MASTER` も、同じく 2 行のエントリの 1 行目だけを写したもの。
 - `Finished entering world.` は、A1・A3・A4 の読み込み直し・A6 の入り直しの、どの入室でも1回ずつ出た。ただし Error World に入ったとき（A5）にも出るので、直前の `Joining local:…` と組で見ないと、狙ったワールドに入れたとは言えない。
 
 #### A2. Master の台を閉じたとき
