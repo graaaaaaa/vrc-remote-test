@@ -26,18 +26,16 @@ public sealed class BridgeOptions
     public const int MaxVrchatProfile = 99;
 
     /// <summary>
-    /// Root of the SMB-shared staging area (incoming/results/status/logs).
-    /// Deliberately separate from <see cref="VrchatWorldsDirectory"/> so a
-    /// malformed or partial upload can never land directly in VRChat's live
-    /// watched directory.
+    /// The Bridge listens only when a specific LAN address is configured.
+    /// Never bind to every interface or enable a plaintext endpoint.
     /// </summary>
-    public string StagingDirectory { get; set; } = string.Empty;
+    public string LanBindAddress { get; set; } = string.Empty;
+
+    public int LanPort { get; set; } = 38443;
 
     /// <summary>
-    /// Bridge-private state (processing/archive/failed). Never inside
-    /// <see cref="StagingDirectory"/>: the SMB account can write the share, so
-    /// nothing the Bridge later trusts (claimed manifests, validated artifact
-    /// snapshots, idempotency records) may live there. Program.cs always sets
+    /// Bridge-private state (incoming/processing/archive/failed/results/status/logs).
+    /// Program.cs always sets
     /// this to %LOCALAPPDATA%\VRCRemoteTest\state, overriding config.json, so the
     /// directory inherits the user profile's private ACL instead of needing a
     /// runtime DACL check; the setter exists for test injection.
@@ -146,5 +144,6 @@ public sealed class BridgeOptions
     /// </summary>
     public string[]? LogMarkerPrefixes { get; set; }
 
-    public IReadOnlyList<string> ResolvedLogMarkerPrefixes => LogMarkerPrefixes ?? DefaultLogMarkerPrefixes;
+    public IReadOnlyList<string> ResolvedLogMarkerPrefixes =>
+        LogMarkerPrefixes is { Length: > 0 } ? LogMarkerPrefixes : DefaultLogMarkerPrefixes;
 }

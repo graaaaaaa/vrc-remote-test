@@ -9,7 +9,7 @@ namespace VRCRemoteTest.Bridge.VRChat;
 ///
 /// The deploy flow only sets or clears the line; both wake VrchatLogService, which then
 /// publishes at once instead of on its next poll. Writing the share stays with that service
-/// alone, so only one SharedFileWriter replaces vrchat-latest.log, and a write that fails
+/// alone, so only one PrivateSnapshotWriter replaces vrchat-latest.log, and a write that fails
 /// never reaches the deploy. Thread-safe: the deploy flow and the Log Viewer run on
 /// different hosted services.
 /// </summary>

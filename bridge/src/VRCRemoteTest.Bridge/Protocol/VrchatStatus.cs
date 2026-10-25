@@ -3,12 +3,8 @@ using System.Text.Json.Serialization;
 namespace VRCRemoteTest.Bridge.Protocol;
 
 /// <summary>
-/// Wire format for the continuously-updated `{stagingDirectory}/status/vrchat-status.json`
-/// file. Deliberately minimal (Codex plan review Phase 4a, confidence 0.91) -- this is NOT
-/// a revival of the original heartbeat design (bridgeVersion, hostName, etc. were removed
-/// as over-engineered for v1, see IResultWriter's doc comment). Unity treats this as
-/// advisory/informational only: it never gates build success or failure, only preflight
-/// display.
+/// Wire format for VRChat status kept in Bridge-private state and returned through
+/// the HTTPS API. Unity uses it for preflight display; it does not gate build results.
 /// </summary>
 public sealed class VrchatStatus
 {

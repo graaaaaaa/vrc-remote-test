@@ -163,6 +163,6 @@ if (VRCSdkControlPanel.TryGetBuilder<IVRCSdkWorldBuilderApi>(out var worldBuilde
 
 ## 未検証事項
 
-- **`Build()`実行中にUnityのビルドターゲットが`StandaloneWindows64`でない場合の挙動**: SDK側で自動的にターゲット切替を行うか、それとも呼び出し側が事前に切り替えておく必要があるかは未確認。安全側に倒し、`VrcSdkBuildAdapter`側で明示的に`EditorUserBuildSettings.activeBuildTarget`を確認・切替する設計とする。
-- **`TryGetBuilder`がSDKパネルを開いた直後、非同期的なタイミングでどの程度安定して成功するか**は未検証。Codexレビューでも指摘されたため、リトライ・バックオフの実装を検討する。
+- **Win64 ビルドターゲット**: 2026-10-25 の Unity 2022.3.22f1 / Worlds SDK 3.10.5 バッチ試験では、ターゲット未指定だとアダプターが `INVALID_BUILD_TARGET` を返した。`-buildTarget Win64` を指定した試験は成功した。アダプターは Unity のターゲットを途中で切り替えず、事前の一致を検査する。
+- **`TryGetBuilder` の初期化**: 同日の実機試験で、SDK パネルを開いても Builder のシーン一覧が未初期化のまま返る場合があった。`IsValidBuilder` で一覧を更新し、リトライは Unity の同期コンテキスト上で続ける。バッチ試験ではメインスレッド外のシーン検索が失敗することを確認し、修正後のビルドは成功した。詳細は `docs/validation/lan-direct-2026-10-25.md`。
 - **VRChatの`--watch-worlds`が実際にファイル配置でリロードするか**はSDK APIの範囲外であり、Windows実機での検証が必要（`docs/validation/watch-worlds-spike.md`で別途記録、Phase 0.5参照）。

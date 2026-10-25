@@ -43,7 +43,7 @@ public class VrchatLogServicePublishTests : IDisposable
     {
         var options = new BridgeOptions
         {
-            StagingDirectory = _staging,
+            StateDirectory = _staging,
             VrchatWorldsDirectory = Path.Combine(_logDir, "Worlds"),
         };
         var roster = new VrchatClientRoster(Path.Combine(_tempDir, "state", VrchatClientRoster.FileName));

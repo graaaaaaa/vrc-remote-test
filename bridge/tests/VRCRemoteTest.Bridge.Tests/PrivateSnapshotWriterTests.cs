@@ -9,21 +9,21 @@ namespace VRCRemoteTest.Bridge.Tests;
 /// The held-open cases are Windows-only: on Unix, rename(2) replaces an open
 /// destination, so the POSIX-semantics fallback never runs there.
 /// </summary>
-public class SharedFileWriterTests : IDisposable
+public class PrivateSnapshotWriterTests : IDisposable
 {
     /// <summary>The share mode of the SMB server's handle observed while the Mac held the file open.</summary>
     private const FileShare SmbClientShare = FileShare.ReadWrite | FileShare.Delete;
 
     private readonly string _tempDir;
     private readonly string _path;
-    private readonly ListLogger<SharedFileWriterTests> _logger = new();
-    private readonly SharedFileWriter _writer;
+    private readonly ListLogger<PrivateSnapshotWriterTests> _logger = new();
+    private readonly PrivateSnapshotWriter _writer;
 
-    public SharedFileWriterTests()
+    public PrivateSnapshotWriterTests()
     {
         _tempDir = Directory.CreateTempSubdirectory("vrc-remote-test-sharedfile-").FullName;
         _path = Path.Combine(_tempDir, "vrchat-latest.log");
-        _writer = new SharedFileWriter(_logger);
+        _writer = new PrivateSnapshotWriter(_logger);
     }
 
     public void Dispose()
@@ -36,7 +36,7 @@ public class SharedFileWriterTests : IDisposable
     {
         File.WriteAllText(_path, "old");
 
-        _writer.Write(_path, "new").Should().Be(SharedFileWriteOutcome.Replaced);
+        _writer.Write(_path, "new").Should().Be(SnapshotWriteOutcome.Replaced);
 
         File.ReadAllText(_path).Should().Be("new");
         Directory.GetFiles(_tempDir).Should().ContainSingle().Which.Should().Be(_path);
@@ -54,7 +54,7 @@ public class SharedFileWriterTests : IDisposable
         File.WriteAllText(_path, "old content");
         using var macHandle = HoldOpen(SmbClientShare);
 
-        _writer.Write(_path, "new content").Should().Be(SharedFileWriteOutcome.ReplacedWhileHeldOpen);
+        _writer.Write(_path, "new content").Should().Be(SnapshotWriteOutcome.ReplacedWhileHeldOpen);
 
         File.ReadAllText(_path).Should().Be("new content", "a new open must see the new file");
         ReadThrough(macHandle).Should().Be(
@@ -62,7 +62,7 @@ public class SharedFileWriterTests : IDisposable
         Directory.GetFiles(_tempDir).Should().ContainSingle().Which.Should().Be(_path);
 
         // The name now refers to a file nobody holds, so the normal path works again.
-        _writer.Write(_path, "newer content").Should().Be(SharedFileWriteOutcome.Replaced);
+        _writer.Write(_path, "newer content").Should().Be(SnapshotWriteOutcome.Replaced);
         File.ReadAllText(_path).Should().Be("newer content");
     }
 
@@ -77,7 +77,7 @@ public class SharedFileWriterTests : IDisposable
         File.WriteAllText(_path, "old");
         using var reader = HoldOpen(FileShare.ReadWrite);
 
-        _writer.Write(_path, "new").Should().Be(SharedFileWriteOutcome.DestinationBusy);
+        _writer.Write(_path, "new").Should().Be(SnapshotWriteOutcome.DestinationBusy);
 
         ReadThrough(reader).Should().Be("old");
         Directory.GetFiles(_tempDir).Should().ContainSingle().Which.Should().Be(_path);

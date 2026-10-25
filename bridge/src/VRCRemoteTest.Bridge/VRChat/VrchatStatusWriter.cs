@@ -7,8 +7,8 @@ namespace VRCRemoteTest.Bridge.VRChat;
 /// <summary>
 /// Writes status/vrchat-status.json using the same atomic tmp-then-rename pattern as
 /// ResultWriter, so a concurrent reader (Unity's PollVrchatStatus) never observes a
-/// partially-written file -- including while the Mac's SMB client holds the file open
-/// (see SharedFileWriter).
+/// partially-written file -- including while an API reader has the file open
+/// (see PrivateSnapshotWriter).
 /// </summary>
 public sealed class VrchatStatusWriter : IVrchatStatusWriter
 {
@@ -16,11 +16,11 @@ public sealed class VrchatStatusWriter : IVrchatStatusWriter
 
     private static readonly JsonSerializerOptions SerializerOptions = new() { WriteIndented = true };
 
-    private readonly SharedFileWriter _fileWriter;
+    private readonly PrivateSnapshotWriter _fileWriter;
 
     public VrchatStatusWriter(ILogger<VrchatStatusWriter> logger)
     {
-        _fileWriter = new SharedFileWriter(logger);
+        _fileWriter = new PrivateSnapshotWriter(logger);
     }
 
     public void Write(VrchatStatus status, string statusDirectory)

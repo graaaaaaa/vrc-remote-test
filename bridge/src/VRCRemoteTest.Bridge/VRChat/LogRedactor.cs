@@ -7,14 +7,14 @@ namespace VRCRemoteTest.Bridge.VRChat;
 
 /// <summary>
 /// Masks what a VRChat log may carry about the Windows machine and the accounts before
-/// anything derived from it is written to the share (client-observation plan C5): VRChat
+/// anything derived from it is written to Bridge-private snapshots or returned by the API (client-observation plan C5): VRChat
 /// user IDs (usr_…), the user name in Windows profile paths, IPv4 and IPv6 addresses, and
 /// authentication values (Authorization and Cookie headers, token-like key=value pairs,
 /// VRChat's authcookie_ values, user:password@ in URLs). VRChat's support article on output
 /// logs warns that they can contain the PC's user name and IP addresses.
 ///
 /// Callers mask first and cut to their size limits afterwards, so a cut never leaves the
-/// unmasked start of a value behind. Display names stay: the share is for a single
+/// unmasked start of a value behind. Display names stay: the Bridge is for a single
 /// operator, and docs/setup-windows.md lists them as a residual risk. Neither can this find
 /// every secret a world writes with Debug.Log.
 ///

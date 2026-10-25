@@ -30,7 +30,7 @@ public class StagingWatcherTests : IDisposable
     {
         _tempDir = Directory.CreateTempSubdirectory("vrc-remote-test-watcher-").FullName;
         _stagingDir = Path.Combine(_tempDir, "staging");
-        _stateDir = Path.Combine(_tempDir, "state");
+        _stateDir = _stagingDir;
         _worldsDir = Path.Combine(_tempDir, "worlds");
         Directory.CreateDirectory(_worldsDir);
     }
@@ -47,8 +47,8 @@ public class StagingWatcherTests : IDisposable
         int? clientCount = null,
         int startupTimeoutSeconds = 60) => new()
     {
-        StagingDirectory = _stagingDir,
-        StateDirectory = _stateDir,
+
+        StateDirectory = _stagingDir,
         VrchatWorldsDirectory = _worldsDir,
         MaxArtifactSizeBytes = maxSize,
         RetainBuilds = retainBuilds,
@@ -147,6 +147,19 @@ public class StagingWatcherTests : IDisposable
         File.Exists(Path.Combine(_stateDir, "archive", "build-1.ready.json")).Should().BeTrue();
         File.Exists(Path.Combine(_stagingDir, "results", "build-1.json")).Should().BeTrue();
         File.Exists(Path.Combine(_stagingDir, "incoming", "build-1.ready.json")).Should().BeFalse();
+    }
+
+    [Fact]
+    public async Task Startup_discards_an_interrupted_http_upload_partial()
+    {
+        var incoming = Path.Combine(_stateDir, "incoming");
+        Directory.CreateDirectory(incoming);
+        var partial = Path.Combine(incoming, "interrupted.part");
+        File.WriteAllBytes(partial, new byte[] { 1, 2, 3 });
+
+        await CreateWatcher().RecoverProcessingAsync(CancellationToken.None);
+
+        File.Exists(partial).Should().BeFalse();
     }
 
     [Fact]
@@ -605,7 +618,7 @@ public class StagingWatcherTests : IDisposable
     }
 
     [Fact]
-    public async Task Ingests_through_private_state_and_leaves_nothing_in_the_share()
+    public async Task Ingests_through_private_queue_and_archives_the_manifest()
     {
         var watcher = CreateWatcher();
         WriteIncomingBuild(_stagingDir, "build-private", Encoding.UTF8.GetBytes("fake-world-bundle"));
@@ -613,9 +626,6 @@ public class StagingWatcherTests : IDisposable
         await watcher.RunOnceAsync(CancellationToken.None);
 
         Directory.GetFiles(Path.Combine(_stagingDir, "incoming")).Should().BeEmpty();
-        Directory.Exists(Path.Combine(_stagingDir, "processing")).Should().BeFalse();
-        Directory.Exists(Path.Combine(_stagingDir, "archive")).Should().BeFalse();
-        Directory.Exists(Path.Combine(_stagingDir, "failed")).Should().BeFalse();
         Directory.GetFiles(Path.Combine(_stateDir, "processing")).Should().BeEmpty();
         Directory.GetFiles(Path.Combine(_stateDir, "archive")).Should().ContainSingle()
             .Which.Should().EndWith("build-private.ready.json", "only the manifest is archived");
@@ -750,24 +760,6 @@ public class StagingWatcherTests : IDisposable
 
         File.ReadAllBytes(Path.Combine(_worldsDir, "vrc-remote-build-crash.vrcw")).Should().Equal(bytes);
         Directory.GetFiles(processing).Should().BeEmpty();
-    }
-
-    [Fact]
-    public async Task Recovery_never_imports_a_legacy_processing_directory_from_the_share()
-    {
-        var watcher = CreateWatcher();
-        var bytes = Encoding.UTF8.GetBytes("fake-world-bundle");
-        var legacyProcessing = Path.Combine(_stagingDir, "processing");
-        Directory.CreateDirectory(legacyProcessing);
-        File.WriteAllBytes(Path.Combine(legacyProcessing, "build-legacy.vrcw"), bytes);
-        File.WriteAllText(
-            Path.Combine(legacyProcessing, "build-legacy.ready.json"),
-            JsonSerializer.Serialize(ManifestFor("build-legacy", bytes)));
-
-        await watcher.RecoverProcessingAsync(CancellationToken.None);
-
-        Directory.GetFiles(_worldsDir).Should().BeEmpty();
-        Directory.GetFiles(legacyProcessing).Should().HaveCount(2, "legacy files are left for manual cleanup");
     }
 
     [Fact]

@@ -10,7 +10,7 @@ namespace VRCRemoteTest.Bridge.Tests;
 
 /// <summary>
 /// The real Restart Manager, so these return at once when not on Windows (like
-/// SharedFileWriterTests). On Windows they check what the rules in VrchatLogOwnersTests
+/// PrivateSnapshotWriterTests). On Windows they check what the rules in VrchatLogOwnersTests
 /// take for granted: a process that holds a file open is reported with its PID, a start
 /// time that matches Process.StartTime, and its image name, and is gone once it closes
 /// the file.

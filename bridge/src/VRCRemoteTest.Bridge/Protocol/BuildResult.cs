@@ -3,11 +3,8 @@ using System.Text.Json.Serialization;
 namespace VRCRemoteTest.Bridge.Protocol;
 
 /// <summary>
-/// Wire format for the single per-build result file the Bridge writes under
-/// `{stagingDirectory}/results/{buildId}.json`. Replaces the original heartbeat +
-/// rich status-polling design: Unity waits for exactly one of these files to appear
-/// after upload, with a bounded timeout, rather than polling a continuously-updated
-/// bridge.json heartbeat.
+/// Wire format for the per-build result kept in Bridge-private state and returned
+/// through the HTTPS API. Unity polls by build ID after upload with a bounded timeout.
 /// </summary>
 public sealed class BuildResult
 {

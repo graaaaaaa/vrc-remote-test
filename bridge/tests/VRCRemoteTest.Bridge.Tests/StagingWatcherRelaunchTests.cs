@@ -36,7 +36,7 @@ public class StagingWatcherRelaunchTests : IDisposable
     {
         _tempDir = Directory.CreateTempSubdirectory("vrc-remote-test-relaunch-").FullName;
         _stagingDir = Path.Combine(_tempDir, "staging");
-        _stateDir = Path.Combine(_tempDir, "state");
+        _stateDir = _stagingDir;
         _worldsDir = Path.Combine(_tempDir, "worlds");
         Directory.CreateDirectory(_worldsDir);
 
@@ -51,8 +51,8 @@ public class StagingWatcherRelaunchTests : IDisposable
 
     private BridgeOptions Options(int[] profiles, int retainBuilds) => new()
     {
-        StagingDirectory = _stagingDir,
-        StateDirectory = _stateDir,
+
+        StateDirectory = _stagingDir,
         VrchatWorldsDirectory = _worldsDir,
         MaxArtifactSizeBytes = 1024,
         RetainBuilds = retainBuilds,

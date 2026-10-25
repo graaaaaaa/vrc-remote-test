@@ -25,7 +25,7 @@ public class BridgeOptionsValidatorTests : IDisposable
     {
         var options = new BridgeOptions
         {
-            StagingDirectory = Path.Combine(_tempDir, "staging"),
+            LanBindAddress = "192.168.1.10",
             StateDirectory = Path.Combine(_tempDir, "state"),
             VrchatWorldsDirectory = _tempDir,
             MaxArtifactSizeBytes = 1024,
@@ -42,7 +42,7 @@ public class BridgeOptionsValidatorTests : IDisposable
     {
         var options = new BridgeOptions
         {
-            StagingDirectory = Path.Combine(_tempDir, "staging"),
+            LanBindAddress = "192.168.1.10",
             StateDirectory = Path.Combine(_tempDir, "state"),
             VrchatWorldsDirectory = Path.Combine(_tempDir, "does-not-exist"),
             MaxArtifactSizeBytes = 1024,
@@ -56,11 +56,11 @@ public class BridgeOptionsValidatorTests : IDisposable
     }
 
     [Fact]
-    public void Fails_when_staging_directory_is_blank()
+    public void Fails_when_lan_bind_address_is_blank()
     {
         var options = new BridgeOptions
         {
-            StagingDirectory = string.Empty,
+            LanBindAddress = string.Empty,
             VrchatWorldsDirectory = _tempDir,
             MaxArtifactSizeBytes = 1024,
             RetainBuilds = 10,
@@ -69,7 +69,7 @@ public class BridgeOptionsValidatorTests : IDisposable
         var result = _validator.Validate(name: null, options);
 
         result.Failed.Should().BeTrue();
-        result.Failures.Should().Contain(f => f.Contains("StagingDirectory"));
+        result.Failures.Should().Contain(f => f.Contains("LanBindAddress"));
     }
 
     [Theory]
@@ -79,7 +79,7 @@ public class BridgeOptionsValidatorTests : IDisposable
     {
         var options = new BridgeOptions
         {
-            StagingDirectory = Path.Combine(_tempDir, "staging"),
+            LanBindAddress = "192.168.1.10",
             StateDirectory = Path.Combine(_tempDir, "state"),
             VrchatWorldsDirectory = _tempDir,
             MaxArtifactSizeBytes = maxSize,
@@ -94,7 +94,7 @@ public class BridgeOptionsValidatorTests : IDisposable
 
     private BridgeOptions ValidBaseOptions() => new()
     {
-        StagingDirectory = Path.Combine(_tempDir, "staging"),
+        LanBindAddress = "192.168.1.10",
         StateDirectory = Path.Combine(_tempDir, "state"),
         VrchatWorldsDirectory = _tempDir,
         MaxArtifactSizeBytes = 1024,
@@ -379,67 +379,6 @@ public class BridgeOptionsValidatorTests : IDisposable
     }
 
     [Fact]
-    public void Fails_when_StateDirectory_equals_StagingDirectory()
-    {
-        var options = ValidBaseOptions();
-        options.StateDirectory = options.StagingDirectory + Path.DirectorySeparatorChar;
-
-        var result = _validator.Validate(name: null, options);
-
-        result.Failed.Should().BeTrue();
-        result.Failures.Should().Contain(f => f.Contains("must not overlap"));
-    }
-
-    [Fact]
-    public void Fails_when_StateDirectory_is_inside_StagingDirectory()
-    {
-        var options = ValidBaseOptions();
-        options.StateDirectory = Path.Combine(options.StagingDirectory, "state");
-
-        var result = _validator.Validate(name: null, options);
-
-        result.Failed.Should().BeTrue();
-        result.Failures.Should().Contain(f => f.Contains("must not overlap"));
-    }
-
-    [Fact]
-    public void Fails_when_StagingDirectory_is_inside_StateDirectory()
-    {
-        var options = ValidBaseOptions();
-        options.StagingDirectory = Path.Combine(options.StateDirectory, "share");
-
-        var result = _validator.Validate(name: null, options);
-
-        result.Failed.Should().BeTrue();
-        result.Failures.Should().Contain(f => f.Contains("must not overlap"));
-    }
-
-    [Fact]
-    public void Overlap_check_canonicalizes_dot_segments_before_comparing()
-    {
-        // Lexically "staging2/../staging/state" does not start with "staging/", but it
-        // resolves inside it.
-        var options = ValidBaseOptions();
-        options.StateDirectory = Path.Combine(_tempDir, "staging2", "..", "staging", "state");
-
-        var result = _validator.Validate(name: null, options);
-
-        result.Failed.Should().BeTrue();
-        result.Failures.Should().Contain(f => f.Contains("must not overlap"));
-    }
-
-    [Fact]
-    public void A_sibling_whose_name_extends_StagingDirectory_is_not_treated_as_inside_it()
-    {
-        var options = ValidBaseOptions();
-        options.StateDirectory = options.StagingDirectory + "-state";
-
-        var result = _validator.Validate(name: null, options);
-
-        result.Succeeded.Should().BeTrue();
-    }
-
-    [Fact]
     public void Fails_when_StateDirectory_is_a_symbolic_link()
     {
         var target = Path.Combine(_tempDir, "real-state");
@@ -642,7 +581,7 @@ public class BridgeOptionsValidatorTests : IDisposable
 
     private BridgeOptions ValidOptions(string[]? prefixes) => new()
     {
-        StagingDirectory = Path.Combine(_tempDir, "staging"),
+        LanBindAddress = "192.168.1.10",
         StateDirectory = Path.Combine(_tempDir, "state"),
         VrchatWorldsDirectory = _tempDir,
         LogMarkerPrefixes = prefixes,

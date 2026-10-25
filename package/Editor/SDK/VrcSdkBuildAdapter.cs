@@ -20,20 +20,20 @@ namespace VRCRemoteTest
         {
             EnsureBuildTarget();
 
-            // ConfigureAwait(false) throughout: the headless entry point
-            // (RemoteBuildCommand.ExecuteRemoteBuildHeadless) blocks Unity's
-            // main thread synchronously via .GetAwaiter().GetResult(). Any
-            // await here that tried to resume on the captured
-            // SynchronizationContext (the main thread) would deadlock against
-            // that same blocked thread. The trade-off: if TryGetBuilder needs
-            // a retry (SDK Control Panel not yet open), the subsequent
-            // TryGetBuilder/Build() calls may then run on a thread-pool thread
-            // rather than the main thread. On the happy path (panel already
-            // open, no retry) everything still runs synchronously on the
-            // caller's thread up to the first await, so this only matters for
-            // the retry path. Needs real-machine verification against the
-            // actual SDK — see docs/sdk-api-notes.md.
-            var builder = await ObtainBuilderAsync().ConfigureAwait(false);
+            // The SDK builder and scene lookup are Unity APIs. Keep the
+            // synchronization context across retries so they run on the
+            // Editor main thread in both interactive and batch mode.
+            var builder = await ObtainBuilderAsync();
+
+            // The SDK public API can return a builder before its Builder tab has
+            // populated the scene list. IsValidBuilder refreshes that list; without
+            // it Build() reports "Open the SDK panel" even when the panel is open.
+            if (!builder.IsValidBuilder(out var validationMessage))
+            {
+                throw new RemoteBuildException(
+                    ErrorCode.SdkBuildFailed,
+                    $"SDK world builder is not ready: {validationMessage}");
+            }
 
             try
             {
@@ -88,7 +88,7 @@ namespace VRCRemoteTest
                     EditorWindow.GetWindow(typeof(VRCSdkControlPanel));
                 }
 
-                await Task.Delay(RetryDelayMs).ConfigureAwait(false);
+                await Task.Delay(RetryDelayMs);
             }
 
             throw new RemoteBuildException(

@@ -3,6 +3,7 @@ using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using VRCRemoteTest.Bridge.Configuration;
+using VRCRemoteTest.Bridge.Lan;
 
 namespace VRCRemoteTest.Bridge.VRChat;
 
@@ -22,7 +23,7 @@ namespace VRCRemoteTest.Bridge.VRChat;
 /// - status/vrchat-clients.json.
 ///
 /// A log copy whose content did not change since it was last written is not written again.
-/// A markers or .prev file counts as written only when SharedFileWriter replaced it (not when
+/// A markers or .prev file counts as written only when PrivateSnapshotWriter replaced it (not when
 /// a reader kept it busy), and the observer offers it again until then; a slot's new markers
 /// wait until its .prev is in place.
 ///
@@ -50,9 +51,10 @@ public sealed class VrchatLogService : BackgroundService
     private readonly VrchatLogNotice _notice;
     private readonly ILogger<VrchatLogService> _logger;
     private readonly TimeSpan _pollInterval;
+    private readonly LogSourceRegistry? _logSources;
 
     /// <summary>One writer per published file, so each logs its own outcome changes.</summary>
-    private readonly Dictionary<string, SharedFileWriter> _writers = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, PrivateSnapshotWriter> _writers = new(StringComparer.OrdinalIgnoreCase);
 
     private readonly Dictionary<string, string> _lastWriteProblem = new(StringComparer.OrdinalIgnoreCase);
 
@@ -64,8 +66,9 @@ public sealed class VrchatLogService : BackgroundService
         IVrchatLogReader logReader,
         VrchatClientObserver observer,
         VrchatLogNotice notice,
-        ILogger<VrchatLogService> logger)
-        : this(options, logReader, observer, notice, logger, DefaultPollInterval)
+        ILogger<VrchatLogService> logger,
+        LogSourceRegistry logSources)
+        : this(options, logReader, observer, notice, logger, DefaultPollInterval, logSources)
     {
     }
 
@@ -76,7 +79,8 @@ public sealed class VrchatLogService : BackgroundService
         VrchatClientObserver observer,
         VrchatLogNotice notice,
         ILogger<VrchatLogService> logger,
-        TimeSpan pollInterval)
+        TimeSpan pollInterval,
+        LogSourceRegistry? logSources = null)
     {
         _options = options.Value;
         _logReader = logReader;
@@ -84,13 +88,14 @@ public sealed class VrchatLogService : BackgroundService
         _notice = notice;
         _logger = logger;
         _pollInterval = pollInterval;
+        _logSources = logSources;
     }
 
-    private string LogsDirectory => Path.Combine(_options.StagingDirectory, "logs");
+    private string LogsDirectory => Path.Combine(_options.StateDirectory, "logs");
 
     private string ClientLogsDirectory => Path.Combine(LogsDirectory, "clients");
 
-    private string StatusDirectory => Path.Combine(_options.StagingDirectory, "status");
+    private string StatusDirectory => Path.Combine(_options.StateDirectory, "status");
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
@@ -141,6 +146,7 @@ public sealed class VrchatLogService : BackgroundService
         }
 
         var observation = _observer.Observe(read, cancellationToken);
+        _logSources?.Publish(read, observation.Clients);
 
         if (read.Latest.IsAvailable)
         {
@@ -188,6 +194,7 @@ public sealed class VrchatLogService : BackgroundService
 
     private void PublishNotice(string message)
     {
+        _logSources?.Clear();
         PublishIfChanged(Path.Combine(LogsDirectory, "vrchat-latest.log"), message);
         for (var slot = 0; slot < VrchatClientRoster.SlotCount; slot++)
         {
@@ -205,8 +212,7 @@ public sealed class VrchatLogService : BackgroundService
     /// Keeps the previous client's markers as slot-{n}.markers.prev.log, replacing the older
     /// one, so only the one generation before is kept (client-observation plan C5). Without
     /// the markers in memory (that client ran before this Bridge started), the published file
-    /// is moved there as it is, without being read: the share's logs directory is the
-    /// Bridge's to write, not the SMB account's. True once done.
+    /// is moved there as it is, without being read: the private logs directory is the Bridge's to write. True once done.
     /// </summary>
     private bool KeepPreviousMarkers(PreviousMarkers previous)
     {
@@ -257,8 +263,8 @@ public sealed class VrchatLogService : BackgroundService
 
     /// <summary>
     /// Tmp-then-rename like ResultWriter, except that a destination held open by the
-    /// Mac's SMB client is replaced with POSIX semantics rather than failing every poll
-    /// (see SharedFileWriter). A failure is logged once per file and problem.
+    /// API reader is replaced atomically rather than observing a partial write
+    /// (see PrivateSnapshotWriter). A failure is logged once per file and problem.
     /// </summary>
     private bool Publish(string path, string content)
     {
@@ -267,13 +273,13 @@ public sealed class VrchatLogService : BackgroundService
             Directory.CreateDirectory(Path.GetDirectoryName(path)!);
             if (!_writers.TryGetValue(path, out var writer))
             {
-                writer = new SharedFileWriter(_logger);
+                writer = new PrivateSnapshotWriter(_logger);
                 _writers[path] = writer;
             }
 
             var outcome = writer.Write(path, content);
             _lastWriteProblem.Remove(path);
-            return outcome != SharedFileWriteOutcome.DestinationBusy;
+            return outcome != SnapshotWriteOutcome.DestinationBusy;
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {

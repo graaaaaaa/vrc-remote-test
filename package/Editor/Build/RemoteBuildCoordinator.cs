@@ -38,7 +38,9 @@ namespace VRCRemoteTest
         /// </summary>
         public bool IsRunning => _executionLock.CurrentCount == 0;
 
-        public bool IsShareReachable => _transport.IsAvailable;
+        public bool IsBridgeReachable => _transport.IsAvailable;
+
+        internal void ProbeBridgeForHeadless() => _transport.ProbeAsync().GetAwaiter().GetResult();
 
         public bool IsSdkAvailable => _sdkAdapter.IsAvailable;
 
@@ -63,6 +65,11 @@ namespace VRCRemoteTest
         public string GetClientLog(int slot) => _transport.PollClientLog(slot);
 
         public string GetClientMarkers(int slot) => _transport.PollClientMarkers(slot);
+
+        public Task DownloadFullLogAsync(int slot, long clientGeneration, long observationEpoch,
+            string destinationPath, CancellationToken cancellationToken = default) =>
+            _transport.DownloadFullLogAsync(slot, clientGeneration, observationEpoch,
+                destinationPath, cancellationToken);
 
         /// <summary>
         /// Set as soon as SHA-256 has been computed for a successful SDK
@@ -112,11 +119,11 @@ namespace VRCRemoteTest
                 var pollInterval = TimeSpan.FromSeconds(RemoteTestSettings.PollIntervalSeconds);
 
                 Report(progress, RemoteBuildStatus.Running, "Running preflight checks...");
-                RunPreflight();
+                await RunPreflightAsync(cancellationToken);
 
                 Report(progress, RemoteBuildStatus.Running, "Building Windows world...");
                 cancellationToken.ThrowIfCancellationRequested();
-                var sdkPath = await _sdkAdapter.BuildWindowsWorldAsync().ConfigureAwait(false);
+                var sdkPath = await _sdkAdapter.BuildWindowsWorldAsync();
                 cancellationToken.ThrowIfCancellationRequested();
 
                 Report(progress, RemoteBuildStatus.Running, "Resolving build artifact...");
@@ -187,7 +194,7 @@ namespace VRCRemoteTest
                     CreatedAtUtc = DateTimeOffset.UtcNow,
                 };
 
-                Report(progress, RemoteBuildStatus.Running, "Uploading to remote share...");
+                Report(progress, RemoteBuildStatus.Running, "Uploading to Windows Bridge...");
                 await _transport.UploadBuildAsync(artifact, manifest, buildId, cancellationToken).ConfigureAwait(false);
                 Debug.Log($"[VRC Remote Test] Upload complete. Build ID: {buildId}");
 
@@ -279,7 +286,7 @@ namespace VRCRemoteTest
                 }
 
                 Report(progress, RemoteBuildStatus.Running, "Running preflight checks...");
-                RunPreflight();
+                await RunPreflightAsync(cancellationToken);
 
                 var resultTimeout = TimeSpan.FromSeconds(RemoteTestSettings.ResultTimeoutSeconds);
                 var pollInterval = TimeSpan.FromSeconds(RemoteTestSettings.PollIntervalSeconds);
@@ -311,7 +318,7 @@ namespace VRCRemoteTest
             }
         }
 
-        private void RunPreflight()
+        private async Task RunPreflightAsync(CancellationToken cancellationToken)
         {
             if (EditorApplication.isPlaying)
             {
@@ -319,12 +326,7 @@ namespace VRCRemoteTest
                     ErrorCode.PlayModeActive, "Cannot start a remote build while in Play Mode.");
             }
 
-            if (!_transport.IsAvailable)
-            {
-                throw new RemoteBuildException(
-                    ErrorCode.RemoteShareUnavailable,
-                    "Remote share is not available. Check that the SMB share is mounted and writable.");
-            }
+            await _transport.ProbeAsync(cancellationToken);
         }
 
         private async Task<BuildResult> PollForResultAsync(
@@ -336,7 +338,7 @@ namespace VRCRemoteTest
             {
                 cancellationToken.ThrowIfCancellationRequested();
 
-                var result = _transport.PollResult(buildId);
+                var result = await _transport.PollResultAsync(buildId, cancellationToken).ConfigureAwait(false);
                 if (result != null)
                 {
                     if (!IsValidResult(result, buildId))

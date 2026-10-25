@@ -9,14 +9,13 @@ namespace VRCRemoteTest.Tests
     /// (package/Editor/AssemblyInfo.cs) to reach the internal API surface.
     ///
     /// Deliberately does NOT call RemoteBuildCommand.GetCoordinator() in these
-    /// tests: it constructs a real SmbRemoteTransport against
-    /// RemoteTestSettings.SharePath, which depends on this machine's
-    /// EditorPrefs/CLI/env configuration rather than test-controlled state.
+    /// tests: it constructs a real LAN transport using this machine's pairing
+    /// configuration rather than test-controlled state.
     /// The IsRunning-guard branch itself is exercised directly against
     /// RemoteBuildCoordinator with fakes in RemoteBuildCoordinatorTests
     /// (IsRunning_reflects_in_flight_build); what's specific to
     /// RemoteBuildCommand and safe to test here is the no-coordinator-yet
-    /// short-circuit path, which never touches SharePath.
+    /// short-circuit path, which never reads the pairing configuration.
     /// </summary>
     public class RemoteBuildCommandTests
     {

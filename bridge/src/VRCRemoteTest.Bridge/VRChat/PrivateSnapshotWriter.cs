@@ -7,7 +7,7 @@ using Microsoft.Win32.SafeHandles;
 
 namespace VRCRemoteTest.Bridge.VRChat;
 
-internal enum SharedFileWriteOutcome
+internal enum SnapshotWriteOutcome
 {
     /// <summary>The normal tmp-then-rename path.</summary>
     Replaced,
@@ -20,17 +20,13 @@ internal enum SharedFileWriteOutcome
 }
 
 /// <summary>
-/// Publishes a file that Unity polls over SMB from the Mac (logs/vrchat-latest.log,
-/// status/vrchat-status.json) with the same tmp-then-rename pattern as ResultWriter.
+/// Atomically publishes private status and log snapshots served by the LAN API.
 ///
 /// That rename cannot replace a destination that is open: on Windows,
 /// File.Move(overwrite: true) fails with UnauthorizedAccessException ("Access to the
 /// path is denied.", no path) while any handle is open on the destination, even one
-/// that shares Read|Write|Delete. The Mac's SMB client can get into a state where it
-/// keeps exactly such a handle open on the server for hours (observed 2026-10-17: held
-/// by PID 4 "System", i.e. the SMB server, sharing Read|Write|Delete, until the share
-/// was remounted on the Mac; vrchat-latest.log stopped updating while an ERR with a
-/// stack trace was logged every 5s).
+/// that shares Read|Write|Delete. An API reader can hold a file briefly during
+/// a download.
 ///
 /// In that case the tmp file is renamed over the destination with POSIX semantics
 /// (FileRenameInfoEx, REPLACE_IF_EXISTS | POSIX_SEMANTICS), which Windows allows when
@@ -38,15 +34,12 @@ internal enum SharedFileWriteOutcome
 /// new file ID, so a new open sees the new content, while the reader's existing handle
 /// keeps the old, unlinked file. The replacement stays atomic.
 ///
-/// Rewriting the destination in place was tried first and did not work: while the
-/// Mac held the handle, its SMB client kept serving the old cached content, cut to the
-/// new size and padded with NULs, so Unity could not parse vrchat-status.json. With a
-/// new file, a client that keeps using its old handle sees the old content intact.
+/// Rewriting in place is avoided so every reader sees one complete snapshot.
 ///
 /// Outcome changes are logged once, not on every poll. Not thread-safe: each instance
 /// belongs to a single polling loop.
 /// </summary>
-internal sealed class SharedFileWriter
+internal sealed class PrivateSnapshotWriter
 {
     private const int ErrorAccessDenied = 5;
     private const int ErrorSharingViolation = 32;
@@ -56,14 +49,14 @@ internal sealed class SharedFileWriter
     private static readonly Encoding Utf8NoBom = new UTF8Encoding(encoderShouldEmitUTF8Identifier: false);
 
     private readonly ILogger _logger;
-    private SharedFileWriteOutcome _lastOutcome = SharedFileWriteOutcome.Replaced;
+    private SnapshotWriteOutcome _lastOutcome = SnapshotWriteOutcome.Replaced;
 
-    public SharedFileWriter(ILogger logger)
+    public PrivateSnapshotWriter(ILogger logger)
     {
         _logger = logger;
     }
 
-    public SharedFileWriteOutcome Write(string finalPath, string content)
+    public SnapshotWriteOutcome Write(string finalPath, string content)
     {
         var outcome = WriteCore(Path.GetFullPath(finalPath), content);
         if (outcome != _lastOutcome)
@@ -75,7 +68,7 @@ internal sealed class SharedFileWriter
         return outcome;
     }
 
-    private static SharedFileWriteOutcome WriteCore(string finalPath, string content)
+    private static SnapshotWriteOutcome WriteCore(string finalPath, string content)
     {
         var tempPath = finalPath + ".tmp";
 
@@ -83,7 +76,7 @@ internal sealed class SharedFileWriter
         try
         {
             File.Move(tempPath, finalPath, overwrite: true);
-            return SharedFileWriteOutcome.Replaced;
+            return SnapshotWriteOutcome.Replaced;
         }
         catch (UnauthorizedAccessException) when (File.Exists(finalPath))
         {
@@ -102,16 +95,16 @@ internal sealed class SharedFileWriter
     /// the POSIX rename too and is thrown from here.
     /// </summary>
     [SupportedOSPlatform("windows")]
-    private static SharedFileWriteOutcome ReplaceWhileHeldOpen(string tempPath, string finalPath)
+    private static SnapshotWriteOutcome ReplaceWhileHeldOpen(string tempPath, string finalPath)
     {
         var error = PosixRename.TryReplace(tempPath, finalPath);
         switch (error)
         {
             case 0:
-                return SharedFileWriteOutcome.ReplacedWhileHeldOpen;
+                return SnapshotWriteOutcome.ReplacedWhileHeldOpen;
             case ErrorSharingViolation or ErrorLockViolation:
                 File.Delete(tempPath);
-                return SharedFileWriteOutcome.DestinationBusy;
+                return SnapshotWriteOutcome.DestinationBusy;
             case ErrorAccessDenied:
                 throw new UnauthorizedAccessException($"Access to the path '{finalPath}' is denied.");
             default:
@@ -121,17 +114,17 @@ internal sealed class SharedFileWriter
         }
     }
 
-    private void LogOutcomeChange(string finalPath, SharedFileWriteOutcome outcome)
+    private void LogOutcomeChange(string finalPath, SnapshotWriteOutcome outcome)
     {
         switch (outcome)
         {
-            case SharedFileWriteOutcome.ReplacedWhileHeldOpen:
+            case SnapshotWriteOutcome.ReplacedWhileHeldOpen:
                 _logger.LogInformation(
-                    "{Path} is held open by a reader (typically the Mac's SMB client); " +
+                    "{Path} is held open by a reader; " +
                     "replacing it with POSIX semantics so that new opens see the new file.",
                     finalPath);
                 break;
-            case SharedFileWriteOutcome.DestinationBusy:
+            case SnapshotWriteOutcome.DestinationBusy:
                 _logger.LogWarning(
                     "{Path} is held open by a reader that does not allow it to be replaced; " +
                     "it will not be updated until that reader releases it.",

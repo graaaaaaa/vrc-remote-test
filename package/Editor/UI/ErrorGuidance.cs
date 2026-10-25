@@ -61,13 +61,10 @@ namespace VRCRemoteTest
             [ErrorCode.InvalidBuildTarget] =
                 "The active Build Target is not Windows. Switch to StandaloneWindows64 via " +
                 "File > Build Settings.",
-            [ErrorCode.RemoteShareUnavailable] =
-                "The configured SMB share is not reachable. Check that it's mounted and the path is correct.",
-            [ErrorCode.RemoteShareNotWritable] =
-                "The configured SMB share is mounted but not writable. Check share and NTFS permissions.",
+            [ErrorCode.BridgeUnavailable] =
+                "Windows Bridge is unavailable. Check its LAN address, firewall rule and pairing.",
             [ErrorCode.UploadFailed] =
-                "The build failed to upload to the remote share. Check your network connection and " +
-                "share permissions.",
+                "The build failed to upload to Windows Bridge. Check the LAN connection and Bridge logs.",
             [ErrorCode.BuildAlreadyRunning] =
                 "A remote build is already in progress. Wait for it to finish before starting another.",
             [ErrorCode.PlayModeActive] =

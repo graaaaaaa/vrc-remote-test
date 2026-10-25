@@ -5,15 +5,15 @@ namespace VRCRemoteTest.Tests
 {
     public class RemoteTestSettingsTests
     {
-        private const string SharePathKey = "VRCRemoteTest_SharePath";
+        private const string BridgeUrlKey = "VRCRemoteTest_BridgeUrl";
         private const string TimeoutKey = "VRCRemoteTest_ResultTimeoutSeconds";
         private const string IntervalKey = "VRCRemoteTest_PollIntervalSeconds";
         private const string LogAutoRefreshKey = "VRCRemoteTest_LogAutoRefresh";
         private const string MoonlightApplicationNameKey = "VRCRemoteTest_MoonlightApplicationName";
         private const string FocusMoonlightAfterDeployKey = "VRCRemoteTest_FocusMoonlightAfterDeploy";
 
-        private string _originalSharePath;
-        private bool _hadSharePath;
+        private string _originalBridgeUrl;
+        private bool _hadBridgeUrl;
         private int _originalTimeout;
         private int _originalInterval;
         private bool _originalLogAutoRefresh;
@@ -23,8 +23,8 @@ namespace VRCRemoteTest.Tests
         [SetUp]
         public void SetUp()
         {
-            _hadSharePath = EditorPrefs.HasKey(SharePathKey);
-            _originalSharePath = EditorPrefs.GetString(SharePathKey, string.Empty);
+            _hadBridgeUrl = EditorPrefs.HasKey(BridgeUrlKey);
+            _originalBridgeUrl = EditorPrefs.GetString(BridgeUrlKey, string.Empty);
             _originalTimeout = EditorPrefs.GetInt(TimeoutKey, 60);
             _originalInterval = EditorPrefs.GetInt(IntervalKey, 2);
             _originalLogAutoRefresh = EditorPrefs.GetBool(LogAutoRefreshKey, true);
@@ -35,13 +35,13 @@ namespace VRCRemoteTest.Tests
         [TearDown]
         public void TearDown()
         {
-            if (_hadSharePath)
+            if (_hadBridgeUrl)
             {
-                EditorPrefs.SetString(SharePathKey, _originalSharePath);
+                EditorPrefs.SetString(BridgeUrlKey, _originalBridgeUrl);
             }
             else
             {
-                EditorPrefs.DeleteKey(SharePathKey);
+                EditorPrefs.DeleteKey(BridgeUrlKey);
             }
 
             EditorPrefs.SetInt(TimeoutKey, _originalTimeout);
@@ -52,22 +52,22 @@ namespace VRCRemoteTest.Tests
         }
 
         [Test]
-        public void TryGetSharePath_returns_true_when_configured()
+        public void TryGetBridgeUrl_returns_true_when_configured()
         {
-            EditorPrefs.SetString(SharePathKey, "/Volumes/VRCRemoteTest");
+            EditorPrefs.SetString(BridgeUrlKey, "https://192.0.2.1:38443");
 
-            var found = RemoteTestSettings.TryGetSharePath(out var path);
+            var found = RemoteTestSettings.TryGetBridgeUrl(out var path);
 
             Assert.IsTrue(found);
-            Assert.AreEqual("/Volumes/VRCRemoteTest", path);
+            Assert.AreEqual("https://192.0.2.1:38443", path);
         }
 
         [Test]
-        public void TryGetSharePath_returns_false_when_not_configured()
+        public void TryGetBridgeUrl_returns_false_when_not_configured()
         {
-            EditorPrefs.DeleteKey(SharePathKey);
+            EditorPrefs.DeleteKey(BridgeUrlKey);
 
-            var found = RemoteTestSettings.TryGetSharePath(out var path);
+            var found = RemoteTestSettings.TryGetBridgeUrl(out var path);
 
             Assert.IsFalse(found);
             Assert.IsNull(path);

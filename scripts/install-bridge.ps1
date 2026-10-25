@@ -9,15 +9,10 @@
     タスクを登録する。BridgeはWindows Serviceにしない設計（仕様書§20）の
     ため、対話ユーザーセッション上でのみ動作させる必要がある。
 
-    既定の配置先はSMB共有（StagingDirectory）の外側にある
-    %LOCALAPPDATA%\Programs\VRCRemoteTest\Bridge\ 。SMB共有内に実行体を
-    置くと、共有への書き込み権限を持つ者が実行体を差し替えることで
-    ログオン時に自動実行されるコードを乗っ取れてしまうため
-    （Codex計画レビューで検出）、意図的にSMB共有の外に配置する。
+    既定の配置先は %LOCALAPPDATA%\Programs\VRCRemoteTest\Bridge\ 。
+    -ExpectedSha256 は必須。-SourcePath からコピーした実行体を
+    配置先で検証してから置き換える。
 
-    -ExpectedSha256 は必須。-SourcePath（例: SMB共有内の一時drop位置
-    C:\VRCRemoteTest\_bridge-drop\VRCRemoteTest.Bridge.exe）は共有への
-    書き込み権限を持つ者が差し替えられるため、そのまま信用しない。
     配置先ディレクトリ内に新しい候補ファイルを作ってコピーし、その候補の
     SHA-256 を照合してから、同じディレクトリ内の rename で ExePath に置き換える。
     照合後にコピー元を読み直すことはない（セキュリティレビュー S8）。
@@ -25,8 +20,7 @@
     0.5 秒おきに最大 10 回まで入れ直す（Bridge を止めた直後は、exe の置き換えが
     しばらく拒否されることがあるため）。
 
-    期待するハッシュは、共有以外の経路で用意すること。共有内の .sha256 や、
-    侵害されている可能性のある端末が出した値では真正性の保証にならない。
+    期待するハッシュは、公開された信頼できる経路で確認すること。
     出所の選び方は docs/setup-windows.md の手順1を参照。
 
     配置先は %LOCALAPPDATA% の下に限り、現在のユーザー・SYSTEM・Administrators
@@ -63,7 +57,7 @@
     .\install-bridge.ps1 -ExpectedSha256 <64桁のハッシュ>
 
 .EXAMPLE
-    .\install-bridge.ps1 -ExpectedSha256 <64桁のハッシュ> -SourcePath C:\VRCRemoteTest\_bridge-drop\VRCRemoteTest.Bridge.exe -StartNow
+    .\install-bridge.ps1 -ExpectedSha256 <64桁のハッシュ> -SourcePath C:\Users\USER\Downloads\VRCRemoteTest.Bridge.exe -StartNow
 #>
 
 [CmdletBinding()]

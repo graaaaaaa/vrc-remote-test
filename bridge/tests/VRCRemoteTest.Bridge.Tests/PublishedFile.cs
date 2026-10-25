@@ -7,7 +7,7 @@ internal static class PublishedFile
 {
     /// <summary>
     /// Opened sharing read, write and delete access, as the Mac's SMB client does. A reader
-    /// that does not share delete access makes SharedFileWriter skip the write on Windows
+    /// that does not share delete access makes PrivateSnapshotWriter skip the write on Windows
     /// (DestinationBusy) until the next poll, so a test polling with File.ReadAllText could
     /// itself keep a write that only a wake triggers from ever landing.
     /// </summary>

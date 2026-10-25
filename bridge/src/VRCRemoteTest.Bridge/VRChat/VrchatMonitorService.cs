@@ -52,7 +52,7 @@ public sealed class VrchatMonitorService : BackgroundService
         _pollInterval = pollInterval;
     }
 
-    private string StatusDirectory => Path.Combine(_options.StagingDirectory, "status");
+    private string StatusDirectory => Path.Combine(_options.StateDirectory, "status");
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {

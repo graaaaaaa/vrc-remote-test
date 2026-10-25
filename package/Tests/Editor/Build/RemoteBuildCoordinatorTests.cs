@@ -86,17 +86,17 @@ namespace VRCRemoteTest.Tests
         }
 
         [Test]
-        public void Share_unavailable_fails_at_preflight_before_building()
+        public void Bridge_unavailable_fails_at_preflight_before_building()
         {
             var sdkAdapter = new FakeVrcSdkBuildAdapter { ReturnedPath = _validArtifactPath };
             var transport = new FakeRemoteTransport { IsAvailable = false };
             var coordinator = new RemoteBuildCoordinator(sdkAdapter, transport);
 
-            LogAssert.Expect(LogType.Error, new Regex(@"^\[VRC Remote Test\] REMOTE_SHARE_UNAVAILABLE:"));
+            LogAssert.Expect(LogType.Error, new Regex(@"^\[VRC Remote Test\] BRIDGE_UNAVAILABLE:"));
             var outcome = coordinator.ExecuteRemoteBuildAsync().GetAwaiter().GetResult();
 
             Assert.IsFalse(outcome.Succeeded);
-            Assert.AreEqual(ErrorCode.RemoteShareUnavailable, outcome.ErrorCode);
+            Assert.AreEqual(ErrorCode.BridgeUnavailable, outcome.ErrorCode);
             Assert.AreEqual(0, sdkAdapter.BuildCallCount);
         }
 
