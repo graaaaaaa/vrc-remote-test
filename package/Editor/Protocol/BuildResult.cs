@@ -4,8 +4,8 @@ using Newtonsoft.Json;
 namespace VRCRemoteTest
 {
     /// <summary>
-    /// Wire format for the single per-build result file the Bridge writes under
-    /// `{stagingDirectory}/results/{buildId}.json`. Must match
+    /// Wire format for the per-build result returned by the Bridge HTTPS API.
+    /// Must match
     /// bridge/src/VRCRemoteTest.Bridge/Protocol/BuildResult.cs exactly.
     /// Unity treats this as untrusted input and must validate it (see
     /// RemoteBuildCoordinator.IsValidResult) before acting on it.

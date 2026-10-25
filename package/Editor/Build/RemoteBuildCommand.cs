@@ -1,5 +1,6 @@
 using System;
 using UnityEditor;
+using UnityEditor.SceneManagement;
 using UnityEngine;
 
 namespace VRCRemoteTest
@@ -9,7 +10,7 @@ namespace VRCRemoteTest
     /// in-process concurrency guard actually applies across both):
     ///
     /// - <see cref="ExecuteRemoteBuildHeadless"/>: for `-batchmode -executeMethod`
-    ///   / CI. Blocks synchronously and sets the process exit code.
+    ///   / CI. Keeps the Editor running until the async SDK build finishes.
     /// - <see cref="ExecuteRemoteBuildFromMenu"/>: for the interactive Unity menu.
     ///   Fire-and-forget `async void` is fine here since there is no batch-mode
     ///   process lifecycle to race against.
@@ -17,6 +18,7 @@ namespace VRCRemoteTest
     public static class RemoteBuildCommand
     {
         private static RemoteBuildCoordinator _coordinator;
+        private static bool _headlessStarted;
 
         /// <summary>
         /// internal (not private) so RemoteTestWindow shares the same
@@ -30,7 +32,10 @@ namespace VRCRemoteTest
             if (_coordinator == null)
             {
                 var sdkAdapter = new VrcSdkBuildAdapter();
-                var transport = new SmbRemoteTransport(RemoteTestSettings.SharePath);
+                var transport = new LanRemoteTransport(
+                    RemoteTestSettings.BridgeUrl,
+                    RemoteTestSettings.BridgeFingerprint,
+                    RemoteTestSettings.BridgeToken);
                 _coordinator = new RemoteBuildCoordinator(sdkAdapter, transport);
             }
 
@@ -38,7 +43,7 @@ namespace VRCRemoteTest
         }
 
         /// <summary>
-        /// Call after SharePath changes so the next build picks up the new
+        /// Call after pairing changes so the next build picks up the new
         /// value — the coordinator caches its IRemoteTransport at construction
         /// time. Returns false (and leaves the existing coordinator in place)
         /// if a build is currently running: discarding it mid-flight would
@@ -59,22 +64,41 @@ namespace VRCRemoteTest
 
         /// <summary>
         /// Headless/CI entry point:
-        /// `Unity.exe -batchmode -quit -projectPath &lt;path&gt; -executeMethod VRCRemoteTest.RemoteBuildCommand.ExecuteRemoteBuildHeadless`.
+        /// `Unity.exe -batchmode -projectPath &lt;path&gt; -executeMethod VRCRemoteTest.RemoteBuildCommand.ExecuteRemoteBuildHeadless`.
         ///
-        /// Deliberately synchronous (`.GetAwaiter().GetResult()`), not
-        /// `async void`: Unity's -executeMethod machinery can consider the
-        /// method "done" at the first incomplete await and let -quit proceed
-        /// before an async continuation runs, so an async-void entry point is
-        /// not reliable here (Codex plan review Round 3, confidence 0.84).
+        /// Do not pass -quit: the SDK awaits on Unity's synchronization context
+        /// while exporting a scene, so blocking this thread deadlocks the build.
+        /// RunHeadlessAsync calls EditorApplication.Exit when it has a result.
         /// </summary>
         public static void ExecuteRemoteBuildHeadless()
+        {
+            if (_headlessStarted) return;
+            _headlessStarted = true;
+            RunHeadlessAsync();
+        }
+
+        private static async void RunHeadlessAsync()
         {
             var exitCode = 1;
             try
             {
+                var scenePath = Environment.GetEnvironmentVariable("VRC_REMOTE_TEST_SCENE_PATH");
+                if (!string.IsNullOrWhiteSpace(scenePath))
+                {
+                    if (!scenePath.StartsWith("Assets/", StringComparison.Ordinal)
+                        || !scenePath.EndsWith(".unity", StringComparison.OrdinalIgnoreCase)
+                        || scenePath.Contains("..")
+                        || AssetDatabase.LoadAssetAtPath<SceneAsset>(scenePath) == null)
+                        throw new ArgumentException("VRC_REMOTE_TEST_SCENE_PATH must name a saved scene under Assets/.");
+                    EditorSceneManager.OpenScene(scenePath, OpenSceneMode.Single);
+                }
+
                 var progress = new Progress<RemoteBuildProgress>(
                     p => Debug.Log($"[VRC Remote Test] [{p.Status}] {p.Message}"));
-                var outcome = GetCoordinator().ExecuteRemoteBuildAsync(progress).GetAwaiter().GetResult();
+                var coordinator = GetCoordinator();
+                if (Application.isBatchMode && coordinator.IsBridgeReachable == false)
+                    coordinator.ProbeBridgeForHeadless();
+                var outcome = await coordinator.ExecuteRemoteBuildAsync(progress);
                 exitCode = outcome.Succeeded ? 0 : 1;
             }
             catch (Exception ex)

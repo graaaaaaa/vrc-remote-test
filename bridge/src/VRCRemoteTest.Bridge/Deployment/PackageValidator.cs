@@ -9,8 +9,7 @@ namespace VRCRemoteTest.Bridge.Deployment;
 /// VRChat's live Worlds directory. This is the single security choke point for v1
 /// (confirmed sufficient via Codex plan review): filename allow-listing, path
 /// containment (implied by rejecting any separator in fileName), size limits, and
-/// SHA-256 integrity. Authentication beyond SMB share ACLs (e.g. HMAC-signed
-/// manifests) is deferred to v1.1.
+/// SHA-256 integrity. Authentication is enforced by BridgeLanApi before artifacts enter the private queue.
 /// </summary>
 public sealed partial class PackageValidator : IPackageValidator
 {

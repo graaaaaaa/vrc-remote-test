@@ -6,16 +6,18 @@ namespace VRCRemoteTest
     /// <summary>
     /// Real testability boundary (Codex plan review Round 3, confidence 0.92):
     /// the coordinator's tests substitute a fake here rather than touching a
-    /// real SMB mount.
+    /// real network endpoint.
     /// </summary>
     public interface IRemoteTransport
     {
-        /// <summary>Whether the remote share is mounted and writable.</summary>
+        /// <summary>Last observed connection status, for display only.</summary>
         bool IsAvailable { get; }
 
+        /// <summary>Authenticate and check API/protocol versions before building.</summary>
+        Task ProbeAsync(CancellationToken cancellationToken = default);
+
         /// <summary>
-        /// Uploads the artifact and manifest to the remote staging area using
-        /// the atomic .part-then-rename protocol (spec section 17).
+        /// Uploads and commits the artifact over authenticated HTTPS.
         /// </summary>
         Task UploadBuildAsync(
             BuildArtifact artifact,
@@ -24,12 +26,9 @@ namespace VRCRemoteTest
             CancellationToken cancellationToken = default);
 
         /// <summary>
-        /// Polls for a result file at results/{buildId}.json. Returns null if
-        /// the file does not exist yet or could not be read (transient I/O
-        /// race with the Bridge's own atomic write) — callers should keep
-        /// polling in that case, not treat it as failure.
+        /// Returns null until the Bridge has published a result.
         /// </summary>
-        BuildResult PollResult(string buildId);
+        Task<BuildResult> PollResultAsync(string buildId, CancellationToken cancellationToken = default);
 
         /// <summary>
         /// Reads the Bridge's continuously-updated status/vrchat-status.json
@@ -67,5 +66,9 @@ namespace VRCRemoteTest
         /// unreadable or over the guard.
         /// </summary>
         string PollClientMarkers(int slot);
+
+        /// <summary>Save a redacted, complete snapshot of the selected client log.</summary>
+        Task DownloadFullLogAsync(int slot, long clientGeneration, long observationEpoch,
+            string destinationPath, CancellationToken cancellationToken = default);
     }
 }

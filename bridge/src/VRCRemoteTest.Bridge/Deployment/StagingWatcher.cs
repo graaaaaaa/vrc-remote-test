@@ -10,27 +10,23 @@ using VRCRemoteTest.Bridge.VRChat;
 namespace VRCRemoteTest.Bridge.Deployment;
 
 /// <summary>
-/// The Bridge's core loop. Deliberately a "file promoter", not an orchestration
-/// service: watch a staging directory, validate, atomically install into VRChat's
-/// Worlds directory, write one result file, archive or quarantine. No heartbeat; with
+/// The Bridge's private build queue. HTTP uploads are committed atomically into
+/// state/incoming, validated, then installed into VRChat's Worlds directory.
+/// With
 /// AutoLaunchVrchat, the VRChat side of a deploy is delegated to
 /// <see cref="IVrchatClientCoordinator"/>. Uses periodic polling as the
 /// source of truth per spec section 51; a FileSystemWatcher can be layered on later
 /// purely as a wake-up optimization without changing correctness.
 ///
-/// Trust boundary: everything under the SMB share can be rewritten by the SMB
-/// account at any time, so the Bridge never moves a shared file into its own state
-/// (a same-volume move keeps the uploader's security descriptor) and never reopens
-/// a shared file after validating it. Instead it copies bounded bytes into new
-/// files under <see cref="BridgeOptions.StateDirectory"/>, validates that private
-/// snapshot, and installs from the same snapshot (security review S7/S15).
+/// HTTP request data is untrusted, so the processor still validates a private
+/// snapshot and installs from that same snapshot.
 /// </summary>
 public sealed class StagingWatcher : BackgroundService, IBridgeWatcher
 {
     private static readonly TimeSpan ScanInterval = TimeSpan.FromSeconds(5);
 
     /// <summary>
-    /// Real manifests are a few hundred bytes; the cap only exists so an SMB writer
+    /// Real manifests are a few hundred bytes; the cap exists so a remote sender
     /// cannot make the Bridge buffer an arbitrarily large file.
     /// </summary>
     internal const int MaxManifestBytes = 64 * 1024;
@@ -78,11 +74,11 @@ public sealed class StagingWatcher : BackgroundService, IBridgeWatcher
         _logger = logger;
     }
 
-    // Shared with the Mac over SMB.
-    private string IncomingDir => Path.Combine(_options.StagingDirectory, "incoming");
-    private string ResultsDir => Path.Combine(_options.StagingDirectory, "results");
+    // HTTP commits arrive in a private queue; no directory is network-shared.
+    private string IncomingDir => Path.Combine(_options.StateDirectory, "incoming");
+    private string ResultsDir => Path.Combine(_options.StateDirectory, "results");
 
-    // Bridge-private, outside the share.
+    // Bridge-private processing and idempotency records.
     private string ProcessingDir => Path.Combine(_options.StateDirectory, "processing");
     private string ArchiveDir => Path.Combine(_options.StateDirectory, "archive");
     private string FailedDir => Path.Combine(_options.StateDirectory, "failed");
@@ -97,8 +93,6 @@ public sealed class StagingWatcher : BackgroundService, IBridgeWatcher
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         EnsureDirectoriesExist();
-        WarnAboutLegacySharedState();
-
         await RecoverProcessingAsync(stoppingToken);
 
         while (!stoppingToken.IsCancellationRequested)
@@ -109,7 +103,7 @@ public sealed class StagingWatcher : BackgroundService, IBridgeWatcher
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
-                _logger.LogError(ex, "Unhandled error while scanning staging directory.");
+                _logger.LogError(ex, "Unhandled error while scanning the private build queue.");
             }
 
             try
@@ -151,14 +145,19 @@ public sealed class StagingWatcher : BackgroundService, IBridgeWatcher
     }
 
     /// <summary>
-    /// Only private state is recovered. Partial snapshots left by a crash are never
-    /// trusted, only discarded: the retried claim copies again from incoming/ or
-    /// reports ArtifactNotFound. Builds left in a pre-upgrade shared processing/
-    /// directory are deliberately not imported (see <see cref="WarnAboutLegacySharedState"/>).
+    /// Partial snapshots left by a crash are discarded. Committed manifests are
+    /// recovered from private processing/.
     /// </summary>
     internal async Task RecoverProcessingAsync(CancellationToken cancellationToken)
     {
         EnsureDirectoriesExist();
+
+        // An HTTP upload that was interrupted by a process crash can leave only
+        // a private .part file. It was never committed and is safe to discard.
+        foreach (var partial in Directory.EnumerateFiles(IncomingDir, $"*{PartialSuffix}"))
+        {
+            SafeDelete(partial);
+        }
 
         foreach (var partial in Directory.EnumerateFiles(ProcessingDir, $"*{PartialSuffix}"))
         {
@@ -183,22 +182,6 @@ public sealed class StagingWatcher : BackgroundService, IBridgeWatcher
         Directory.CreateDirectory(ProcessingDir);
         Directory.CreateDirectory(ArchiveDir);
         Directory.CreateDirectory(FailedDir);
-    }
-
-    private void WarnAboutLegacySharedState()
-    {
-        foreach (var name in new[] { "processing", "archive", "failed" })
-        {
-            var legacyDirectory = Path.Combine(_options.StagingDirectory, name);
-            if (Directory.Exists(legacyDirectory))
-            {
-                _logger.LogWarning(
-                    "Ignoring legacy {LegacyDirectory} inside the share: Bridge state now lives in {StateDirectory} " +
-                    "and is never read back from the share. Remove it manually (see docs/setup-windows.md).",
-                    legacyDirectory,
-                    _options.StateDirectory);
-            }
-        }
     }
 
     private async Task ClaimAndProcessAsync(string readyFilePath, CancellationToken cancellationToken)
@@ -732,7 +715,7 @@ public sealed class StagingWatcher : BackgroundService, IBridgeWatcher
         Path.Combine(Path.GetDirectoryName(finalPath)!, $"{Guid.NewGuid():N}{PartialSuffix}");
 
     /// <summary>
-    /// A standard SMB account normally cannot create links, but a shared file that is
+    /// An incoming file that is
     /// one would make the Bridge read (and snapshot) whatever it points at, so links
     /// are never ingested (Codex code review Phase 0, Round 1).
     /// </summary>
@@ -783,7 +766,7 @@ public sealed class StagingWatcher : BackgroundService, IBridgeWatcher
     /// A manifest named after a build that was already processed is a late copy, not a
     /// new upload (Unity never reuses a build id). On 2026-10-18 the Bridge consumed a
     /// manifest 5 ms after the Mac renamed it into place, and 5 ms later an empty file
-    /// with the same name appeared in incoming/: the Mac's SMB client wrote an extended
+    /// with the same name appeared in incoming/: an older sender wrote an extended
     /// attribute (a named stream) to the name, which on NTFS creates the file with an
     /// empty main stream. The next scan reported MANIFEST_INVALID for it, replacing the
     /// deployed result (docs/validation/smb-late-empty-manifest.md). Such a copy is deleted; the build's result and whatever failed/ keeps for it stay

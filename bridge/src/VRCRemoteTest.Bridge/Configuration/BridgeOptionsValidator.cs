@@ -1,4 +1,5 @@
 using Microsoft.Extensions.Options;
+using System.Net;
 
 namespace VRCRemoteTest.Bridge.Configuration;
 
@@ -24,12 +25,21 @@ public sealed class BridgeOptionsValidator : IValidateOptions<BridgeOptions>
     {
         var failures = new List<string>();
 
-        if (string.IsNullOrWhiteSpace(options.StagingDirectory))
+        ValidateStateDirectory(options, failures);
+
+        if (!IPAddress.TryParse(options.LanBindAddress, out var bindAddress)
+            || IPAddress.IsLoopback(bindAddress)
+            || bindAddress.Equals(IPAddress.Any)
+            || bindAddress.Equals(IPAddress.IPv6Any)
+            || bindAddress.IsIPv6Multicast)
         {
-            failures.Add("StagingDirectory must be configured.");
+            failures.Add("LanBindAddress must be a specific non-loopback LAN IP address.");
         }
 
-        ValidateStateDirectory(options, failures);
+        if (options.LanPort is < 1024 or > 65535)
+        {
+            failures.Add("LanPort must be between 1024 and 65535.");
+        }
 
         if (string.IsNullOrWhiteSpace(options.VrchatWorldsDirectory))
         {
@@ -258,10 +268,8 @@ public sealed class BridgeOptionsValidator : IValidateOptions<BridgeOptions>
     }
 
     /// <summary>
-    /// StateDirectory holds everything the Bridge trusts after ingestion, so it
-    /// must never be reachable through the SMB share. Both paths are
-    /// canonicalized first: a lexical comparison alone would accept
-    /// "C:\VRCRemoteTest2\..\VRCRemoteTest\state" as outside the staging root.
+    /// StateDirectory holds all uploaded and published data. It must be local
+    /// and must not be a link into an untrusted directory.
     /// </summary>
     private static void ValidateStateDirectory(BridgeOptions options, List<string> failures)
     {
@@ -285,30 +293,14 @@ public sealed class BridgeOptionsValidator : IValidateOptions<BridgeOptions>
             return;
         }
 
-        if (string.IsNullOrWhiteSpace(options.StagingDirectory))
-        {
-            // Already reported above; nothing to compare against.
-            return;
-        }
-
         string state;
-        string staging;
         try
         {
             state = NormalizeDirectory(stateDirectory);
-            staging = NormalizeDirectory(options.StagingDirectory);
         }
         catch (Exception ex) when (ex is ArgumentException or NotSupportedException or PathTooLongException)
         {
-            failures.Add($"StateDirectory or StagingDirectory is not a valid path: {ex.Message}");
-            return;
-        }
-
-        if (IsSameOrInside(state, staging) || IsSameOrInside(staging, state))
-        {
-            failures.Add(
-                $"StateDirectory '{stateDirectory}' must not overlap StagingDirectory '{options.StagingDirectory}': " +
-                "Bridge state must stay outside the SMB share.");
+            failures.Add($"StateDirectory is not a valid path: {ex.Message}");
             return;
         }
 
@@ -333,18 +325,4 @@ public sealed class BridgeOptionsValidator : IValidateOptions<BridgeOptions>
     private static string NormalizeDirectory(string path) =>
         Path.TrimEndingDirectorySeparator(Path.GetFullPath(path));
 
-    /// <summary>
-    /// Case-insensitive because the Bridge targets NTFS; on a case-sensitive
-    /// filesystem this can only reject more, never less.
-    /// </summary>
-    private static bool IsSameOrInside(string candidate, string root)
-    {
-        if (string.Equals(candidate, root, StringComparison.OrdinalIgnoreCase))
-        {
-            return true;
-        }
-
-        var prefix = Path.EndsInDirectorySeparator(root) ? root : root + Path.DirectorySeparatorChar;
-        return candidate.StartsWith(prefix, StringComparison.OrdinalIgnoreCase);
-    }
 }

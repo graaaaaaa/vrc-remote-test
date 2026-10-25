@@ -1,18 +1,21 @@
 #!/usr/bin/env bash
 # VRC Remote Test: read what the Windows Bridge (v0.6.0 and later) observes about each
-# VRChat client, from the share mounted on the Mac (client-observation plan F7).
+# VRChat client, over the authenticated LAN Direct API.
 #
-# Read-only: it reads status/vrchat-clients.json and logs/clients/ on the share and never
-# writes there. Builds and deploys stay with Unity (batch mode included).
+# Builds and deploys stay with Unity (batch mode included). export-log asks
+# Bridge for a private, redacted snapshot of the selected client log.
 #
 #   vrcrt.sh status [--json]
+#   vrcrt.sh result <build-id>
 #   vrcrt.sh log <slot> [--markers] [--lines N]
 #   vrcrt.sh log all --markers [--lines N]
+#   vrcrt.sh export-log <slot|all> <output-directory>
 #   vrcrt.sh cursor
 #   vrcrt.sh wait-marker <slot|all> <regex> <seconds> [--after <cursor>] [--any-generation]
 #   vrcrt.sh wait-same-instance <seconds> [--slots 0,1] [--after <cursor>]
 #
-# The share is $VRCRT_SHARE (default /Volumes/VRCRemoteTest). <cursor> is the JSON that
+# Set VRCRT_BRIDGE_URL and VRCRT_CERT_SHA256. The token comes from macOS Keychain,
+# or VRCRT_TOKEN in CI. <cursor> is the JSON that
 # `cursor` prints, or @<file> holding it. Exit codes: 0 done, 1 timed out, 2 usage error,
 # 3 the observation cannot answer (old or missing files, a client still being read, the
 # Bridge restarted or re-read a log, Logging not Full, records dropped).
@@ -32,15 +35,22 @@ fi
 
 exec "$python" -I - "$@" <<'PYTHON'
 import argparse
+import hashlib
+import http.client
 import json
 import os
 import re
+import ssl
 import subprocess
 import sys
+import tempfile
 import time
 from datetime import datetime, timedelta, timezone
+from urllib.parse import urlsplit
 
-SHARE = os.environ.get("VRCRT_SHARE", "/Volumes/VRCRemoteTest")
+BRIDGE_URL = os.environ.get("VRCRT_BRIDGE_URL", "")
+CERT_SHA256 = os.environ.get("VRCRT_CERT_SHA256", "").lower()
+FIXTURE_DIR = os.environ.get("VRCRT_FIXTURE_DIR", "")
 SLOTS = range(4)
 STALE_AFTER = timedelta(seconds=15)
 REGEX_TIMEOUT_SECONDS = 2.0
@@ -48,6 +58,7 @@ MAX_PATTERN_LENGTH = 1000
 MAX_CLIENTS_BYTES = 256 * 1024
 MAX_LOG_BYTES = 512 * 1024
 MAX_MARKERS_BYTES = 1280 * 1024
+MAX_FULL_LOG_BYTES = 256 * 1024 * 1024
 POLL_SECONDS = 1.0
 
 EXIT_TIMEOUT = 1
@@ -88,21 +99,180 @@ def safe(text):
 
 
 def share_path(*parts):
-    return os.path.join(SHARE, *parts)
+    if FIXTURE_DIR:
+        return os.path.join(FIXTURE_DIR, *parts)
+    if parts == ("status", "vrchat-clients.json"):
+        return "/api/v1/clients"
+    if len(parts) == 2 and parts[0] == "results" and re.fullmatch(r"[0-9A-Za-z_-]+\.json", parts[1]):
+        return "/api/v1/builds/" + parts[1][:-5]
+    if len(parts) == 3 and parts[:2] == ("logs", "clients"):
+        name = parts[2]
+        match = re.fullmatch(r"slot-([0-3])\.(markers\.)?log", name)
+        if match:
+            return "/api/v1/%s/clients/%s" % ("markers" if match.group(2) else "logs", match.group(1))
+    raise Failure(EXIT_USAGE, "unsupported Bridge resource")
 
 
 def read_bounded(path, limit):
-    """The file's text, or None when it does not exist. Larger than the limit is an observation failure."""
+    """Read one pinned HTTPS resource, or a local fixture in the script tests."""
     try:
-        with open(path, "rb") as stream:
-            data = stream.read(limit + 1)
+        if FIXTURE_DIR:
+            with open(path, "rb") as stream:
+                data = stream.read(limit + 1)
+        else:
+            parsed = urlsplit(BRIDGE_URL)
+            if parsed.scheme != "https" or not parsed.hostname or not parsed.port or parsed.path not in ("", "/"):
+                raise Failure(EXIT_USAGE, "set VRCRT_BRIDGE_URL to the Bridge HTTPS address")
+            if not re.fullmatch(r"[0-9a-f]{64}", CERT_SHA256):
+                raise Failure(EXIT_USAGE, "set VRCRT_CERT_SHA256 to the paired certificate fingerprint")
+            token = os.environ.get("VRCRT_TOKEN")
+            if not token:
+                result = subprocess.run(
+                    ["/usr/bin/security", "find-generic-password", "-s", "VRCRemoteTest.LanDirect", "-a", BRIDGE_URL, "-w"],
+                    text=True, capture_output=True, check=False)
+                if result.returncode:
+                    raise Failure(EXIT_OBSERVATION, "Bridge token is missing from macOS Keychain")
+                token = result.stdout.strip()
+            context = ssl._create_unverified_context()
+            conn = http.client.HTTPSConnection(parsed.hostname, parsed.port, context=context, timeout=10)
+            try:
+                conn.connect()
+                actual = hashlib.sha256(conn.sock.getpeercert(binary_form=True)).hexdigest()
+                if actual != CERT_SHA256:
+                    raise Failure(EXIT_OBSERVATION, "Bridge certificate fingerprint changed; pair again")
+                conn.request("GET", path, headers={"Authorization": "Bearer " + token})
+                response = conn.getresponse()
+                if response.status == 404:
+                    return None
+                if response.status != 200:
+                    raise Failure(EXIT_OBSERVATION, "Bridge returned HTTP %d for %s" % (response.status, path))
+                data = response.read(limit + 1)
+            finally:
+                conn.close()
     except FileNotFoundError:
         return None
     except OSError as error:
-        raise Failure(EXIT_OBSERVATION, "cannot read %s: %s" % (path, error.strerror or error))
+        raise Failure(EXIT_OBSERVATION, "cannot read %s: %s" % (path, error))
     if len(data) > limit:
         raise Failure(EXIT_OBSERVATION, "%s is larger than %d bytes; not reading it" % (path, limit))
     return data.decode("utf-8", errors="replace")
+
+
+def bridge_connection():
+    """Connect and check the certificate before returning an authenticated connection."""
+    parsed = urlsplit(BRIDGE_URL)
+    if parsed.scheme != "https" or not parsed.hostname or not parsed.port or parsed.path not in ("", "/"):
+        raise Failure(EXIT_USAGE, "set VRCRT_BRIDGE_URL to the Bridge HTTPS address")
+    if not re.fullmatch(r"[0-9a-f]{64}", CERT_SHA256):
+        raise Failure(EXIT_USAGE, "set VRCRT_CERT_SHA256 to the paired certificate fingerprint")
+    token = os.environ.get("VRCRT_TOKEN")
+    if not token:
+        result = subprocess.run(
+            ["/usr/bin/security", "find-generic-password", "-s", "VRCRemoteTest.LanDirect", "-a", BRIDGE_URL, "-w"],
+            text=True, capture_output=True, check=False)
+        if result.returncode:
+            raise Failure(EXIT_OBSERVATION, "Bridge token is missing from macOS Keychain")
+        token = result.stdout.strip()
+    context = ssl._create_unverified_context()
+    conn = http.client.HTTPSConnection(parsed.hostname, parsed.port, context=context, timeout=30)
+    try:
+        conn.connect()
+        actual = hashlib.sha256(conn.sock.getpeercert(binary_form=True)).hexdigest()
+        if actual != CERT_SHA256:
+            raise Failure(EXIT_OBSERVATION, "Bridge certificate fingerprint changed; pair again")
+        return conn, {"Authorization": "Bearer " + token}
+    except BaseException:
+        conn.close()
+        raise
+
+
+def export_one_log(slot, client, directory):
+    body = json.dumps({"slot": slot, "clientGeneration": client["clientGeneration"],
+                       "observationEpoch": client["observationEpoch"]}).encode("utf-8")
+    conn, headers = bridge_connection()
+    try:
+        conn.request("POST", "/api/v1/log-exports", body=body,
+                     headers={**headers, "Content-Type": "application/json"})
+        response = conn.getresponse()
+        metadata_bytes = response.read(8193)
+        if response.status != 200:
+            raise Failure(EXIT_OBSERVATION, "slot %d log export failed (HTTP %d); client session may have changed"
+                          % (slot, response.status))
+        if len(metadata_bytes) > 8192:
+            raise Failure(EXIT_OBSERVATION, "Bridge log export metadata is too large")
+        try:
+            metadata = json.loads(metadata_bytes)
+        except ValueError:
+            raise Failure(EXIT_OBSERVATION, "Bridge returned invalid log export metadata")
+    finally:
+        conn.close()
+    if not isinstance(metadata, dict):
+        raise Failure(EXIT_OBSERVATION, "Bridge returned invalid log export metadata")
+    export_id = metadata.get("exportId")
+    size = metadata.get("size")
+    sha256 = metadata.get("sha256")
+    if (not isinstance(export_id, str) or not re.fullmatch(r"[0-9a-f]{32}", export_id)
+            or type(size) is not int or not 0 <= size <= MAX_FULL_LOG_BYTES
+            or not isinstance(sha256, str) or not re.fullmatch(r"[0-9a-f]{64}", sha256)):
+        raise Failure(EXIT_OBSERVATION, "Bridge returned invalid log export metadata")
+    filename = "vrchat-slot-%d-generation-%d-epoch-%d-%s.log" % (
+        slot, client["clientGeneration"], client["observationEpoch"], export_id)
+    destination = os.path.join(directory, filename)
+    conn, headers = bridge_connection()
+    partial = None
+    try:
+        conn.request("GET", "/api/v1/log-exports/" + export_id, headers=headers)
+        response = conn.getresponse()
+        if response.status != 200:
+            raise Failure(EXIT_OBSERVATION, "slot %d log download failed (HTTP %d)" % (slot, response.status))
+        with tempfile.NamedTemporaryFile(prefix=".vrcrt-log-", suffix=".part", dir=directory, delete=False) as output:
+            partial = output.name
+            digest = hashlib.sha256()
+            count = 0
+            while True:
+                chunk = response.read(65536)
+                if not chunk:
+                    break
+                count += len(chunk)
+                if count > size or count > MAX_FULL_LOG_BYTES:
+                    raise Failure(EXIT_OBSERVATION, "slot %d log is larger than announced" % slot)
+                output.write(chunk)
+                digest.update(chunk)
+            output.flush()
+            os.fsync(output.fileno())
+        if count != size or digest.hexdigest() != sha256:
+            raise Failure(EXIT_OBSERVATION, "slot %d log failed size or SHA-256 verification" % slot)
+        os.link(partial, destination)  # Fails if a file with this name already exists.
+        print(destination)
+    finally:
+        conn.close()
+        if partial and os.path.exists(partial):
+            os.unlink(partial)
+
+
+def cmd_export_log(args):
+    slot = parse_slot(args.slot, allow_all=True)
+    directory = os.path.abspath(args.output_directory)
+    if not os.path.isdir(directory):
+        raise Failure(EXIT_USAGE, "output directory does not exist: %s" % directory)
+    clients = load_clients()
+    if is_stale(clients):
+        raise Failure(EXIT_OBSERVATION, "client list is older than 15 s; refusing log export")
+    selected = ([entry_of(clients, slot)] if slot is not None
+                else [c for c in clients["clients"] if c.get("running") is True])
+    if not selected or any(c is None for c in selected):
+        raise Failure(EXIT_OBSERVATION, "no matching VRChat client is running")
+    for client in selected:
+        if (client.get("logStatus") != "shown" or type(client.get("clientGeneration")) is not int
+                or type(client.get("observationEpoch")) is not int):
+            raise Failure(EXIT_OBSERVATION, "slot %d has no verified current log source" % client["slot"])
+    for client in selected:
+        try:
+            export_one_log(client["slot"], client, directory)
+        except (OSError, http.client.HTTPException) as error:
+            raise Failure(EXIT_OBSERVATION, "slot %d log export failed: %s" %
+                          (client["slot"], getattr(error, "strerror", None) or str(error)))
+    return 0
 
 
 def parse_utc(value):
@@ -126,7 +296,7 @@ def load_clients(required=True):
         if required:
             raise Failure(
                 EXIT_OBSERVATION,
-                "status/vrchat-clients.json is not on the share %s (is it mounted, and is the Bridge v0.6.0 or later?)" % SHARE)
+                "Bridge client status is unavailable at %s" % BRIDGE_URL)
         return None
     try:
         data = json.loads(text)
@@ -316,6 +486,22 @@ def cmd_status(args):
     return 0
 
 
+def cmd_result(args):
+    if not re.fullmatch(r"[0-9A-Za-z_-]{1,128}", args.build_id):
+        raise Failure(EXIT_USAGE, "invalid build ID")
+    value = read_bounded(share_path("results", args.build_id + ".json"), 64 * 1024)
+    if value is None:
+        raise Failure(EXIT_OBSERVATION, "build result is not available")
+    try:
+        result = json.loads(value)
+    except ValueError:
+        raise Failure(EXIT_OBSERVATION, "build result is not valid JSON")
+    if not isinstance(result, dict) or result.get("buildId") != args.build_id:
+        raise Failure(EXIT_OBSERVATION, "build result ID does not match")
+    print(json.dumps(result, indent=2, ensure_ascii=True))
+    return 0 if result.get("status") == "deployed" else EXIT_OBSERVATION
+
+
 def cmd_log(args):
     slot = parse_slot(args.slot, allow_all=True)
     if slot is None and not args.markers:
@@ -494,7 +680,7 @@ class Parser(argparse.ArgumentParser):
 
 
 def main(argv):
-    parser = Parser(prog="vrcrt.sh", description="Read the VRC Remote Test Bridge's per-client observation from the share.")
+    parser = Parser(prog="vrcrt.sh", description="Read the VRC Remote Test Bridge's per-client observation over HTTPS.")
     sub = parser.add_subparsers(dest="command", parser_class=Parser)
     sub.required = True
 
@@ -502,11 +688,20 @@ def main(argv):
     p.add_argument("--json", action="store_true", help="print vrchat-clients.json as it is")
     p.set_defaults(run=cmd_status)
 
+    p = sub.add_parser("result", help="read and verify a Bridge build result")
+    p.add_argument("build_id")
+    p.set_defaults(run=cmd_result)
+
     p = sub.add_parser("log", help="a slot's log, or the marker lines")
     p.add_argument("slot", help="0-3, or all with --markers")
     p.add_argument("--markers", action="store_true")
     p.add_argument("--lines", type=int)
     p.set_defaults(run=cmd_log)
+
+    p = sub.add_parser("export-log", help="save verified full log snapshots for one or all running clients")
+    p.add_argument("slot", help="0-3, or all running clients")
+    p.add_argument("output_directory", help="existing local directory for the .log files")
+    p.set_defaults(run=cmd_export_log)
 
     p = sub.add_parser("cursor", help="the current position, for --after")
     p.set_defaults(run=cmd_cursor)

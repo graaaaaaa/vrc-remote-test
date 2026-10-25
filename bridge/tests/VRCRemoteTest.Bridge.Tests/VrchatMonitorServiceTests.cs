@@ -16,7 +16,7 @@ public class VrchatMonitorServiceTests
     private static VrchatMonitorService CreateService(
         FakeVrchatProcessMonitor processMonitor, FakeVrchatStatusWriter statusWriter, string stagingDir) =>
         new(
-            Options.Create(new BridgeOptions { StagingDirectory = stagingDir }),
+            Options.Create(new BridgeOptions { StateDirectory = stagingDir }),
             processMonitor,
             statusWriter,
             NullLogger<VrchatMonitorService>.Instance,

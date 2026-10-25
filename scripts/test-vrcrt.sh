@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Checks scripts/vrcrt.sh against a fake share in a temporary directory: the files are
+# Checks scripts/vrcrt.sh against local protocol fixtures: the files are
 # shaped like the ones the Bridge v0.6.0 writes (status/vrchat-clients.json and
 # logs/clients/). Run from anywhere: bash scripts/test-vrcrt.sh
 set -u
@@ -8,8 +8,8 @@ here="$(cd "$(dirname "$0")" && pwd)"
 vrcrt="$here/vrcrt.sh"
 share="$(mktemp -d "${TMPDIR:-/tmp}/vrcrt-test.XXXXXX")"
 trap 'rm -rf "$share"' EXIT
-export VRCRT_SHARE="$share"
-mkdir -p "$share/status" "$share/logs/clients"
+export VRCRT_FIXTURE_DIR="$share"
+mkdir -p "$share/status" "$share/logs/clients" "$share/results"
 
 failures=0
 pass() { printf 'ok   %s\n' "$1"; }
@@ -77,9 +77,17 @@ printf '%s\n' "${H}line one" $'    continued\twith a tab\033[31m' > "$share/logs
 expect "status shows both slots" 0 "local:aaaa" "$vrcrt" status
 expect "status escapes warnings" 0 'slot 1: tab\there' "$vrcrt" status
 expect "status --json" 0 '"clientGeneration": 22' "$vrcrt" status --json
+printf '%s\n' '{"buildId":"test-build","status":"deployed","sha256":"abc"}' > "$share/results/test-build.json"
+expect "result confirms deployed build" 0 '"status": "deployed"' "$vrcrt" result test-build
+expect "result rejects an unknown build" 3 "not available" "$vrcrt" result missing-build
 expect "log escapes control characters" 0 'continued\twith a tab\x1b[31m' "$vrcrt" log 1
 expect "log --lines" 0 "continued" "$vrcrt" log 1 --lines 1
 expect "log all needs --markers" 2 "needs --markers" "$vrcrt" log all
+expect "export-log rejects an invalid slot" 2 "a slot is 0 to 3" "$vrcrt" export-log 4 "$share"
+expect "export-log needs an existing output directory" 2 "output directory does not exist" \
+    "$vrcrt" export-log 0 "$share/missing"
+expect "export-log rejects a client without a verified log source" 3 "no verified current log source" \
+    "$vrcrt" export-log 0 "$share"
 expect "a slot is 0 to 3" 2 "a slot is 0 to 3" "$vrcrt" log 4
 expect "markers of one slot" 0 "45	2026.10.18 13:41:45" "$vrcrt" log 0 --markers
 
@@ -139,7 +147,7 @@ clients joined joined ', "catchingUp": true'
 expect "a client still being read has no cursor" 3 "catchingUp" "$vrcrt" cursor
 
 rm "$share/status/vrchat-clients.json"
-expect "without vrchat-clients.json" 3 "Bridge v0.6.0 or later" "$vrcrt" status
+expect "without vrchat-clients.json" 3 "Bridge client status is unavailable" "$vrcrt" status
 
 if [ "$failures" -ne 0 ]; then
     printf '%d check(s) failed\n' "$failures"

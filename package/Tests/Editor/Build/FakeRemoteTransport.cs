@@ -8,6 +8,9 @@ namespace VRCRemoteTest.Tests
     internal sealed class FakeRemoteTransport : IRemoteTransport
     {
         public bool IsAvailable { get; set; } = true;
+        public Task ProbeAsync(CancellationToken cancellationToken = default) =>
+            IsAvailable ? Task.CompletedTask : Task.FromException(
+                new RemoteBuildException(ErrorCode.BridgeUnavailable, "Bridge unavailable."));
         public bool UploadCalled { get; private set; }
         public string LastUploadedBuildId { get; private set; }
 
@@ -33,14 +36,14 @@ namespace VRCRemoteTest.Tests
             return Task.CompletedTask;
         }
 
-        public BuildResult PollResult(string buildId)
+        public Task<BuildResult> PollResultAsync(string buildId, CancellationToken cancellationToken = default)
         {
             if (ResultFactory != null)
             {
-                return ResultFactory(buildId);
+                return Task.FromResult(ResultFactory(buildId));
             }
 
-            return ResultQueue.Count > 0 ? ResultQueue.Dequeue() : null;
+            return Task.FromResult(ResultQueue.Count > 0 ? ResultQueue.Dequeue() : null);
         }
 
         public VrchatStatus VrchatStatusToReturn { get; set; }
@@ -62,5 +65,8 @@ namespace VRCRemoteTest.Tests
         public Dictionary<int, string> ClientMarkers { get; } = new Dictionary<int, string>();
 
         public string PollClientMarkers(int slot) => ClientMarkers.TryGetValue(slot, out var markers) ? markers : null;
+
+        public Task DownloadFullLogAsync(int slot, long clientGeneration, long observationEpoch,
+            string destinationPath, CancellationToken cancellationToken = default) => Task.CompletedTask;
     }
 }

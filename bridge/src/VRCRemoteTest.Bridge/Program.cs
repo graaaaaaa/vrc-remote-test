@@ -1,11 +1,14 @@
 using Microsoft.Extensions.Configuration;
+using Microsoft.AspNetCore.Builder;
+using Microsoft.AspNetCore.Hosting;
 using Microsoft.Extensions.DependencyInjection;
-using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Options;
+using System.Net;
 using Serilog;
 using VRCRemoteTest.Bridge;
 using VRCRemoteTest.Bridge.Configuration;
 using VRCRemoteTest.Bridge.Deployment;
+using VRCRemoteTest.Bridge.Lan;
 using VRCRemoteTest.Bridge.VRChat;
 
 var localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
@@ -29,6 +32,30 @@ var logDir = Path.Combine(configDir, "logs");
 Directory.CreateDirectory(configDir);
 Directory.CreateDirectory(logDir);
 
+if (args.Length == 1 && args[0] == "pair")
+{
+    var pairingConfig = new ConfigurationBuilder()
+        .AddJsonFile(Path.Combine(configDir, "config.json"), optional: false)
+        .Build();
+    var bind = pairingConfig["Bridge:LanBindAddress"];
+    var port = int.TryParse(pairingConfig["Bridge:LanPort"], out var configuredPort)
+        ? configuredPort : 38443;
+    if (!IPAddress.TryParse(bind, out var address)
+        || IPAddress.IsLoopback(address) || address.Equals(IPAddress.Any)
+        || address.Equals(IPAddress.IPv6Any))
+    {
+        Console.Error.WriteLine("Set Bridge:LanBindAddress to the Windows LAN IP before pairing.");
+        Environment.ExitCode = 1;
+        return;
+    }
+
+    var pairing = BridgeIdentity.LoadOrCreate(configDir);
+    Console.WriteLine($"URL: https://{(address.AddressFamily == System.Net.Sockets.AddressFamily.InterNetworkV6 ? $"[{address}]" : address)}:{port}");
+    Console.WriteLine($"Certificate SHA-256: {pairing.Fingerprint}");
+    Console.WriteLine($"Pairing token: {pairing.Token}");
+    return;
+}
+
 Log.Logger = new LoggerConfiguration()
     .MinimumLevel.Information()
     .WriteTo.Console()
@@ -42,7 +69,7 @@ try
 {
     Log.Information("VRC Remote Test Bridge starting. Config directory: {ConfigDir}", configDir);
 
-    var builder = Host.CreateApplicationBuilder(args);
+    var builder = WebApplication.CreateBuilder(args);
 
     // Windows Service is deliberately not used (spec section 20 / plan security posture):
     // the Bridge runs in the interactive user session, non-elevated, started via
@@ -59,14 +86,22 @@ try
         .Bind(builder.Configuration.GetSection(BridgeOptions.SectionName))
         .PostConfigure(options =>
         {
-            if (string.IsNullOrWhiteSpace(options.StagingDirectory))
-            {
-                options.StagingDirectory = @"C:\VRCRemoteTest";
-            }
-
             // Fixed rather than configurable: see BridgeOptions.StateDirectory.
             options.StateDirectory = Path.Combine(configDir, "state");
         });
+
+    if (builder.Configuration["Bridge:StagingDirectory"] is not null)
+        throw new InvalidOperationException("Bridge:StagingDirectory is obsolete; remove it and pair LAN Direct.");
+
+    var lanConfig = builder.Configuration.GetSection(BridgeOptions.SectionName).Get<BridgeOptions>() ?? new BridgeOptions();
+    if (!IPAddress.TryParse(lanConfig.LanBindAddress, out var lanAddress))
+    {
+        throw new InvalidOperationException("Bridge:LanBindAddress must name the Windows LAN IP.");
+    }
+
+    var identity = BridgeIdentity.LoadOrCreate(configDir);
+    builder.WebHost.ConfigureKestrel(server =>
+        server.Listen(lanAddress, lanConfig.LanPort, listen => listen.UseHttps(identity.Certificate)));
 
     builder.Services.AddSingleton<IValidateOptions<BridgeOptions>, BridgeOptionsValidator>();
 
@@ -104,18 +139,20 @@ try
     builder.Services.AddSingleton<VrchatClientRoster>();
     builder.Services.AddSingleton<IVrchatLogReader, VrchatLogReader>();
     builder.Services.AddSingleton<VrchatClientObserver>();
+    builder.Services.AddSingleton<LogSourceRegistry>();
     builder.Services.AddSingleton<VrchatLogNotice>();
     builder.Services.AddHostedService<VrchatLogService>();
 
-    using var host = builder.Build();
+    await using var host = builder.Build();
 
     // Fail fast on invalid configuration (e.g. missing VrchatWorldsDirectory) before
     // the watcher loop ever starts (spec section 11 preflight philosophy, applied
     // Bridge-side).
     var options = host.Services.GetRequiredService<IOptions<BridgeOptions>>().Value;
+    BridgeLanApi.Map(host, options, identity, host.Services.GetRequiredService<LogSourceRegistry>());
 
     // Acquired before any hosted service starts, so a second Bridge never touches the
-    // share, the state directory or VRChat.
+    // state directory or VRChat.
     using var instanceLock = BridgeInstanceLock.TryAcquire(options.StateDirectory);
     if (instanceLock is null)
     {

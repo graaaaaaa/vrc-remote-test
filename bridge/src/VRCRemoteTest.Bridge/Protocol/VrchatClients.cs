@@ -3,12 +3,12 @@ using System.Text.Json.Serialization;
 namespace VRCRemoteTest.Bridge.Protocol;
 
 /// <summary>
-/// Wire format for `{stagingDirectory}/status/vrchat-clients.json`, rewritten by
+/// Wire format for the client status kept in Bridge-private state, rewritten by
 /// VrchatLogService every 5 seconds (client-observation plan F1). One entry per slot that
 /// has had a client, its exited one included, so a client keeps its slot number across
 /// polls and Bridge restarts. Everything here is observed from the clients' processes and
 /// logs: advisory, never a reason for the Mac to trust a world or for the Bridge to act.
-/// vrchat-status.json keeps its own shape for Unity 0.5.x.
+/// The VRChat status response keeps its own shape.
 ///
 /// The control fields of later phases (bridgeSessionId, supportedActions, sessionGeneration,
 /// controlEligible) are not written yet.

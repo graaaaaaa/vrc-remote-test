@@ -18,8 +18,7 @@ namespace VRCRemoteTest
     {
         // 2.5s TTL cache + event-driven refresh (OnEnable, settings commit,
         // before/after build) rather than the originally-proposed 5s pure
-        // debounce — IsShareReachable is a cheap local-filesystem check on a
-        // mounted SMB share, and stale status risks the user starting a build
+        // debounce. Bridge reachability is checked over the network, and stale status risks a build
         // that immediately fails preflight (Codex plan review Phase 3, Round
         // 2, confidence 0.88).
         private const float PreflightCheckIntervalSeconds = 2.5f;
@@ -78,8 +77,8 @@ namespace VRCRemoteTest
         private string _lastRenderedLogContent = string.Empty;
         private double _lastLogCheckTime = double.NegativeInfinity;
 
-        private bool _shareConfigured;
-        private bool _shareReachable;
+        private bool _bridgeConfigured;
+        private bool _bridgeReachable;
         private bool _sdkAvailable;
         private bool _hasLastArtifact;
         private VrchatStatus _vrchatStatus;
@@ -91,7 +90,10 @@ namespace VRCRemoteTest
         private DateTime _lastOutcomeTime;
 
         private bool _settingsFoldout;
-        private string _sharePathInput = string.Empty;
+        private string _bridgeUrlInput = string.Empty;
+        private string _fingerprintInput = string.Empty;
+        private string _tokenInput = string.Empty;
+        private string _pairingError;
         private CancellationTokenSource _cts;
 
         // Wraps the whole window body: when this window is docked into a
@@ -181,19 +183,14 @@ namespace VRCRemoteTest
         {
             EditorGUILayout.LabelField("Preflight", EditorStyles.boldLabel);
 
-            if (!_shareConfigured)
+            if (!_bridgeConfigured)
             {
                 EditorGUILayout.HelpBox(
-                    "Remote share is not configured. Set SharePath below.", MessageType.Warning);
+                    "Windows Bridge is not paired. Enter its pairing details in Settings.", MessageType.Warning);
             }
             else
             {
-                // "Remote Share: Reachable" rather than "Windows Bridge Online" —
-                // this only confirms the SMB mount is present and writable, not
-                // that the Bridge process is alive. Phase 1 deliberately has no
-                // heartbeat, so claiming to detect the Bridge process would be
-                // misleading (Codex plan review Phase 3 plan, design decision).
-                DrawStatusLine("Remote Share", _shareReachable, "Reachable", "Not reachable");
+                DrawStatusLine("Windows Bridge", _bridgeReachable, "Connected", "Connecting or unavailable");
             }
 
             DrawStatusLine("VRChat SDK", _sdkAvailable, "Available", "Not available");
@@ -203,7 +200,7 @@ namespace VRCRemoteTest
 
         /// <summary>
         /// Phase 4a: advisory only, never gates the build buttons (unlike Remote
-        /// Share/VRChat SDK which do via DrawActionButtons' DisabledScope). A
+        /// Bridge/VRChat SDK which do via DrawActionButtons' DisabledScope). A
         /// stale or missing status (Bridge not running Phase 4a's monitor, or an
         /// older Bridge build without it) reads as "Unknown", never green — the
         /// UI never trusts an old IsRunning=true (Codex plan review Phase 4a,
@@ -469,12 +466,38 @@ namespace VRCRemoteTest
 
             var client = _clients.Clients?.FirstOrDefault(c => c != null && c.Slot == slot.Value);
             EditorGUILayout.LabelField(ClientLogView.Describe(client), EditorStyles.wordWrappedMiniLabel);
+            using (new EditorGUI.DisabledScope(_clientsStale || client?.ObservationEpoch == null
+                || client.LogStatus != "shown"))
+            {
+                if (GUILayout.Button("Save Full Log..."))
+                {
+                    var path = EditorUtility.SaveFilePanel("Save VRChat Full Log", string.Empty,
+                        $"vrchat-slot-{slot.Value}-generation-{client.ClientGeneration}.log", "log");
+                    if (!string.IsNullOrEmpty(path))
+                        StartSaveFullLog(slot.Value, client.ClientGeneration,
+                            client.ObservationEpoch.Value, path);
+                }
+            }
             if (client?.Warnings != null)
             {
                 foreach (var warning in client.Warnings.Where(w => !string.IsNullOrEmpty(w)))
                 {
                     EditorGUILayout.HelpBox(warning, MessageType.Warning);
                 }
+            }
+        }
+
+        private async void StartSaveFullLog(int slot, long generation, long epoch, string destination)
+        {
+            try
+            {
+                await RemoteBuildCommand.GetCoordinator().DownloadFullLogAsync(
+                    slot, generation, epoch, destination);
+                Debug.Log("[VRC Remote Test] Full VRChat log saved: " + destination);
+            }
+            catch (Exception ex)
+            {
+                Debug.LogError("[VRC Remote Test] Could not save full VRChat log: " + ex.Message);
             }
         }
 
@@ -506,9 +529,9 @@ namespace VRCRemoteTest
 
         private void DrawActionButtons()
         {
-            var running = RemoteBuildCommand.GetCoordinator().IsRunning;
+            var running = _bridgeConfigured && RemoteBuildCommand.GetCoordinator().IsRunning;
 
-            using (new EditorGUI.DisabledScope(running || !_shareConfigured))
+            using (new EditorGUI.DisabledScope(running || !_bridgeConfigured))
             {
                 if (GUILayout.Button("Remote Build & Test"))
                 {
@@ -516,7 +539,7 @@ namespace VRCRemoteTest
                 }
             }
 
-            using (new EditorGUI.DisabledScope(running || !_shareConfigured || !_hasLastArtifact))
+            using (new EditorGUI.DisabledScope(running || !_bridgeConfigured || !_hasLastArtifact))
             {
                 if (GUILayout.Button("Deploy Last Build"))
                 {
@@ -546,29 +569,20 @@ namespace VRCRemoteTest
                 return;
             }
 
-            // Disabled while a build/deploy is running: changing SharePath
+            // Disabled while a build/deploy is running: changing the pairing
             // mid-flight would invalidate the coordinator's transport out from
             // under the in-flight operation (see RemoteBuildCommand.InvalidateCoordinator).
-            using (new EditorGUI.DisabledScope(RemoteBuildCommand.GetCoordinator().IsRunning))
+            using (new EditorGUI.DisabledScope(_bridgeConfigured && RemoteBuildCommand.GetCoordinator().IsRunning))
             {
-                EditorGUI.BeginChangeCheck();
-                // DelayedTextField (not TextField): commits on Enter/focus-loss
-                // only, so we don't write EditorPrefs and invalidate the
-                // coordinator on every keystroke.
-                var newSharePath = EditorGUILayout.DelayedTextField("Share Path", _sharePathInput);
-                if (EditorGUI.EndChangeCheck())
+                _bridgeUrlInput = EditorGUILayout.DelayedTextField("Bridge URL", _bridgeUrlInput);
+                _fingerprintInput = EditorGUILayout.DelayedTextField("Certificate SHA-256", _fingerprintInput);
+                _tokenInput = EditorGUILayout.PasswordField("Pairing Token", _tokenInput);
+                if (GUILayout.Button("Save Pairing"))
                 {
-                    _sharePathInput = newSharePath;
-                    RemoteTestSettings.SharePath = newSharePath;
-                    if (!RemoteBuildCommand.InvalidateCoordinator())
-                    {
-                        Debug.LogWarning(
-                            "[VRC Remote Test] SharePath changed but a build is in progress; " +
-                            "the new path will take effect after it finishes.");
-                    }
-
-                    RefreshPreflightStatus();
+                    VerifyAndSavePairing(_bridgeUrlInput.Trim(), _fingerprintInput.Trim(), _tokenInput.Trim());
                 }
+                if (!string.IsNullOrEmpty(_pairingError))
+                    EditorGUILayout.HelpBox(_pairingError, MessageType.Error);
 
                 var newTimeout = EditorGUILayout.IntField(
                     "Result Timeout (s)", RemoteTestSettings.ResultTimeoutSeconds);
@@ -586,7 +600,7 @@ namespace VRCRemoteTest
             }
 
             // Not gated by the DisabledScope above — these are independent of
-            // the coordinator's transport/SharePath and safe to change
+            // the coordinator's connection and safe to change
             // mid-build.
             var newMoonlightName = EditorGUILayout.DelayedTextField(
                 "Moonlight Application Name", RemoteTestSettings.MoonlightApplicationName);
@@ -601,6 +615,24 @@ namespace VRCRemoteTest
             {
                 RemoteTestSettings.FocusMoonlightAfterDeploy = newFocusAfterDeploy;
             }
+        }
+
+        private async void VerifyAndSavePairing(string url, string fingerprint, string token)
+        {
+            try
+            {
+                using (var transport = new LanRemoteTransport(url, fingerprint, token))
+                    await transport.ProbeAsync();
+                BridgeTokenStore.Save(url, token);
+                RemoteTestSettings.BridgeUrl = url;
+                RemoteTestSettings.BridgeFingerprint = fingerprint;
+                _tokenInput = string.Empty;
+                _pairingError = null;
+                RemoteBuildCommand.InvalidateCoordinator();
+                RefreshPreflightStatus();
+            }
+            catch (Exception ex) { _pairingError = ex.Message; }
+            Repaint();
         }
 
         private async void StartRemoteBuild()
@@ -668,17 +700,19 @@ namespace VRCRemoteTest
 
         private void LoadSettingsIntoFields()
         {
-            _sharePathInput = RemoteTestSettings.TryGetSharePath(out var path) ? path : string.Empty;
+            _bridgeUrlInput = RemoteTestSettings.TryGetBridgeUrl(out var url) ? url : string.Empty;
+            _fingerprintInput = RemoteTestSettings.BridgeFingerprint;
         }
 
         private void RefreshPreflightStatus()
         {
             _lastPreflightCheckTime = EditorApplication.timeSinceStartup;
 
-            _shareConfigured = RemoteTestSettings.TryGetSharePath(out _);
-            if (!_shareConfigured)
+            _bridgeConfigured = RemoteTestSettings.TryGetBridgeUrl(out _)
+                && !string.IsNullOrEmpty(RemoteTestSettings.BridgeFingerprint);
+            if (!_bridgeConfigured)
             {
-                _shareReachable = false;
+                _bridgeReachable = false;
                 _sdkAvailable = false;
                 _hasLastArtifact = false;
                 _vrchatStatus = null;
@@ -688,14 +722,15 @@ namespace VRCRemoteTest
             try
             {
                 var coordinator = RemoteBuildCommand.GetCoordinator();
-                _shareReachable = coordinator.IsShareReachable;
+                _bridgeReachable = coordinator.IsBridgeReachable;
                 _sdkAvailable = coordinator.IsSdkAvailable;
                 _hasLastArtifact = coordinator.LastArtifact != null;
                 _vrchatStatus = coordinator.VrchatStatus;
             }
             catch (RemoteBuildException)
             {
-                _shareReachable = false;
+                _bridgeConfigured = false;
+                _bridgeReachable = false;
                 _sdkAvailable = false;
                 _hasLastArtifact = false;
                 _vrchatStatus = null;

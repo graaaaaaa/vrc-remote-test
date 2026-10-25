@@ -25,8 +25,7 @@ namespace VRCRemoteTest
         public const string SdkNotAvailable = "SDK_NOT_AVAILABLE";
         public const string SdkBuildFailed = "SDK_BUILD_FAILED";
         public const string InvalidBuildTarget = "INVALID_BUILD_TARGET";
-        public const string RemoteShareUnavailable = "REMOTE_SHARE_UNAVAILABLE";
-        public const string RemoteShareNotWritable = "REMOTE_SHARE_NOT_WRITABLE";
+        public const string BridgeUnavailable = "BRIDGE_UNAVAILABLE";
         public const string UploadFailed = "UPLOAD_FAILED";
         public const string BuildAlreadyRunning = "BUILD_ALREADY_RUNNING";
         public const string PlayModeActive = "PLAY_MODE_ACTIVE";

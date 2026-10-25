@@ -79,7 +79,7 @@ namespace VRCRemoteTest
             clients?.Clients == null
                 ? Array.Empty<int>()
                 : clients.Clients
-                    .Where(c => c != null && c.Slot >= 0 && c.Slot < SmbRemoteTransport.SlotCount)
+                    .Where(c => c != null && c.Slot >= 0 && c.Slot < LanRemoteTransport.SlotCount)
                     .Select(c => c.Slot)
                     .Distinct()
                     .OrderBy(s => s)

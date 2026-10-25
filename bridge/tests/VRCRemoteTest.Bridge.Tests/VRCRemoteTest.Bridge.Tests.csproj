@@ -18,6 +18,7 @@
   </ItemGroup>
 
   <ItemGroup>
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
     <ProjectReference Include="..\..\src\VRCRemoteTest.Bridge\VRCRemoteTest.Bridge.csproj" />
   </ItemGroup>
 

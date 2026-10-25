@@ -32,10 +32,10 @@ public class VrchatLogServiceTests : IDisposable
         VrchatLogNotice? notice = null,
         TimeSpan? pollInterval = null) =>
         new(
-            Options.Create(new BridgeOptions { StagingDirectory = _tempDir }),
+            Options.Create(new BridgeOptions { StateDirectory = _tempDir }),
             logReader,
             new VrchatClientObserver(
-                new BridgeOptions { StagingDirectory = _tempDir },
+                new BridgeOptions { StateDirectory = _tempDir },
                 new VrchatClientRoster(filePath: null),
                 managedClients: null,
                 _ => DateTime.UtcNow,

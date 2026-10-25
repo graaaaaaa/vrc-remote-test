@@ -12,9 +12,8 @@ namespace VRCRemoteTest
     {
         private const string Prefix = "VRCRemoteTest_";
 
-        private const string SharePathKey = Prefix + "SharePath";
-        private const string SharePathCliFlag = "-vrcRemoteTestSharePath";
-        private const string SharePathEnvVar = "VRC_REMOTE_TEST_SHARE_PATH";
+        private const string BridgeUrlKey = Prefix + "BridgeUrl";
+        private const string BridgeFingerprintKey = Prefix + "BridgeFingerprint";
 
         private const string ResultTimeoutKey = Prefix + "ResultTimeoutSeconds";
         private const int DefaultResultTimeoutSeconds = 60;
@@ -27,30 +26,20 @@ namespace VRCRemoteTest
         private const int MaxPollIntervalSeconds = 60;
 
         /// <summary>
-        /// No default value — headless invocation must fail fast if unset
-        /// rather than silently falling back to a path that may not exist.
+        /// Connection settings are machine-local. CI uses environment variables;
+        /// the interactive editor uses EditorPrefs and the macOS Keychain.
         /// </summary>
-        public static string SharePath
+        public static string BridgeUrl
         {
             get
             {
-                if (VrcRemoteCommandLine.TryGetFlagValue(SharePathCliFlag, out var cliValue, out var cliError))
-                {
-                    return cliValue;
-                }
-
-                if (cliError != null)
-                {
-                    throw new RemoteBuildException(ErrorCode.InvalidConfiguration, cliError);
-                }
-
-                var envValue = System.Environment.GetEnvironmentVariable(SharePathEnvVar);
+                var envValue = System.Environment.GetEnvironmentVariable("VRC_REMOTE_TEST_BRIDGE_URL");
                 if (!string.IsNullOrEmpty(envValue))
                 {
                     return envValue;
                 }
 
-                var prefsValue = EditorPrefs.GetString(SharePathKey, string.Empty);
+                var prefsValue = EditorPrefs.GetString(BridgeUrlKey, string.Empty);
                 if (!string.IsNullOrEmpty(prefsValue))
                 {
                     return prefsValue;
@@ -58,29 +47,34 @@ namespace VRCRemoteTest
 
                 throw new RemoteBuildException(
                     ErrorCode.InvalidConfiguration,
-                    $"SharePath is not configured. Set it via {SharePathCliFlag} <path>, " +
-                    $"the {SharePathEnvVar} environment variable, or interactively via EditorPrefs.");
+                    "Bridge URL is not configured. Pair the Bridge in the VRC Remote Test window.");
             }
-            set => EditorPrefs.SetString(SharePathKey, value);
+            set => EditorPrefs.SetString(BridgeUrlKey, value);
         }
 
-        /// <summary>
-        /// Non-throwing variant of <see cref="SharePath"/> for callers (e.g. the
-        /// interactive UI) that need to handle "not configured" as a normal
-        /// state rather than an exception.
-        /// </summary>
-        public static bool TryGetSharePath(out string path)
+        public static string BridgeFingerprint
+        {
+            get
+            {
+                var envValue = System.Environment.GetEnvironmentVariable("VRC_REMOTE_TEST_CERT_SHA256");
+                return !string.IsNullOrEmpty(envValue)
+                    ? envValue : EditorPrefs.GetString(BridgeFingerprintKey, string.Empty);
+            }
+            set => EditorPrefs.SetString(BridgeFingerprintKey, value);
+        }
+
+        public static string BridgeToken =>
+            System.Environment.GetEnvironmentVariable("VRC_REMOTE_TEST_TOKEN")
+            ?? BridgeTokenStore.Read(BridgeUrl);
+
+        public static bool TryGetBridgeUrl(out string url)
         {
             try
             {
-                path = SharePath;
+                url = BridgeUrl;
                 return true;
             }
-            catch (RemoteBuildException)
-            {
-                path = null;
-                return false;
-            }
+            catch (RemoteBuildException) { url = null; return false; }
         }
 
         /// <summary>

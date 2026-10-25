@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.7.0] — LAN Direct (breaking)
+
+- Replaced the legacy transfer and observation path with certificate-pinned, token-authenticated HTTPS. Bridge and Unity must be updated together.
+- Interactive `.vrcw` uploads stream through `UploadHandlerFile`; results, client status, log tails and markers use the same API.
+- Added an explicit full-log export for a selected client generation and observation epoch, with redaction and SHA-256 verification.
+- Added scriptable build-result lookup, verified full-log export for all running clients, and a one-command Unity batch build/deploy/evidence workflow.
+- Removed the old share setting, environment variable, CLI flag, transport and Windows shared-folder setup.
+
+
 ## [0.6.0] - 2026-10-18
 
 The Windows Bridge now publishes every VRChat client's log, state and marker lines, not just the first client's (client-observation plan P1), and the Log Viewer and the new `scripts/vrcrt.sh` on the Mac read them. It needs no new share permission and the Mac sends nothing new. To get them, **update both the Windows Bridge** (`docs/setup-windows.md`, steps 1 and 6) **and the Unity package** (in VCC or ALCOM); either one also works with the other still on 0.5.x, and the Log Viewer then shows only the first client's log, as before. An existing `config.json` keeps working as before (`LogMarkerPrefixes` is optional and defaults to `["[VRCRT]"]`).
