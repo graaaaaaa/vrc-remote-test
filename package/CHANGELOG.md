@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.8.1] - Unreleased
+
+Fixes replacing the Windows Bridge with `scripts/install-bridge.ps1`, which stopped twice during the 0.7.1 → 0.8.0 update on 2026-10-31. The Bridge and the Unity package have no functional changes. Follow `docs/setup-windows.md`, step 1 ("版を入れ替える").
+
+### Fixed (Windows scripts)
+
+- `install-bridge.ps1` is saved as UTF-8 with a BOM and no longer starts with `#Requires -Version 7.0`, so Windows PowerShell 5.1 reads its Japanese text and stops, changing nothing, with the command to run instead: `pwsh.exe -NoProfile -ExecutionPolicy Bypass -File …` with the same arguments. `docs/setup-windows.md` now gives that form; running the script inside 5.1 with `&` was stopped by the default Restricted execution policy.
+- An existing task whose definition (action, trigger, principal, settings and description) already matches is kept and started, instead of being unregistered and registered again. During the 0.8.0 update, `Unregister-ScheduledTask` failed with "Access is denied" on the task 0.7.1 had registered, after the executable had been replaced, and the script ended without registering or starting anything. When the definition differs and the task cannot be removed, the script lists the differences and how to remove the task, then stops.
+- The cause of that "Access is denied": the task had been registered from an elevated shell, so its owner was Administrators and the user had read access only (`O:BA…(A;;FR;;;<user>)`). `install-bridge.ps1` now refuses to run elevated, changing nothing. It reads the existing task's security descriptor first, and when the task must be registered again but the user cannot delete it, it stops before replacing the executable, with the commands to fix it (stop the Bridge, which keeps running when its task is removed; unregister from an elevated PowerShell; then run the script again without elevation). When the definition matches, it keeps such a task and says how to fix it for later.
+- When the task step fails, the script prints the state it stopped in (the executable replaced or not; the task kept, left as it was, removed or registered) and the command to run again.
+- The messages for a running Bridge and for a refused replacement include the command to run again.
+- `uninstall-bridge.ps1`, `deploy-test.ps1` and `start-vrchat-dev.ps1` get the same treatment: a BOM, no `#Requires`, and under 5.1 a `pwsh.exe -NoProfile -ExecutionPolicy Bypass -Command "& '…' …"` line with the same arguments. They use `-Command` because `-File` cannot pass an array: `-Profiles 0,1` would arrive as the single number 1.
+
+### Tests
+
+- `scripts/test-windows-scripts.ps1` runs with `pwsh` on any OS: for every script the BOM, parsing, no PowerShell 7-only operators, and the 5.1 message run in a child pwsh, including that its command binds the same arguments; for `install-bridge.ps1` also the task-definition comparison with stand-in objects and the reading of a task's security descriptor, including the one seen on 2026-10-31.
+
 ## [0.8.0] - 2026-10-31
 
 Day-to-day Bridge management from the Mac, so nobody has to work on the Windows PC once the Bridge is installed and paired. **Update both the Windows Bridge** (`docs/setup-windows.md`, step 1) **and the Unity package**. An existing `config.json` and pairing keep working; either side also works with the other still on 0.7.x, without the new features.

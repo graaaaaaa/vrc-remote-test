@@ -16,10 +16,27 @@ v0.8.0 からは、日々の確認と設定の変更を Mac から行えます�
 
 ## 1. Bridge を配置する
 
-リリースの `VRCRemoteTest.Bridge.exe` を Windows 上で入手し、公開された SHA-256 と照合してください。PowerShell 7 で `scripts/install-bridge.ps1 -ExpectedSha256 <SHA-256> -SourcePath <ダウンロードしたexe> -StartNow` を実行します。動いている Bridge は、先に `Stop-ScheduledTask -TaskName VRCRemoteTestBridge` で止めてください（スクリプトは動いている Bridge を入れ替えません）。このスクリプトは実行体を `%LOCALAPPDATA%\Programs\VRCRemoteTest\Bridge` に置き、ログオン時のタスクを登録します。
+リリースの `VRCRemoteTest.Bridge.exe` を Windows 上で入手し、公開された SHA-256 と照合してください。自分で開いた、管理者でない PowerShell（5.1 でも 7 でもよい）から、次の形で PowerShell 7 の `pwsh.exe` に実行させます。このスクリプトは実行体を `%LOCALAPPDATA%\Programs\VRCRemoteTest\Bridge` に置き、ログオン時のタスクを登録します。
 
+```powershell
+pwsh.exe -NoProfile -ExecutionPolicy Bypass -File <リポジトリ>\scripts\install-bridge.ps1 -ExpectedSha256 <SHA-256> -SourcePath <ダウンロードしたexe> -StartNow
+```
+
+- `& .\install-bridge.ps1` のように今の PowerShell の中で動かすと、Windows PowerShell 5.1 では実行ポリシー（既定は Restricted）で止まります。ダウンロードしたスクリプトは、PowerShell 7 の RemoteSigned でも止まることがあります。上の形なら、このコマンドに限って実行ポリシーを迂回します。
+- 5.1 で起動したときは、何も変更せずに、上の形のコマンドを示して止まります。
+- 管理者として実行すると、何も変更せずに止まります。管理者の権限で登録したタスクは所有者が Administrators になり、あとで自分では削除できず、次の入れ替えで止まるためです。
 - winget で入れた PowerShell 7 はストア版になり、`%LOCALAPPDATA%\Microsoft\WindowsApps\pwsh.exe` にあります。
-- Windows PowerShell 5.1 は、BOM の無い UTF-8 の日本語を読み違えます。5.1 で動かすスクリプトは ASCII にするか、BOM 付きで保存してください。
+- Windows PowerShell 5.1 は、BOM の無い UTF-8 の日本語を読み違えます。`scripts` の ps1 はどれも BOM 付きで保存してあり、5.1 で起動すると何もせずに `pwsh.exe` での起動し直し方を示します。スクリプトを足すときも、BOM 付きで保存し、冒頭で同じように版を確かめてください（`pwsh -NoProfile -File scripts/test-windows-scripts.ps1` で確かめられます）。
+
+### 版を入れ替える
+
+1. Bridge を止めます: `Stop-ScheduledTask -TaskName VRCRemoteTestBridge`。`Get-Process VRCRemoteTest.Bridge -ErrorAction SilentlyContinue` で何も出なければ止まっています。手で起動した Bridge は `Stop-Process -Id <PID>` で止めます。スクリプトは Bridge を止めません。入れ替えが要るのに Bridge が動いていれば、何も変えずに止まって、止め方とやり直すコマンドを示します。
+2. 上のコマンドを `-StartNow` 付きで実行します。スクリプトは新しい実行体を SHA-256 で照合して置き換え、次にタスクを調べます。
+   - 前の版で登録したタスクの定義（Action、Trigger、Principal、Settings、Description）が同じなら、削除も再登録もせずに残して起動します。
+   - 定義が違えば、削除して登録し直します。削除できなければ（「アクセスが拒否されました」など）、違う箇所と直し方（タスク スケジューラ `taskschd.msc` で削除する、消せなければ管理者の PowerShell で `Unregister-ScheduledTask`）を示して止まります。タスクの記述子から削除できないと分かるときは、実行体を置き換える前に止まります。
+   - 前の版を管理者の権限で入れていた場合は、タスクを自分で削除できません。定義が同じなら残して進み、直し方を表示します。直すには、`Stop-ScheduledTask -TaskName VRCRemoteTestBridge` で Bridge を止め、管理者の PowerShell で `Unregister-ScheduledTask -TaskName VRCRemoteTestBridge -Confirm:$false` を実行してから、管理者でない PowerShell で上のコマンドをもう一度実行します。タスクを削除しても、そのタスクが起動した Bridge は動き続けるので、止めるのは削除の前です。
+   - タスクの段階で止まったときは、実行体とタスクがどの状態で残ったかと、やり直すコマンドを表示します。実行体はもう照合済みなので、やり直しに `-SourcePath` は要りません。
+3. Mac で `vrcrt.sh doctor` を実行し、Bridge の版と実行体の SHA-256 を確かめます。
 - Claude デスクトップアプリのシェルから `%LOCALAPPDATA%` や `LocalLow` に書いたファイルは、アプリ専用の領域に仮想化され、タスクスケジューラーの Bridge からは見えません。`config.json` は、自分で開いた PowerShell 7 で書いてください。`pair` も自分のターミナルで実行してください。
 
 `%LOCALAPPDATA%\VRCRemoteTest\config.json` に次の `Bridge` セクションを用意します。`LanBindAddress` は Windows の開発用 LAN インターフェースの固定 IP です。`VrchatWorldsDirectory` は実在するローカル Worlds ディレクトリを指定します。その他の VRChat 設定は `bridge/README.md` を参照してください。

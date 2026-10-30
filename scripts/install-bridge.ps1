@@ -1,10 +1,16 @@
-#Requires -Version 7.0
-<#
+﻿<#
 .SYNOPSIS
     Bridge (VRCRemoteTest.Bridge.exe) を、信頼できる SHA-256 と照合したうえで
     Windows Task Scheduler に登録し、ログオン時に自動起動させる（仕様書§21）。
 
 .DESCRIPTION
+    PowerShell 7 で、実行ポリシーに止められない形で起動する:
+      pwsh.exe -NoProfile -ExecutionPolicy Bypass -File .\install-bridge.ps1 -ExpectedSha256 <SHA-256> -SourcePath <exe> -StartNow
+    Windows PowerShell 5.1（powershell.exe）で起動されたときは、何も変更せずに
+    上の形の起動し直し方を示して止まる。5.1 が日本語を読み違えて、その案内より
+    前に構文エラーで止まらないよう、このファイルは BOM 付きの UTF-8 で保存する。
+    5.1 でも読めるよう、PowerShell 7 にしかない構文（?? や三項演算子など）は使わない。
+
     Trigger "At log on" / Principal "Interactive, Limited"（非elevated）で
     タスクを登録する。BridgeはWindows Serviceにしない設計（仕様書§20）の
     ため、対話ユーザーセッション上でのみ動作させる必要がある。
@@ -33,7 +39,16 @@
 
     再実行しても安全（冪等）: 配置済みの実行体が期待するハッシュと一致すれば
     -SourcePath は読まずに置き換えを省略する。同名タスクは、本スクリプトが
-    登録したものと判別できたときのみ削除・再登録する。
+    登録したものと判別できたときのみ扱う。その定義（Action、Trigger、Principal、
+    Settings、Description）が登録したい定義と同じなら、削除も再登録もせずに残す。
+    違うときだけ削除・再登録し、削除できなければ、何をすれば直るかを示して止まる
+    （v0.7.1 から v0.8.0 への入れ替えで、Unregister-ScheduledTask が「アクセスが
+    拒否されました」で失敗した。2026-10-31）。タスクの記述子から削除できないと
+    分かるときは、実行体を置き換える前に止まる。タスクの段階で止まったときは、
+    実行体とタスクがどの状態で残ったかと、やり直すコマンドを表示する。
+
+    管理者として実行されたときは、何も変更せずに止まる。管理者の権限で登録した
+    タスクは所有者が Administrators になり、本人が削除できなくなるため（上の失敗の原因）。
 
 .PARAMETER ExpectedSha256
     配置する実行体の SHA-256（16進64文字、大文字小文字は不問）。必須。
@@ -54,10 +69,10 @@
     場合は二重起動を避けるためスキップする。
 
 .EXAMPLE
-    .\install-bridge.ps1 -ExpectedSha256 <64桁のハッシュ>
+    pwsh.exe -NoProfile -ExecutionPolicy Bypass -File .\install-bridge.ps1 -ExpectedSha256 <64桁のハッシュ>
 
 .EXAMPLE
-    .\install-bridge.ps1 -ExpectedSha256 <64桁のハッシュ> -SourcePath C:\Users\USER\Downloads\VRCRemoteTest.Bridge.exe -StartNow
+    pwsh.exe -NoProfile -ExecutionPolicy Bypass -File .\install-bridge.ps1 -ExpectedSha256 <64桁のハッシュ> -SourcePath C:\Users\USER\Downloads\VRCRemoteTest.Bridge.exe -StartNow
 #>
 
 [CmdletBinding()]
@@ -75,7 +90,67 @@ param(
     [switch]$StartNow
 )
 
+# 案内に出す起動コマンド。値は cmd.exe からも PowerShell からも同じに渡る二重引用符で囲む。
+# 版の確認より前に使うので、Windows PowerShell 5.1 でも動く書き方にする。
+function Format-PwshCommand {
+    param([string]$ScriptPath, [System.Collections.IDictionary]$Parameters)
+
+    if (-not $ScriptPath) {
+        $ScriptPath = '.\install-bridge.ps1'
+    }
+
+    $parts = @('pwsh.exe', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"' + $ScriptPath + '"'))
+    foreach ($name in $Parameters.Keys) {
+        $value = $Parameters[$name]
+        if ($value -is [switch] -or $value -is [bool]) {
+            if ($value) {
+                $parts += "-$name"
+            }
+        }
+        elseif ($null -ne $value -and "$value" -ne '') {
+            $parts += "-$name"
+            $parts += ('"' + $value + '"')
+        }
+    }
+
+    $parts -join ' '
+}
+
+# 指定された引数を、案内のコマンドに並べる順で返す。
+function Get-InvocationParameter {
+    param([System.Collections.IDictionary]$Bound, [switch]$WithoutSource)
+
+    $ordered = [ordered]@{}
+    foreach ($name in @('ExpectedSha256', 'SourcePath', 'ExePath', 'TaskName', 'StartNow')) {
+        if ($WithoutSource -and $name -eq 'SourcePath') {
+            continue
+        }
+
+        # $PSBoundParameters には Contains が無く、[ordered] には ContainsKey が無い。
+        if ($Bound.Keys -contains $name) {
+            $ordered[$name] = $Bound[$name]
+        }
+    }
+
+    $ordered
+}
+
+# #Requires -Version 7.0 は使わない。5.1 はそれを英語の一文で断るだけで、
+# どう起動し直せばよいかが分からない（2026-10-31 の入れ替えで 5.1 から起動された）。
+if ($PSVersionTable.PSVersion.Major -lt 7) {
+    Write-Host "このスクリプトは PowerShell 7（pwsh.exe）で実行してください。いまは Windows PowerShell $($PSVersionTable.PSVersion) で動いています。何も変更していません。" -ForegroundColor Red
+    Write-Host "次のコマンドで起動し直してください:" -ForegroundColor Red
+    Write-Host ("  " + (Format-PwshCommand -ScriptPath $PSCommandPath -Parameters (Get-InvocationParameter -Bound $PSBoundParameters)))
+    Write-Host "PowerShell 7 が無ければ、先に入れてください（docs/setup-windows.md の手順1）。"
+    exit 1
+}
+
 $ErrorActionPreference = 'Stop'
+
+# 止まったときに示す、やり直しのコマンド。実行体の置き換えが済んだあとは
+# -SourcePath が要らないので、それを除いたものも用意する。
+$RerunCommand = Format-PwshCommand -ScriptPath $PSCommandPath -Parameters (Get-InvocationParameter -Bound $PSBoundParameters)
+$RerunWithoutSourceCommand = Format-PwshCommand -ScriptPath $PSCommandPath -Parameters (Get-InvocationParameter -Bound $PSBoundParameters -WithoutSource)
 
 $ExpectedExeName = 'VRCRemoteTest.Bridge.exe'
 $TaskPathRoot = '\'
@@ -270,7 +345,8 @@ function Move-VerifiedCandidate {
             if ($attempt -ge $ReplaceMaxAttempts) {
                 throw "実行体の置き換えが $attempt 回とも拒否されました: $($failure.Message)`n" +
                     "配置済みの実行体とタスクは変更していません。Bridge が止まっていること（Get-Process -Name VRCRemoteTest.Bridge）を確かめ、" +
-                    "動いていれば Stop-ScheduledTask -TaskName '$TaskName' -TaskPath '$TaskPathRoot' で止めてから、もう一度実行してください。"
+                    "動いていれば Stop-ScheduledTask -TaskName '$TaskName' -TaskPath '$TaskPathRoot' で止めてから、もう一度実行してください:`n" +
+                    "  $RerunCommand"
             }
 
             if ($attempt -eq 1) {
@@ -282,7 +358,291 @@ function Move-VerifiedCandidate {
     }
 }
 
+function Test-SameTaskPath {
+    param([string]$Actual, [string]$Expected)
+
+    $normalize = { param($p) "$p".Trim().Trim('"').TrimEnd('\', '/') }
+    [string]::Equals((& $normalize $Actual), (& $normalize $Expected), [System.StringComparison]::OrdinalIgnoreCase)
+}
+
+# Task Scheduler はアカウントを登録時の形（PC\user）のほか、ドメイン無しの
+# ユーザー名や SID で返すことがある。どれも現在のユーザーなら同じとみなす。
+function Test-CurrentUserAccount {
+    param([string]$Value, [string]$IdentityName, [string]$Sid)
+
+    if ([string]::IsNullOrEmpty($Value)) {
+        return $false
+    }
+
+    $leaf = $IdentityName.Substring($IdentityName.LastIndexOf('\') + 1)
+    foreach ($candidate in @($IdentityName, $leaf, $Sid)) {
+        if ([string]::Equals($Value, $candidate, [System.StringComparison]::OrdinalIgnoreCase)) {
+            return $true
+        }
+    }
+
+    $false
+}
+
+function Get-CimClassNameOf {
+    param($Item)
+
+    if ($Item -and $Item.CimClass) {
+        return $Item.CimClass.CimClassName
+    }
+
+    $null
+}
+
+# 既存タスクの定義と、登録したい定義（New-ScheduledTask* で作った値）の違いを
+# 1行ずつの説明で返す。同じなら空。タスクの有効・無効は比べない（無効のまま残すため）。
+function Get-TaskDefinitionDifference {
+    param(
+        $Existing,
+        $Action,
+        $Trigger,
+        $Principal,
+        $Settings,
+        [string]$Description,
+        [string]$IdentityName,
+        [string]$Sid
+    )
+
+    $differences = @()
+
+    if ($Existing.Description -ne $Description) {
+        $differences += "Description: '$($Existing.Description)'（登録したい値: '$Description'）"
+    }
+
+    $actions = @($Existing.Actions)
+    if ($actions.Count -ne 1) {
+        $differences += "Action の数: $($actions.Count)（登録したい数: 1）"
+    }
+    else {
+        $actual = $actions[0]
+        if ((Get-CimClassNameOf $actual) -ne (Get-CimClassNameOf $Action)) {
+            $differences += "Action の種類: $(Get-CimClassNameOf $actual)（登録したい種類: $(Get-CimClassNameOf $Action)）"
+        }
+        if (-not (Test-SameTaskPath -Actual $actual.Execute -Expected $Action.Execute)) {
+            $differences += "Action の実行体: '$($actual.Execute)'（登録したい値: '$($Action.Execute)'）"
+        }
+        if (-not [string]::IsNullOrEmpty($actual.Arguments)) {
+            $differences += "Action の引数: '$($actual.Arguments)'（登録したい値: なし）"
+        }
+        if (-not (Test-SameTaskPath -Actual $actual.WorkingDirectory -Expected $Action.WorkingDirectory)) {
+            $differences += "Action の作業ディレクトリ: '$($actual.WorkingDirectory)'（登録したい値: '$($Action.WorkingDirectory)'）"
+        }
+    }
+
+    $triggers = @($Existing.Triggers)
+    if ($triggers.Count -ne 1) {
+        $differences += "Trigger の数: $($triggers.Count)（登録したい数: 1）"
+    }
+    else {
+        $actual = $triggers[0]
+        if ((Get-CimClassNameOf $actual) -ne (Get-CimClassNameOf $Trigger)) {
+            $differences += "Trigger の種類: $(Get-CimClassNameOf $actual)（登録したい種類: $(Get-CimClassNameOf $Trigger)、ログオン時）"
+        }
+        if (-not (Test-CurrentUserAccount -Value $actual.UserId -IdentityName $IdentityName -Sid $Sid)) {
+            $differences += "Trigger のユーザー: '$($actual.UserId)'（登録したい値: '$IdentityName'）"
+        }
+        if ($actual.Enabled -eq $false) {
+            $differences += "Trigger が無効になっています"
+        }
+    }
+
+    $actualPrincipal = $Existing.Principal
+    if (-not (Test-CurrentUserAccount -Value $actualPrincipal.UserId -IdentityName $IdentityName -Sid $Sid)) {
+        $differences += "Principal のユーザー: '$($actualPrincipal.UserId)'（登録したい値: '$IdentityName'）"
+    }
+    foreach ($name in @('LogonType', 'RunLevel')) {
+        if ("$($actualPrincipal.$name)" -ne "$($Principal.$name)") {
+            $differences += "Principal の ${name}: '$($actualPrincipal.$name)'（登録したい値: '$($Principal.$name)'）"
+        }
+    }
+
+    foreach ($name in @('MultipleInstances', 'ExecutionTimeLimit', 'StartWhenAvailable')) {
+        if ("$($Existing.Settings.$name)" -ne "$($Settings.$name)") {
+            $differences += "Settings の ${name}: '$($Existing.Settings.$name)'（登録したい値: '$($Settings.$name)'）"
+        }
+    }
+
+    # 1行ずつ出す。呼び出し側は @() で受ける（, で包むと、@() の中で
+    # 「空の配列を1つ持つ配列」になり、同じ定義でも違うと判定される。2026-10-31）。
+    $differences
+}
+
+# タスクの段階で止まったときに、実行体とタスクがどの状態で残ったかを説明する。
+# TaskState: none（もともと無い）/ original（元のタスクに触れていない）/
+# kept（定義が同じなので元のタスクを残した）/ removed（削除して未登録）/ registered（登録し直した）
+function Format-StopState {
+    param(
+        [bool]$ExeReplaced,
+        [string]$ExePath,
+        [string]$TaskState,
+        [string]$TaskName,
+        [string]$TaskPath,
+        [string]$RerunCommand
+    )
+
+    $lines = @('--- どの状態で止まったか ---')
+
+    if ($ExeReplaced) {
+        $lines += "実行体: SHA-256 を照合した新しい実行体に置き換え済み（$ExePath）"
+    }
+    else {
+        $lines += "実行体: 置き換えていない。配置済みの実行体は期待する SHA-256 と一致している（$ExePath）"
+    }
+
+    switch ($TaskState) {
+        'none' { $lines += "タスク '$TaskName': 登録されていない。ログオン時に Bridge は起動しない" }
+        'original' { $lines += "タスク '$TaskName': 元のまま残っている（削除も再登録もしていない）" }
+        'kept' { $lines += "タスク '$TaskName': 定義が同じなので、元のタスクをそのまま残した" }
+        'removed' { $lines += "タスク '$TaskName': 削除したが、登録し直せていない。ログオン時に Bridge は起動しない" }
+        'registered' { $lines += "タスク '$TaskName': 登録し直した" }
+        default { $lines += "タスク '$TaskName': 状態不明（$TaskState）" }
+    }
+
+    $lines += "Bridge: このスクリプトは起動していない"
+
+    if ($TaskState -in @('original', 'kept', 'registered')) {
+        $lines += "今すぐ Bridge を動かすだけなら: Start-ScheduledTask -TaskName '$TaskName' -TaskPath '$TaskPath'"
+    }
+
+    $lines += "原因を直したら、自分で開いた PowerShell で次を実行してやり直す（実行体は一致しているので、置き換えは省略される）:"
+    $lines += "  $RerunCommand"
+
+    $lines -join [Environment]::NewLine
+}
+
+# Task Scheduler の SDDL（例: O:BAG:…D:(A;ID;0x1f019f;;;BA)(A;;FR;;;S-1-5-21-…)）で、
+# Sids のどれかに DELETE を許す ACE があるかを 'yes' / 'no' / 'unknown' で返す。
+# 'no' のときだけ先に止めるので、読み違えても止まらない側に倒す（Deny の ACE は見ず、
+# 書き換えの権利や知らない書き方は 'unknown' にする）。
+function Get-SddlDeleteAccess {
+    param([string]$Sddl, [string[]]$Sids)
+
+    $pattern = '^(?:O:(?:S-[0-9-]+|[A-Z]{2}))?(?:G:(?:S-[0-9-]+|[A-Z]{2}))?D:(?<flags>[A-Z_]*)(?<aces>(?:\([^)]*\))*)'
+    if ([string]::IsNullOrEmpty($Sddl) -or $Sddl -cnotmatch $pattern) {
+        return 'unknown'
+    }
+
+    # NO_ACCESS_CONTROL（null DACL）は全員に全部を許す。
+    if ($Matches['flags'].Contains('NO_ACCESS_CONTROL')) {
+        return 'unknown'
+    }
+
+    $aces = @([regex]::Matches($Matches['aces'], '\(([^)]*)\)') | ForEach-Object { $_.Groups[1].Value })
+    $aliases = @{
+        BA = 'S-1-5-32-544'; BU = 'S-1-5-32-545'; PU = 'S-1-5-32-547'; SY = 'S-1-5-18'; LS = 'S-1-5-19'; NS = 'S-1-5-20'
+        AU = 'S-1-5-11'; IU = 'S-1-5-4'; WD = 'S-1-1-0'; CO = 'S-1-3-0'; OW = 'S-1-3-4'
+    }
+    $grantCodes = @('GA', 'SD', 'FA', 'KA')
+    $maybeCodes = @('GW', 'WD', 'WO')
+    # DELETE と GENERIC_ALL / GENERIC_WRITE、WRITE_DAC、WRITE_OWNER。
+    $grantBits = [int64](0x10000 -bor 0x10000000)
+    $maybeBits = [int64](0x40000000 -bor 0x40000 -bor 0x80000)
+
+    $unknown = $false
+    foreach ($ace in $aces) {
+        $fields = $ace.Split(';')
+        if ($fields.Count -lt 6) {
+            $unknown = $true
+            continue
+        }
+
+        $type = $fields[0]
+        $flags = $fields[1]
+        $rights = $fields[2]
+        $sid = $fields[5]
+
+        if ($type -eq 'D') {
+            continue
+        }
+        # IO（継承専用）の ACE はこの物自体には効かない。フラグは2文字ずつ並ぶ。
+        if ($flags -cmatch '^(?:..)*IO') {
+            continue
+        }
+
+        $grants = $false
+        $maybe = $false
+        if ($rights -match '^0[xX][0-9A-Fa-f]+$') {
+            $mask = [Convert]::ToInt64($rights.Substring(2), 16)
+            $grants = ($mask -band $grantBits) -ne 0
+            $maybe = ($mask -band $maybeBits) -ne 0
+        }
+        elseif ($rights.Length % 2 -eq 0) {
+            $codes = for ($i = 0; $i -lt $rights.Length; $i += 2) { $rights.Substring($i, 2) }
+            $grants = @($codes | Where-Object { $_ -in $grantCodes }).Count -gt 0
+            $maybe = @($codes | Where-Object { $_ -in $maybeCodes }).Count -gt 0
+        }
+        else {
+            $unknown = $true
+            continue
+        }
+
+        if (-not ($grants -or $maybe)) {
+            continue
+        }
+
+        if ($sid -notmatch '^S-') {
+            if ($aliases.ContainsKey($sid)) {
+                $sid = $aliases[$sid]
+            }
+            else {
+                $unknown = $true
+                continue
+            }
+        }
+
+        if ($Sids -notcontains $sid) {
+            continue
+        }
+
+        if ($type -ne 'A' -or -not $grants) {
+            $unknown = $true
+            continue
+        }
+
+        return 'yes'
+    }
+
+    if ($unknown) {
+        return 'unknown'
+    }
+
+    'no'
+}
+
+# 読めなければ $null（判断しない）。
+function Get-TaskSddl {
+    param([string]$TaskName, [string]$TaskPath)
+
+    try {
+        $service = New-Object -ComObject 'Schedule.Service'
+        $service.Connect()
+        # OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION
+        $service.GetFolder($TaskPath).GetTask($TaskName).GetSecurityDescriptor(0x5)
+    }
+    catch {
+        $null
+    }
+}
+
 # --- パラメーターと配置先の検査（ここまでは何も変更しない。配置先ディレクトリの作成のみ） ---
+
+# 管理者の権限で登録したタスクは所有者が Administrators になり、本人には読み取りしか
+# 許されない。すると次の入れ替えで本人がタスクを削除できず、Unregister-ScheduledTask が
+# 「アクセスが拒否されました」で止まる（2026-10-31、v0.7.1 から v0.8.0 への入れ替え。
+# タスクの記述子は O:BA で、本人の ACE は FR だけだった）。
+$currentIdentity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+$identity = $currentIdentity.Name
+$identitySid = $currentIdentity.User.Value
+if (([System.Security.Principal.WindowsPrincipal]::new($currentIdentity)).IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    throw "管理者として実行しないでください。何も変更していません。`n" +
+        "管理者の権限で登録したタスクは、あとでこのユーザーが削除できなくなり、次の入れ替えで止まります。" +
+        "管理者でない PowerShell を開いて、次を実行してください:`n  $RerunCommand"
+}
 
 Assert-ExeLeafName -Path $ExePath -ParamName '-ExePath'
 Assert-LocalAbsolutePath -Path $ExePath -ParamName '-ExePath'
@@ -350,7 +710,42 @@ if ($otherBridges.Count -gt 0) {
         "同じ共有を二重に処理しないよう、不要なら停止してください。")
 }
 
+# --- タスクの定義と削除の権利の確認（何も変更しない） ---
+
+$action = New-ScheduledTaskAction -Execute $ExePath -WorkingDirectory $destDir
+$trigger = New-ScheduledTaskTrigger -AtLogOn -User $identity
+$principal = New-ScheduledTaskPrincipal -UserId $identity -LogonType Interactive -RunLevel Limited
+$settings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -ExecutionTimeLimit ([TimeSpan]::Zero) -StartWhenAvailable -Disable:$wasDisabled
+
+$differences = @()
+if ($existingTask) {
+    $differences = @(Get-TaskDefinitionDifference -Existing $existingTask -Action $action -Trigger $trigger `
+            -Principal $principal -Settings $settings -Description $OwnershipDescription -IdentityName $identity -Sid $identitySid)
+
+    # 削除できないと分かっていれば、実行体を置き換える前に止まる。
+    $tokenSids = @($identitySid) + @($currentIdentity.Groups | ForEach-Object { $_.Value })
+    $deleteAccess = Get-SddlDeleteAccess -Sddl (Get-TaskSddl -TaskName $TaskName -TaskPath $TaskPathRoot) -Sids $tokenSids
+    if ($deleteAccess -eq 'no') {
+        # タスクを削除しても、そのタスクが起動した Bridge は動き続ける。削除の前に止める
+        # （止めないと -StartNow が「既に実行中」で起動を飛ばし、古いプロセスが残る。2026-10-31）。
+        $fixSteps = "  1. Stop-ScheduledTask -TaskName '$TaskName' -TaskPath '$TaskPathRoot'（Bridge を止める）`n" +
+            "  2. 管理者の PowerShell で: Unregister-ScheduledTask -TaskName '$TaskName' -TaskPath '$TaskPathRoot' -Confirm:`$false`n" +
+            "  3. 管理者でない PowerShell で: $RerunCommand"
+        if ($differences.Count -gt 0) {
+            throw "既存タスク '$TaskName' の定義が違うため登録し直す必要がありますが、このユーザーにはタスクを削除する権利がありません" +
+                "（管理者の権限で登録されたタスクと見られます）。実行体とタスクは変更していません。`n" +
+                "違い:`n" + (($differences | ForEach-Object { "  $_" }) -join "`n") + "`n" +
+                "直し方:`n$fixSteps"
+        }
+
+        Write-Host ("既存タスク '$TaskName' は管理者の権限で登録されたと見られ、このユーザーには削除できません。" +
+            "今回は定義が同じなので残しますが、定義が変わる入れ替えでは止まります。直しておくには:`n$fixSteps") -ForegroundColor Yellow
+    }
+}
+
 # --- 実行体の配置 ---
+
+$exeReplaced = $false
 
 if ($exeExists -and ((Get-Sha256Hex -Path $ExePath) -ieq $ExpectedSha256)) {
     Write-Host "配置済みの実行体は期待する SHA-256 と一致するため、置き換えを省略します: $ExePath" -ForegroundColor Yellow
@@ -376,7 +771,8 @@ else {
     if ($running) {
         throw "実行体を置き換えるには、稼働中の Bridge（PID: $($running.Id -join ', ')）を先に停止してください。`n" +
             "例: Stop-ScheduledTask -TaskName '$TaskName' -TaskPath '$TaskPathRoot'（手動起動の場合は Stop-Process -Id <PID>）`n" +
-            "配置済みの実行体とタスクは変更していません。"
+            "配置済みの実行体とタスクは変更していません。止めたら、もう一度実行してください:`n" +
+            "  $RerunCommand"
     }
 
     $candidate = Join-Path $destDir ('.' + [guid]::NewGuid().ToString('N') + '.candidate')
@@ -392,6 +788,7 @@ else {
 
         # 同じディレクトリ内の rename。照合済みの候補そのものが ExePath になる。
         $attempts = Move-VerifiedCandidate -Candidate $candidate -Destination $ExePath
+        $exeReplaced = $true
         if ($attempts -gt 1) {
             Write-Host "SHA-256 を照合した実行体を、$attempts 回目の置き換えで配置しました: $ExePath" -ForegroundColor Green
         }
@@ -408,41 +805,78 @@ else {
 
 # --- タスク登録 ---
 
-$identity = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
-
 Write-Host "Exe:      $ExePath"
 Write-Host "Identity: $identity"
 Write-Host "TaskName: $TaskName"
 
+$taskState = 'none'
 if ($existingTask) {
-    Write-Host "既存タスクを削除します（本スクリプト管理下のタスクと確認済み）..." -ForegroundColor Yellow
-    Unregister-ScheduledTask -TaskName $TaskName -TaskPath $TaskPathRoot -Confirm:$false
+    $taskState = 'original'
 }
 
-$action = New-ScheduledTaskAction -Execute $ExePath -WorkingDirectory $destDir
-$trigger = New-ScheduledTaskTrigger -AtLogOn -User $identity
-$principal = New-ScheduledTaskPrincipal -UserId $identity -LogonType Interactive -RunLevel Limited
-$settings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -ExecutionTimeLimit ([TimeSpan]::Zero) -StartWhenAvailable -Disable:$wasDisabled
+# ここから先で止まったときは、実行体とタスクがどの状態で残ったかを必ず示す。
+try {
+    $needsRegister = $true
+    if ($existingTask) {
+        if ($differences.Count -eq 0) {
+            $needsRegister = $false
+            $taskState = 'kept'
+            Write-Host "既存タスク '$TaskName' は登録したい定義と同じなので、削除も再登録もせずに残します。" -ForegroundColor Yellow
+        }
+        else {
+            Write-Host "既存タスク '$TaskName' の定義が違うため、削除して登録し直します（本スクリプト管理下のタスクと確認済み）:" -ForegroundColor Yellow
+            $differences | ForEach-Object { Write-Host "  $_" }
 
-Register-ScheduledTask -TaskName $TaskName -TaskPath $TaskPathRoot -Action $action -Trigger $trigger `
-    -Principal $principal -Settings $settings -Description $OwnershipDescription | Out-Null
+            try {
+                Unregister-ScheduledTask -TaskName $TaskName -TaskPath $TaskPathRoot -Confirm:$false
+            }
+            catch {
+                throw "既存タスク '$TaskName' を削除できませんでした: $($_.Exception.Message)`n" +
+                    "直し方: Bridge が動いていれば、先に Stop-ScheduledTask -TaskName '$TaskName' -TaskPath '$TaskPathRoot' で止めてください" +
+                    "（タスクを削除しても、そのタスクが起動した Bridge は動き続けます）。" +
+                    "そのあとタスク スケジューラ（taskschd.msc）でタスク '$TaskName' を削除してください。" +
+                    "削除できなければ、管理者の PowerShell で Unregister-ScheduledTask -TaskName '$TaskName' -TaskPath '$TaskPathRoot' -Confirm:`$false を実行してください。" +
+                    "そのあとのやり直しは、管理者でない PowerShell で行ってください。"
+            }
 
-if ($wasDisabled) {
-    Write-Host "タスク '$TaskName' を再登録しました（無効化された状態を維持）。" -ForegroundColor Yellow
-}
-else {
-    Write-Host "タスク '$TaskName' を登録しました（ログオン時に自動起動、非elevated）。" -ForegroundColor Green
-}
-
-if ($StartNow) {
-    $running = Get-RunningBridge -Path $ExePath
-    if ($running) {
-        Write-Warning "既に $ExePath を実行中のプロセスがあります（PID: $($running.Id -join ', ')）。二重起動を避けるため Start-ScheduledTask はスキップします。"
+            $taskState = 'removed'
+        }
     }
-    else {
-        Start-ScheduledTask -TaskName $TaskName -TaskPath $TaskPathRoot
-        Write-Host "タスクを起動しました。" -ForegroundColor Green
+
+    if ($needsRegister) {
+        Register-ScheduledTask -TaskName $TaskName -TaskPath $TaskPathRoot -Action $action -Trigger $trigger `
+            -Principal $principal -Settings $settings -Description $OwnershipDescription | Out-Null
+        $taskState = 'registered'
+
+        if ($wasDisabled) {
+            Write-Host "タスク '$TaskName' を再登録しました（無効化された状態を維持）。" -ForegroundColor Yellow
+        }
+        else {
+            Write-Host "タスク '$TaskName' を登録しました（ログオン時に自動起動、非elevated）。" -ForegroundColor Green
+        }
     }
+    elseif ($wasDisabled) {
+        Write-Host "タスク '$TaskName' は無効化された状態のままです。" -ForegroundColor Yellow
+    }
+
+    if ($StartNow) {
+        $running = Get-RunningBridge -Path $ExePath
+        if ($running) {
+            Write-Warning "既に $ExePath を実行中のプロセスがあります（PID: $($running.Id -join ', ')）。二重起動を避けるため Start-ScheduledTask はスキップします。"
+        }
+        else {
+            Start-ScheduledTask -TaskName $TaskName -TaskPath $TaskPathRoot
+            Write-Host "タスクを起動しました。" -ForegroundColor Green
+        }
+    }
+}
+catch {
+    Write-Host ""
+    Write-Host "失敗しました: $($_.Exception.Message)" -ForegroundColor Red
+    Write-Host ""
+    Write-Host (Format-StopState -ExeReplaced $exeReplaced -ExePath $ExePath -TaskState $taskState -TaskName $TaskName `
+            -TaskPath $TaskPathRoot -RerunCommand $RerunWithoutSourceCommand) -ForegroundColor Yellow
+    exit 1
 }
 
 Write-Host ""
