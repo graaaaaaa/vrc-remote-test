@@ -7,6 +7,9 @@ namespace VRCRemoteTest.Bridge.Configuration;
 
 public sealed class ConfigFileException(string message) : Exception(message);
 
+/// <summary>config.json is no longer the file a change was based on (edited on Windows meanwhile).</summary>
+public sealed class ConfigChangedException() : IOException("config.json changed on Windows meanwhile; it was left as it is.");
+
 /// <summary>
 /// Reading and writing config.json for a change made through the LAN API. The file is read
 /// as leniently as the configuration provider reads it (comments, trailing commas, a UTF-8
@@ -51,17 +54,41 @@ public static class ConfigFile
             span = span[Encoding.UTF8.Preamble.Length..];
         }
 
-        JsonNode? node;
         try
         {
-            node = JsonNode.Parse(span, documentOptions: ReadOptions);
+            var root = JsonNode.Parse(span, documentOptions: ReadOptions) as JsonObject
+                ?? throw new ConfigFileException("config.json must hold a JSON object.");
+
+            // JsonObject reads its properties lazily: a name repeated anywhere surfaces here
+            // rather than in the middle of a change.
+            Materialize(root);
+            return root;
         }
-        catch (Exception ex) when (ex is JsonException or ArgumentException)
+        catch (Exception ex) when (ex is JsonException or ArgumentException or InvalidOperationException)
         {
             throw new ConfigFileException("config.json is not valid JSON: " + ex.Message);
         }
+    }
 
-        return node as JsonObject ?? throw new ConfigFileException("config.json must hold a JSON object.");
+    private static void Materialize(JsonNode? node)
+    {
+        switch (node)
+        {
+            case JsonObject obj:
+                foreach (var (_, child) in obj)
+                {
+                    Materialize(child);
+                }
+
+                break;
+            case JsonArray array:
+                foreach (var child in array)
+                {
+                    Materialize(child);
+                }
+
+                break;
+        }
     }
 
     public static byte[] Serialize(JsonObject root) =>
@@ -131,31 +158,46 @@ public static class ConfigFile
 
     /// <summary>
     /// Writes a flushed temporary file next to <paramref name="path"/> and moves it over the
-    /// file, retrying a few times while Windows reports the file in use. On failure the old
-    /// file is unchanged and the exception is thrown.
+    /// file, retrying a few times while Windows reports the file in use. Before every attempt
+    /// the file must still be <paramref name="expectedEtag"/> (<see cref="MissingEtag"/>: no
+    /// file), so an edit saved on Windows meanwhile is never overwritten
+    /// (<see cref="ConfigChangedException"/>); only the instant between that check and the
+    /// move stays open. On any failure the old file is unchanged.
     /// </summary>
-    public static void Replace(string path, byte[] bytes)
+    public static void Replace(string path, byte[] bytes, string expectedEtag)
     {
         var temp = path + ".tmp";
         WriteFlushed(temp, bytes, FileMode.Create);
-        for (var attempt = 1; ; attempt++)
+        try
         {
-            try
+            for (var attempt = 1; ; attempt++)
             {
-                File.Move(temp, path, overwrite: true);
-                return;
-            }
-            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException && attempt < 5)
-            {
-                Thread.Sleep(200 * attempt);
-            }
-            catch
-            {
-                TryDelete(temp);
-                throw;
+                if (CurrentEtag(path) != expectedEtag)
+                {
+                    throw new ConfigChangedException();
+                }
+
+                try
+                {
+                    File.Move(temp, path, overwrite: true);
+                    return;
+                }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException && attempt < 5)
+                {
+                    Thread.Sleep(200 * attempt);
+                }
             }
         }
+        catch
+        {
+            TryDelete(temp);
+            throw;
+        }
     }
+
+    /// <summary>The etag of the file now: <see cref="MissingEtag"/> when there is none. Throws when it cannot be read.</summary>
+    public static string CurrentEtag(string path) =>
+        File.Exists(path) ? EtagOf(File.ReadAllBytes(path)) : MissingEtag;
 
     private static void WriteFlushed(string path, byte[] bytes, FileMode mode)
     {

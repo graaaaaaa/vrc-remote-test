@@ -50,6 +50,11 @@ public enum RestartRequestResult
 /// the logger are held by Program around it. A host (DI, options, hosted services, Kestrel)
 /// is built from config.json each time, so a restart applies a changed configuration
 /// without touching the process, the scheduled task or the pairing.
+///
+/// The gate starts closed and closes again whenever a restart is scheduled; only
+/// <see cref="OnHostStarted"/> opens it. Kestrel answers as soon as a host starts, so no
+/// management request can get in between that and the host being recorded as started
+/// (which would otherwise lose a restart scheduled in that moment).
 /// </summary>
 public sealed class BridgeRuntime
 {
@@ -67,6 +72,9 @@ public sealed class BridgeRuntime
     private bool _restartScheduled;
     private ConfigApplyReport? _lastConfigApply;
 
+    /// <summary>A change whose host could not start: config.json was put back, and the host built from it is starting.</summary>
+    private (PendingConfigApply Apply, string Problem)? _rollingBack;
+
     public BridgeRuntime(
         string configDirectory,
         BridgeIdentity identity,
@@ -81,6 +89,7 @@ public sealed class BridgeRuntime
         _utcNow = utcNow ?? (() => DateTimeOffset.UtcNow);
         ProcessStartedAtUtc = _utcNow();
         _lastConfigApply = LoadApplyReport();
+        Gate.MarkRestartPending();
     }
 
     public string ConfigDirectory { get; }
@@ -120,6 +129,12 @@ public sealed class BridgeRuntime
         get { lock (_sync) return _lastConfigApply; }
     }
 
+    /// <summary>A restart has been asked for and the next host has not started yet.</summary>
+    public bool RestartScheduled
+    {
+        get { lock (_sync) return _restartScheduled; }
+    }
+
     internal PendingConfigApply? PendingApply { get; private set; }
 
     public static string? HashFile(string? path)
@@ -143,7 +158,9 @@ public sealed class BridgeRuntime
     /// <summary>
     /// Asks the running host to stop so the next one is built from config.json.
     /// <paramref name="apply"/> is the configuration change that needs it; a plain request
-    /// (null) is refused within <see cref="MinRestartInterval"/> of the last start.
+    /// (null) is refused within <see cref="MinRestartInterval"/> of the last start. Callers
+    /// hold the gate, which is open only while a host runs, so this never races
+    /// <see cref="OnHostStarted"/>.
     /// </summary>
     internal RestartRequestResult RequestRestart(PendingConfigApply? apply)
     {
@@ -192,64 +209,64 @@ public sealed class BridgeRuntime
             ActiveConfigEtag = activeConfigEtag;
             _restartScheduled = false;
             _restartSignal = NewSignal();
-            if (PendingApply is { } apply)
+            if (_rollingBack is { } rollback)
             {
-                SetReport(new ConfigApplyReport
-                {
-                    OperationId = apply.OperationId,
-                    RequestedEtag = apply.WrittenEtag,
-                    Outcome = activeConfigEtag == apply.WrittenEtag ? "applied" : "failed",
-                    Problems = activeConfigEtag == apply.WrittenEtag
-                        ? []
-                        : ["config.json changed on Windows after the change was written; the host runs that file instead."],
-                    AtUtc = _utcNow(),
-                });
-                PendingApply = null;
+                SetReport(Report(rollback.Apply, "rolledBack", [rollback.Problem]));
+                _rollingBack = null;
             }
+            else if (PendingApply is { } apply)
+            {
+                var applied = activeConfigEtag == apply.WrittenEtag;
+                SetReport(Report(apply, applied ? "applied" : "failed", applied
+                    ? []
+                    : ["config.json changed on Windows after the change was written; the host runs that file instead."]));
+            }
+
+            PendingApply = null;
         }
 
         Gate.HostStarted();
     }
 
-    internal void ReportRolledBack(PendingConfigApply apply, string problem)
+    /// <summary>config.json was put back after <paramref name="apply"/>'s host failed; the outcome is known once the next host starts or fails.</summary>
+    internal void BeginRollback(PendingConfigApply apply, string problem)
     {
         lock (_sync)
         {
-            SetReport(new ConfigApplyReport
-            {
-                OperationId = apply.OperationId,
-                RequestedEtag = apply.WrittenEtag,
-                Outcome = "rolledBack",
-                Problems = [problem],
-                AtUtc = _utcNow(),
-            });
+            _rollingBack = (apply, problem);
             PendingApply = null;
         }
     }
 
-    internal void ReportFailed(PendingConfigApply apply, IReadOnlyList<string> problems)
+    /// <summary>No host could start; whatever change was in flight failed, with every reason known.</summary>
+    internal void ReportStartFailure(string problem, string? notRestored)
     {
         lock (_sync)
         {
-            SetReport(new ConfigApplyReport
+            if (_rollingBack is { } rollback)
             {
-                OperationId = apply.OperationId,
-                RequestedEtag = apply.WrittenEtag,
-                Outcome = "failed",
-                Problems = problems,
-                AtUtc = _utcNow(),
-            });
-            PendingApply = null;
+                SetReport(Report(rollback.Apply, "failed",
+                    [rollback.Problem, "The host built from the previous config.json could not start either: " + problem]));
+                _rollingBack = null;
+            }
+            else if (PendingApply is { } apply)
+            {
+                SetReport(Report(apply, "failed", notRestored is null ? [problem] : [problem, notRestored]));
+                PendingApply = null;
+            }
         }
     }
 
-    private ConfigApplyReport Pending(PendingConfigApply apply) => new()
+    private ConfigApplyReport Report(PendingConfigApply apply, string outcome, IReadOnlyList<string> problems) => new()
     {
         OperationId = apply.OperationId,
         RequestedEtag = apply.WrittenEtag,
-        Outcome = "pending",
+        Outcome = outcome,
+        Problems = problems.Select(LogRedactor.Redact).ToList(),
         AtUtc = _utcNow(),
     };
+
+    private ConfigApplyReport Pending(PendingConfigApply apply) => Report(apply, "pending", []);
 
     /// <summary>Kept on disk too, so a Bridge that had to stop shows why when it is started again.</summary>
     private void SetReport(ConfigApplyReport report)

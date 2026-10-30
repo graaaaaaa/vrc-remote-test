@@ -207,30 +207,45 @@ public sealed class AccountTests : IDisposable
     }
 
     [Fact]
-    public void A_broken_key_is_replaced_and_old_profile_accounts_are_discarded()
+    public void A_broken_key_is_replaced_and_accounts_recorded_under_the_old_key_are_never_read()
     {
-        AccountDigest.LoadOrCreate(_state);
+        var first = AccountDigest.LoadOrCreate(_state);
+        new ProfileAccountStore(_state, first.KeyId).Record(Account(0, "aaaaaaaaaaaa", 1)).Should().BeTrue();
+        new ProfileAccountStore(_state, first.KeyId).All.Should().ContainSingle("the same key reads them back");
+
         File.WriteAllBytes(Path.Combine(_state, AccountDigest.KeyFileName), [1, 2, 3]);
-        var store = new ProfileAccountStore(_state, discard: false);
+        var second = AccountDigest.LoadOrCreate(_state);
+
+        second.Regenerated.Should().BeTrue();
+        second.KeyId.Should().NotBe(first.KeyId);
+        new ProfileAccountStore(_state, second.KeyId).All.Should().BeEmpty();
+    }
+
+    [Fact]
+    public void A_login_that_could_not_be_written_is_written_with_the_next_poll()
+    {
+        var status = Path.Combine(_state, "status");
+        File.WriteAllText(status, "a file where the folder belongs");
+        var store = new ProfileAccountStore(_state, "key");
+
+        store.Record(Account(0, "aaaaaaaaaaaa", 1)).Should().BeFalse();
+        store.All.Should().BeEmpty();
+
+        File.Delete(status);
         store.Record(Account(0, "aaaaaaaaaaaa", 1)).Should().BeTrue();
-
-        var digest = AccountDigest.LoadOrCreate(_state);
-        var reopened = new ProfileAccountStore(_state, digest.Regenerated);
-
-        digest.Regenerated.Should().BeTrue();
-        reopened.All.Should().BeEmpty();
+        new ProfileAccountStore(_state, "key").All.Should().ContainSingle();
     }
 
     [Fact]
     public void A_profile_keeps_its_newest_login_and_two_profiles_on_one_account_are_warned()
     {
-        var store = new ProfileAccountStore(_state, discard: false);
+        var store = new ProfileAccountStore(_state, "key");
 
         store.Record(Account(0, "aaaaaaaaaaaa", 10)).Should().BeTrue();
         store.Record(Account(0, "bbbbbbbbbbbb", 5)).Should().BeFalse("an older line read again never replaces a newer one");
         store.Record(Account(1, "aaaaaaaaaaaa", 11)).Should().BeTrue();
 
-        var reopened = new ProfileAccountStore(_state, discard: false);
+        var reopened = new ProfileAccountStore(_state, "key");
         reopened.All.Select(a => (a.Profile, a.IdDigest)).Should().Equal((0, "aaaaaaaaaaaa"), (1, "aaaaaaaaaaaa"));
         reopened.SameAccountWarnings([0, 1]).Should().ContainSingle().Which.Should().Contain("Profiles 0 and 1");
         reopened.SameAccountWarnings([0]).Should().BeEmpty();
@@ -324,6 +339,19 @@ public sealed class OwnedClientCloserTests
     }
 
     [Fact]
+    public async Task A_record_that_cannot_be_written_after_closing_is_reported()
+    {
+        Process(11, _relaunch);
+        _relaunch.FailingSaves = [0];
+
+        var report = await Closer().CloseAsync(requireNoOthers: true, CancellationToken.None);
+
+        report.Closed.Should().Be(1);
+        report.RecordNotUpdated.Should().BeTrue();
+        report.Problem.Should().Contain("could not update its record");
+    }
+
+    [Fact]
     public async Task A_reused_pid_is_not_the_bridges_client()
     {
         var reused = Process(11, null);
@@ -359,6 +387,48 @@ public sealed class BridgeOperationGateTests
         gate.TryEnter("deploy").Should().BeNull();
         gate.HostStarted();
         gate.TryEnter("deploy").Should().NotBeNull();
+    }
+
+    [Fact]
+    public void Nothing_enters_before_the_first_host_has_started()
+    {
+        var state = Directory.CreateTempSubdirectory("vrcrt-runtime-").FullName;
+        try
+        {
+            var runtime = new BridgeRuntime(state, BridgeIdentity.LoadOrCreate(state), AccountDigest.ForKey(new byte[32]), null);
+
+            runtime.Gate.TryEnter("config").Should().BeNull("Kestrel answers before the host is recorded as started");
+            runtime.OnHostStarted("etag");
+            using (runtime.Gate.TryEnter("config"))
+            {
+                runtime.RequestRestart(null).Should().Be(RestartRequestResult.TooSoon);
+            }
+        }
+        finally
+        {
+            Directory.Delete(state, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void A_replace_never_overwrites_an_edit_made_meanwhile()
+    {
+        var directory = Directory.CreateTempSubdirectory("vrcrt-replace-").FullName;
+        try
+        {
+            var path = Path.Combine(directory, "config.json");
+            File.WriteAllText(path, "{\"edited\": true}");
+
+            var act = () => ConfigFile.Replace(path, Encoding.UTF8.GetBytes("{}"), ConfigFile.EtagOf(Encoding.UTF8.GetBytes("{\"old\": 1}")));
+
+            act.Should().Throw<ConfigChangedException>();
+            File.ReadAllText(path).Should().Be("{\"edited\": true}");
+            Directory.GetFiles(directory).Should().ContainSingle("the temporary file is removed");
+        }
+        finally
+        {
+            Directory.Delete(directory, recursive: true);
+        }
     }
 
     [Fact]
@@ -477,7 +547,7 @@ public sealed class LaunchReportTests : IDisposable
     [Fact]
     public async Task A_relaunch_reports_closed_and_started_clients_and_same_account_profiles()
     {
-        var profiles = new ProfileAccountStore(State, discard: false);
+        var profiles = new ProfileAccountStore(State, "key");
         foreach (var profile in new[] { 0, 1 })
         {
             profiles.Record(new ProfileAccount

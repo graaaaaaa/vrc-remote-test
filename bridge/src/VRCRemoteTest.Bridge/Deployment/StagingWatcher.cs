@@ -78,7 +78,11 @@ public sealed class StagingWatcher : BackgroundService, IBridgeWatcher
         _options = options.Value;
         _validator = validator;
         _installer = installer;
-        _resultWriter = resultWriter;
+        _resultWriter = new DefaultLaunchWriter(resultWriter, () => new LaunchReport
+        {
+            Attempted = false,
+            Outcome = _options.AutoLaunchVrchat ? LaunchReport.NotReached : LaunchReport.Disabled,
+        });
         _cleanupService = cleanupService;
         _clientCoordinator = clientCoordinator;
         _logNotice = logNotice;
@@ -89,6 +93,30 @@ public sealed class StagingWatcher : BackgroundService, IBridgeWatcher
     }
 
     private const string DeployOperation = "deploy";
+
+    /// <summary>
+    /// Every result says what happened to VRChat: a result written without a launch report
+    /// (validation failures and the like, before VRChat was looked at) gets notReached, or
+    /// disabled when AutoLaunchVrchat is off.
+    /// </summary>
+    private sealed class DefaultLaunchWriter(IResultWriter inner, Func<LaunchReport> notLaunched) : IResultWriter
+    {
+        public void WriteSuccess(string buildId, string deployedFileName, string sha256, string resultsDirectory) =>
+            inner.WriteSuccess(buildId, deployedFileName, sha256, resultsDirectory, new BuildResultExtras(notLaunched()));
+
+        public void WriteFailure(string buildId, string errorCode, string errorMessage, string resultsDirectory) =>
+            inner.WriteFailure(buildId, errorCode, errorMessage, resultsDirectory, new BuildResultExtras(notLaunched()));
+
+        public void WriteSuccess(
+            string buildId, string deployedFileName, string sha256, string resultsDirectory, BuildResultExtras extras) =>
+            inner.WriteSuccess(buildId, deployedFileName, sha256, resultsDirectory,
+                extras with { Launch = extras.Launch ?? notLaunched() });
+
+        public void WriteFailure(
+            string buildId, string errorCode, string errorMessage, string resultsDirectory, BuildResultExtras extras) =>
+            inner.WriteFailure(buildId, errorCode, errorMessage, resultsDirectory,
+                extras with { Launch = extras.Launch ?? notLaunched() });
+    }
 
     // HTTP commits arrive in a private queue; no directory is network-shared.
     private string IncomingDir => Path.Combine(_options.StateDirectory, "incoming");
@@ -391,7 +419,8 @@ public sealed class StagingWatcher : BackgroundService, IBridgeWatcher
             {
                 if (progress.BuildId is not null)
                 {
-                    _resultWriter.WriteFailure(progress.BuildId, ErrorCode.UnknownError, message, ResultsDir);
+                    _resultWriter.WriteFailure(
+                        progress.BuildId, ErrorCode.UnknownError, message, ResultsDir, new BuildResultExtras(progress.Launch));
                 }
                 else
                 {
@@ -419,6 +448,9 @@ public sealed class StagingWatcher : BackgroundService, IBridgeWatcher
 
         /// <summary>Set only once the move into archive/ is known to have succeeded.</summary>
         public bool Archived { get; set; }
+
+        /// <summary>What happened to VRChat, once known, for a result written after an unexpected error.</summary>
+        public LaunchReport? Launch { get; set; }
     }
 
     private async Task ProcessClaimedManifestAsync(
@@ -704,6 +736,7 @@ public sealed class StagingWatcher : BackgroundService, IBridgeWatcher
         cancellationToken.ThrowIfCancellationRequested();
 
         var extras = new BuildResultExtras(LaunchAfter(preparation, outcome), AccountWarnings());
+        progress.Launch = extras.Launch;
         if (outcome.Succeeded)
         {
             _resultWriter.WriteSuccess(manifest.BuildId, deployedFileName, manifest.Sha256, ResultsDir, extras);

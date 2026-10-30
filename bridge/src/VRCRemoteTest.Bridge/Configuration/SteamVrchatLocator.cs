@@ -11,8 +11,10 @@ public sealed record ExecutableCandidate(string Id, string Path);
 /// Finds VRChat.exe in the Steam libraries of the Windows user the Bridge runs as, so the
 /// LAN API never takes a free-form executable path: a change can only pick one of these.
 /// Steam's folder comes from HKCU\Software\Valve\Steam\SteamPath; the libraries from the
-/// "path" entries of its steamapps\libraryfolders.vdf (plus Steam's own folder). A file
-/// that cannot be read or parsed gives fewer candidates, never an error. Being listed does
+/// "path" entries of its steamapps\libraryfolders.vdf (plus Steam's own folder). The entries
+/// are found by pattern, not by parsing VDF: a file that cannot be read gives only Steam's
+/// own folder, and a malformed one whatever "path" entries it still has; never an error.
+/// Every candidate must exist as a local drive path. Being listed does
 /// not prove a file is VRChat: every candidate still passes BridgeOptionsValidator's
 /// executable checks when it is chosen.
 /// </summary>

@@ -495,13 +495,17 @@ public sealed class VrchatClientObserver
             notices.Add(notice);
         }
 
-        var running = rosterSlot.Liveness == RosterLiveness.Running;
-        var logReadToEnd = useLog && observation is { ReadFailed: false } && !catchingUp;
-        var loginState = tracker is { Authenticated: true } && running
-            ? "authenticated"
-            : running && logReadToEnd && loggingLevel == "full"
-                ? pastGrace ? "likelyLoggedOut" : "notSeen"
-                : "unknown";
+        // Only a running client whose log this Bridge can read now says anything about its
+        // login. The line, once read in this session's log, stays true while the rest is
+        // still being caught up; its absence counts only once the log is read to its end.
+        var logUsable = useLog && observation is { ReadFailed: false };
+        var loginState = !logUsable
+            ? "unknown"
+            : tracker is { Authenticated: true }
+                ? "authenticated"
+                : !catchingUp && loggingLevel == "full"
+                    ? pastGrace ? "likelyLoggedOut" : "notSeen"
+                    : "unknown";
 
         // A login time that the local time zone cannot place (a skipped hour) gives no account.
         VrchatClientAccount? account = null;

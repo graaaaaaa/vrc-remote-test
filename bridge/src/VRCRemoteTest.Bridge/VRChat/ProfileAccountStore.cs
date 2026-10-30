@@ -37,6 +37,11 @@ public sealed class ProfileAccount
 /// reading a log again from its start therefore never makes an entry look newer. A profile
 /// whose client has not run since is shown as it was: the account may have changed on
 /// Windows since then, which only the time tells.
+///
+/// The file names the digest key it was written under (<see cref="AccountDigest.KeyId"/>);
+/// a file under another key is ignored, so a new key voids the old digests without having
+/// to delete anything. An entry is kept in memory only once it is on disk, so a write that
+/// fails is tried again with the next poll.
 /// </summary>
 public sealed class ProfileAccountStore
 {
@@ -46,27 +51,18 @@ public sealed class ProfileAccountStore
     private static readonly JsonSerializerOptions SerializerOptions = new() { WriteIndented = true };
 
     private readonly object _sync = new();
+    private readonly string _keyId;
     private Dictionary<int, ProfileAccount>? _accounts;
 
     public ProfileAccountStore(IOptions<BridgeOptions> options, AccountDigest digest)
-        : this(options.Value.StateDirectory, digest.Regenerated)
+        : this(options.Value.StateDirectory, digest.KeyId)
     {
     }
 
-    internal ProfileAccountStore(string stateDirectory, bool discard)
+    internal ProfileAccountStore(string stateDirectory, string keyId)
     {
         FilePath = Path.Combine(stateDirectory, "status", FileName);
-        if (discard)
-        {
-            // Digests under an old key mean nothing any more.
-            try
-            {
-                File.Delete(FilePath);
-            }
-            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
-            {
-            }
-        }
+        _keyId = keyId;
     }
 
     public string FilePath { get; }
@@ -94,20 +90,24 @@ public sealed class ProfileAccountStore
                 return false;
             }
 
-            accounts[account.Profile] = account;
+            var updated = new Dictionary<int, ProfileAccount>(accounts) { [account.Profile] = account };
             try
             {
                 Directory.CreateDirectory(Path.GetDirectoryName(FilePath)!);
                 var temp = FilePath + ".tmp";
-                File.WriteAllText(temp, JsonSerializer.Serialize(accounts.Values.OrderBy(a => a.Profile), SerializerOptions));
+                File.WriteAllText(temp, JsonSerializer.Serialize(
+                    new StoredFile { KeyId = _keyId, Accounts = updated.Values.OrderBy(a => a.Profile).ToList() },
+                    SerializerOptions));
                 File.Move(temp, FilePath, overwrite: true);
-                return true;
             }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
             {
-                // Kept in memory; written with the next change.
+                // Not kept: the next poll offers the same login again.
                 return false;
             }
+
+            _accounts = updated;
+            return true;
         }
     }
 
@@ -141,12 +141,15 @@ public sealed class ProfileAccountStore
         {
             if (File.Exists(FilePath) && new FileInfo(FilePath).Length <= MaxFileBytes)
             {
-                var stored = JsonSerializer.Deserialize<List<ProfileAccount>>(File.ReadAllText(FilePath));
-                foreach (var account in stored ?? [])
+                var stored = JsonSerializer.Deserialize<StoredFile>(File.ReadAllText(FilePath));
+                if (stored?.KeyId == _keyId)
                 {
-                    if (account.Profile is >= 0 and <= BridgeOptions.MaxVrchatProfile && account.IdDigest.Length > 0)
+                    foreach (var account in stored.Accounts ?? [])
                     {
-                        _accounts[account.Profile] = account;
+                        if (account.Profile is >= 0 and <= BridgeOptions.MaxVrchatProfile && account.IdDigest.Length > 0)
+                        {
+                            _accounts[account.Profile] = account;
+                        }
                     }
                 }
             }
@@ -157,5 +160,14 @@ public sealed class ProfileAccountStore
         }
 
         return _accounts;
+    }
+
+    private sealed class StoredFile
+    {
+        [JsonPropertyName("keyId")]
+        public string? KeyId { get; init; }
+
+        [JsonPropertyName("accounts")]
+        public List<ProfileAccount>? Accounts { get; init; }
     }
 }

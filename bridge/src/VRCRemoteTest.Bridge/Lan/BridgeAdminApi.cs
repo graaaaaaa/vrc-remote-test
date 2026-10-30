@@ -168,15 +168,26 @@ internal static class BridgeAdminApi
 
         try
         {
+            // Both ends are fixed before reading, so lines appended meanwhile are not read.
             using var stream = new FileStream(newest, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
-            var start = Math.Max(0, stream.Length - MaxLogBytes);
+            var end = stream.Length;
+            var start = Math.Max(0, end - MaxLogBytes);
             stream.Seek(start, SeekOrigin.Begin);
-            using var reader = new StreamReader(stream, Encoding.UTF8);
-            var text = reader.ReadToEnd();
-            var all = text.Split('\n');
+            var buffer = new byte[end - start];
+            stream.ReadExactly(buffer);
+            var all = Encoding.UTF8.GetString(buffer).Split('\n');
             var tail = all.Skip(start > 0 ? 1 : 0).Select(l => l.TrimEnd('\r')).Where(l => l.Length > 0).TakeLast(count);
-            var body = string.Join("\n", tail.Select(LogRedactor.Redact)) + "\n";
-            return Results.Text(body, "text/plain; charset=utf-8");
+
+            // Masking can lengthen a line; the answer stays within MaxLogBytes, dropping the oldest lines.
+            var masked = tail.Select(LogRedactor.Redact).ToList();
+            var bytes = masked.Sum(l => Encoding.UTF8.GetByteCount(l) + 1);
+            while (masked.Count > 0 && bytes > MaxLogBytes)
+            {
+                bytes -= Encoding.UTF8.GetByteCount(masked[0]) + 1;
+                masked.RemoveAt(0);
+            }
+
+            return Results.Text(string.Join("\n", masked) + "\n", "text/plain; charset=utf-8");
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
@@ -260,14 +271,25 @@ internal static class BridgeAdminApi
                 ["Send If-Match with the etag from GET /config."]);
         }
 
-        JsonObject patch;
+        JsonObject raw;
         try
         {
-            patch = await ReadPatchAsync(context);
+            raw = await ReadPatchAsync(context);
         }
         catch (ConfigFileException ex)
         {
             return Problem(StatusCodes.Status400BadRequest, "invalidPatch", [ex.Message]);
+        }
+
+        var (patch, unknown, duplicates) = Normalize(raw);
+        if (unknown.Count > 0)
+        {
+            return Problem(StatusCodes.Status400BadRequest, "invalidPatch", unknown);
+        }
+
+        if (duplicates.Count > 0)
+        {
+            return Problem(StatusCodes.Status422UnprocessableEntity, "invalidPatch", duplicates);
         }
 
         var patchProblems = CheckPatch(patch);
@@ -314,12 +336,12 @@ internal static class BridgeAdminApi
         {
             var closer = context.RequestServices.GetRequiredService<OwnedClientCloser>();
             var closed = await closer.CloseAsync(requireNoOthers: true, context.RequestAborted);
-            if (closed.Refused || closed.NotConfirmed > 0)
+            if (closed.Refused || closed.NotConfirmed > 0 || closed.RecordNotUpdated)
             {
                 return Results.Json(new
                 {
                     error = "vrchatRunning",
-                    problems = new[] { "VrchatClientMode was not changed: " + closed.Problem },
+                    problems = new[] { LogRedactor.Redact("VrchatClientMode was not changed: " + closed.Problem) },
                     closed = closed.Closed,
                 }, statusCode: StatusCodes.Status409Conflict);
             }
@@ -327,12 +349,12 @@ internal static class BridgeAdminApi
 
         try
         {
-            // Compared once more just before writing: an edit on Windows since must not be lost.
-            var now = File.Exists(runtime.ConfigPath) ? File.ReadAllBytes(runtime.ConfigPath) : null;
-            if ((now is null ? ConfigFile.MissingEtag : ConfigFile.EtagOf(now)) != currentEtag)
+            // Compared once more before writing, and again before every attempt to replace
+            // the file: an edit on Windows meanwhile must not be lost.
+            var now = ConfigFile.CurrentEtag(runtime.ConfigPath);
+            if (now != currentEtag)
             {
-                return Results.Json(new { error = "etagMismatch", etag = now is null ? ConfigFile.MissingEtag : ConfigFile.EtagOf(now) },
-                    statusCode: StatusCodes.Status412PreconditionFailed);
+                return Results.Json(new { error = "etagMismatch", etag = now }, statusCode: StatusCodes.Status412PreconditionFailed);
             }
 
             if (before is not null)
@@ -340,7 +362,12 @@ internal static class BridgeAdminApi
                 ConfigFile.Backup(runtime.ConfigPath, before, DateTimeOffset.UtcNow);
             }
 
-            ConfigFile.Replace(runtime.ConfigPath, after);
+            ConfigFile.Replace(runtime.ConfigPath, after, currentEtag);
+        }
+        catch (ConfigChangedException)
+        {
+            return Results.Json(new { error = "etagMismatch", etag = SafeEtag(runtime.ConfigPath) },
+                statusCode: StatusCodes.Status412PreconditionFailed);
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
@@ -360,7 +387,7 @@ internal static class BridgeAdminApi
         using var lease = runtime.Gate.TryEnter("restart");
         if (lease is null)
         {
-            return runtime.Gate.RestartPending
+            return runtime.RestartScheduled
                 ? Results.Json(new { restart = "scheduled", coalesced = true }, statusCode: StatusCodes.Status202Accepted)
                 : Busy(runtime);
         }
@@ -394,7 +421,7 @@ internal static class BridgeAdminApi
             closed = report.Closed,
             notConfirmed = report.NotConfirmed,
             othersRunning = report.Others,
-            problem = report.Problem,
+            problem = report.Problem is null ? null : LogRedactor.Redact(report.Problem),
         }, statusCode: report.Refused ? StatusCodes.Status409Conflict : StatusCodes.Status200OK);
     }
 
@@ -459,7 +486,17 @@ internal static class BridgeAdminApi
     /// <summary>The options a host would get from <paramref name="bytes"/>, through the same binding and validator.</summary>
     internal static (BridgeOptions? Options, IReadOnlyList<string> Failures) Validate(byte[] bytes, string stateDirectory)
     {
-        var configuration = new ConfigurationBuilder().AddJsonStream(new MemoryStream(bytes)).Build();
+        IConfigurationRoot configuration;
+        try
+        {
+            configuration = new ConfigurationBuilder().AddJsonStream(new MemoryStream(bytes)).Build();
+        }
+        catch (Exception ex) when (ex is FormatException or InvalidDataException or JsonException)
+        {
+            // e.g. a key that appears twice in a section the patch did not touch.
+            return (null, ["config.json cannot be read as configuration: " + ex.Message]);
+        }
+
         if (configuration["Bridge:StagingDirectory"] is not null)
         {
             return (null, ["Bridge:StagingDirectory is obsolete; remove it on Windows."]);
@@ -475,6 +512,54 @@ internal static class BridgeAdminApi
         catch (OptionsValidationException ex)
         {
             return (null, ex.Failures.ToList());
+        }
+        catch (InvalidOperationException ex)
+        {
+            // A value the binder cannot convert (e.g. a string where a number belongs, in a
+            // setting the patch did not touch).
+            return (null, [ex.Message]);
+        }
+    }
+
+    /// <summary>
+    /// The patch with every name spelled as its setting (config.json and the binder ignore
+    /// case, so "retainBuilds" is RetainBuilds). Unknown names are refused (400), and two
+    /// names for one setting are a conflict (422) rather than a guess.
+    /// </summary>
+    internal static (JsonObject Patch, IReadOnlyList<string> Unknown, IReadOnlyList<string> Duplicates) Normalize(JsonObject raw)
+    {
+        var patch = new JsonObject();
+        var unknown = new List<string>();
+        var duplicates = new List<string>();
+        foreach (var (name, value) in raw)
+        {
+            var setting = Editable.FirstOrDefault(s => string.Equals(s.Name, name, StringComparison.OrdinalIgnoreCase));
+            if (setting is null)
+            {
+                unknown.Add($"{name} cannot be changed through the LAN API (settings: {string.Join(", ", Editable.Select(s => s.Name))}).");
+            }
+            else if (patch.ContainsKey(setting.Name))
+            {
+                duplicates.Add($"The patch names {setting.Name} more than once.");
+            }
+            else
+            {
+                patch[setting.Name] = value?.DeepClone();
+            }
+        }
+
+        return (patch, unknown, duplicates);
+    }
+
+    private static string? SafeEtag(string path)
+    {
+        try
+        {
+            return ConfigFile.CurrentEtag(path);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return null;
         }
     }
 
@@ -536,8 +621,12 @@ internal static class BridgeAdminApi
 
         try
         {
-            return JsonNode.Parse(memory.ToArray()) as JsonObject
+            var patch = JsonNode.Parse(memory.ToArray()) as JsonObject
                 ?? throw new ConfigFileException("The patch must be a JSON object.");
+
+            // JsonObject reads its properties lazily; a repeated name surfaces here.
+            _ = patch.Count;
+            return patch;
         }
         catch (Exception ex) when (ex is JsonException or ArgumentException)
         {
@@ -551,8 +640,9 @@ internal static class BridgeAdminApi
         operation = runtime.Gate.Current ?? (runtime.Gate.RestartPending ? "restart" : null),
     }, statusCode: StatusCodes.Status409Conflict);
 
+    /// <summary>Every problem is masked: validator and I/O messages can name paths under the Windows user's profile.</summary>
     private static IResult Problem(int status, string error, IReadOnlyList<string> problems) =>
-        Results.Json(new { error, problems }, statusCode: status);
+        Results.Json(new { error, problems = problems.Select(LogRedactor.Redact).ToList() }, statusCode: status);
 
     private static string? OneOf(JsonNode v, params string[] allowed) =>
         v.GetValueKind() == JsonValueKind.String && allowed.Contains(v.GetValue<string>(), StringComparer.Ordinal)

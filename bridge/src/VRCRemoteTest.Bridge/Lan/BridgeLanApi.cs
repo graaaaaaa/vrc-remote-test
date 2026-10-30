@@ -55,7 +55,9 @@ public static class BridgeLanApi
         api.MapPut("/builds/{buildId}/artifact", (HttpContext context, string buildId) =>
             PutArtifact(context, options, buildId));
         api.MapPost("/builds/{buildId}/commit", (HttpContext context, string buildId) =>
-            Commit(context, options, buildId));
+            runtime?.RestartScheduled == true
+                ? Task.FromResult(Results.Json(new { error = "busy", operation = "restart" }, statusCode: StatusCodes.Status409Conflict))
+                : Commit(context, options, buildId));
         api.MapGet("/builds/{buildId}", (string buildId) =>
             ReadBuildResult(options, buildId));
 
@@ -385,7 +387,9 @@ public static class BridgeLanApi
                             line.Append(chars[i]);
                             if (line.Length > MaxFullLogLineChars)
                             {
-                                return TooLarge("logLineTooLong", MaxFullLogLineChars, null);
+                                // A limit on one line's characters, not on bytes.
+                                return Results.Json(new { error = "logLineTooLong", limitChars = MaxFullLogLineChars },
+                                    statusCode: StatusCodes.Status413PayloadTooLarge);
                             }
                         }
                     }

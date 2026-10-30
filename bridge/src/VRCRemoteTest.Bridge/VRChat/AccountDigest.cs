@@ -25,7 +25,11 @@ public sealed class AccountDigest
     {
         _key = key;
         Regenerated = regenerated;
+        KeyId = Convert.ToHexString(SHA256.HashData(key)).ToLowerInvariant()[..16];
     }
+
+    /// <summary>Names the key without revealing it; records of digests carry it, so digests under another key are never read back.</summary>
+    public string KeyId { get; }
 
     /// <summary>True when this process made a new key, so earlier digests are void.</summary>
     public bool Regenerated { get; }

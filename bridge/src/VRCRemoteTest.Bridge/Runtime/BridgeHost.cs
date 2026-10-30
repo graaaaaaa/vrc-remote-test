@@ -132,13 +132,21 @@ public static class BridgeHost
         test?.ConfigureServices?.Invoke(builder.Services);
 
         var app = builder.Build();
-
-        // Fail fast on invalid configuration (e.g. missing VrchatWorldsDirectory) before
-        // the watcher loop ever starts (spec section 11 preflight philosophy, applied
-        // Bridge-side).
-        var options = app.Services.GetRequiredService<IOptions<BridgeOptions>>().Value;
-        BridgeLanApi.Map(app, options, runtime.Identity, app.Services.GetRequiredService<LogSourceRegistry>(), runtime);
-        return app;
+        try
+        {
+            // Fail fast on invalid configuration (e.g. missing VrchatWorldsDirectory) before
+            // the watcher loop ever starts (spec section 11 preflight philosophy, applied
+            // Bridge-side).
+            var options = app.Services.GetRequiredService<IOptions<BridgeOptions>>().Value;
+            BridgeLanApi.Map(app, options, runtime.Identity, app.Services.GetRequiredService<LogSourceRegistry>(), runtime);
+            return app;
+        }
+        catch
+        {
+            // The caller never gets this app, so it cannot dispose it.
+            ((IDisposable)app).Dispose();
+            throw;
+        }
     }
 
     /// <summary>The options binding every host uses, and the one a configuration change is checked with.</summary>
@@ -165,6 +173,12 @@ public static class BridgeHost
     {
         while (true)
         {
+            // A stop asked for while the previous host was stopping ends the process here.
+            if (cancellationToken.IsCancellationRequested)
+            {
+                return 0;
+            }
+
             var started = await TryStartAsync(runtime, args, test, cancellationToken).ConfigureAwait(false);
             if (started.Host is null)
             {
@@ -180,15 +194,16 @@ public static class BridgeHost
                         Log.Error(
                             "The host could not start with the configuration change {OperationId} ({Problem}); config.json was restored and the host is started again.",
                             apply.OperationId, started.Problem);
-                        runtime.ReportRolledBack(apply, started.Problem!);
+                        runtime.BeginRollback(apply, started.Problem!);
                         continue;
                     }
 
-                    runtime.ReportFailed(apply,
-                    [
-                        started.Problem!,
-                        "config.json was not restored: it was no longer the file the change wrote, or the previous file could not be written back.",
-                    ]);
+                    runtime.ReportStartFailure(started.Problem!,
+                        "config.json was not restored: it was no longer the file the change wrote, or the previous file could not be written back.");
+                }
+                else
+                {
+                    runtime.ReportStartFailure(started.Problem!, null);
                 }
 
                 Log.Fatal("The Bridge could not start: {Problem}", started.Problem);
@@ -276,21 +291,25 @@ public static class BridgeHost
     {
         try
         {
-            if (BridgeRuntime.HashFile(runtime.ConfigPath) != apply.WrittenEtag)
-            {
-                return false;
-            }
-
             if (apply.PreviousBytes is null)
             {
+                if (ConfigFile.CurrentEtag(runtime.ConfigPath) != apply.WrittenEtag)
+                {
+                    return false;
+                }
+
                 File.Delete(runtime.ConfigPath);
             }
             else
             {
-                ConfigFile.Replace(runtime.ConfigPath, apply.PreviousBytes);
+                ConfigFile.Replace(runtime.ConfigPath, apply.PreviousBytes, apply.WrittenEtag);
             }
 
             return true;
+        }
+        catch (ConfigChangedException)
+        {
+            return false;
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {

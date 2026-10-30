@@ -74,6 +74,14 @@ public sealed class VrchatMonitorService : BackgroundService
             try
             {
                 var status = _processMonitor.GetStatus();
+
+                // GetStatus can outlast the host's stop timeout; a host being replaced must
+                // not publish over the next host's status.
+                if (stoppingToken.IsCancellationRequested)
+                {
+                    break;
+                }
+
                 _statusWriter.Write(status, StatusDirectory);
             }
             catch (Exception ex) when (ex is not OperationCanceledException)

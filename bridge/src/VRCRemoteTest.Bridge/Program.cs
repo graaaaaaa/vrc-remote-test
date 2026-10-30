@@ -90,7 +90,17 @@ try
         HashExecutable());
     Log.Information("Executable SHA-256: {ExeSha256}", runtime.ExeSha256 ?? "unknown");
 
-    Environment.ExitCode = await BridgeHost.RunAsync(runtime, args, test: null, CancellationToken.None);
+    // Ctrl+C or the process being asked to exit stops the whole Bridge, also when it arrives
+    // while one host is stopping for a restart and its console lifetime is already gone.
+    var processStop = new CancellationTokenSource();
+    Console.CancelKeyPress += (_, e) =>
+    {
+        e.Cancel = true;
+        processStop.Cancel();
+    };
+    AppDomain.CurrentDomain.ProcessExit += (_, _) => processStop.Cancel();
+
+    Environment.ExitCode = await BridgeHost.RunAsync(runtime, args, test: null, processStop.Token);
 }
 catch (Exception ex)
 {

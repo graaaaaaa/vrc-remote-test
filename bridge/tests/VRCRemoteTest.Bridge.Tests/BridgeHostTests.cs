@@ -31,8 +31,8 @@ public sealed class BridgeHostTests : IAsyncLifetime
     private HttpClient? _client;
     private int _port;
 
-    /// <summary>Set to make the next host fail to build once (a host that cannot start after a change).</summary>
-    private volatile bool _failNextBuild;
+    /// <summary>How many of the next hosts fail to build (a host that cannot start after a change).</summary>
+    private int _failBuilds;
 
     private string ConfigDirectory => Path.Combine(_root, "VRCRemoteTest");
     private string ConfigPath => Path.Combine(ConfigDirectory, "config.json");
@@ -76,9 +76,8 @@ public sealed class BridgeHostTests : IAsyncLifetime
             BindRetryWindow = TimeSpan.FromSeconds(10),
             ConfigureServices = services =>
             {
-                if (_failNextBuild)
+                if (Interlocked.Decrement(ref _failBuilds) >= 0)
                 {
-                    _failNextBuild = false;
                     throw new InvalidOperationException("this host cannot start (test)");
                 }
 
@@ -223,7 +222,7 @@ public sealed class BridgeHostTests : IAsyncLifetime
     [InlineData("{\"LanBindAddress\": \"192.0.2.11\"}")]
     [InlineData("{\"VrchatWorldsDirectory\": \"C:\\\\Other\"}")]
     [InlineData("{\"VrchatExecutable\": \"C:\\\\evil\\\\VRChat.exe\"}")]
-    [InlineData("{\"retainBuilds\": 3}")]
+    [InlineData("{\"RetainBuilds\": 3, \"RetainBuilds\": 4}")]
     [InlineData("{\"RetainBuilds\": 0}")]
     [InlineData("{\"RetainBuilds\": \"3\"}")]
     [InlineData("{\"MaxArtifactSizeBytes\": 4294967296}")]
@@ -263,7 +262,7 @@ public sealed class BridgeHostTests : IAsyncLifetime
     {
         await StartAsync();
         var before = File.ReadAllBytes(ConfigPath);
-        _failNextBuild = true;
+        _failBuilds = 1;
 
         var response = await PutConfigAsync("{\"RetainBuilds\": 4}", await EtagAsync());
 
@@ -273,6 +272,46 @@ public sealed class BridgeHostTests : IAsyncLifetime
         Assert.Contains("this host cannot start", info["lastConfigApply"]!["problems"]![0]!.GetValue<string>());
         Assert.Equal(before, File.ReadAllBytes(ConfigPath));
         Assert.Equal(10, info["activeConfig"]!["RetainBuilds"]!.GetValue<int>());
+    }
+
+    [Fact]
+    public async Task When_the_previous_file_cannot_start_either_the_change_fails_and_the_bridge_stops()
+    {
+        await StartAsync();
+        _failBuilds = 2;
+
+        var response = await PutConfigAsync("{\"RetainBuilds\": 4}", await EtagAsync());
+
+        Assert.Equal(HttpStatusCode.Accepted, response.StatusCode);
+        Assert.Equal(1, await _run!.WaitAsync(TimeSpan.FromSeconds(30)));
+        var report = _runtime!.LastConfigApply!;
+        Assert.Equal("failed", report.Outcome);
+        Assert.Equal(2, report.Problems.Count);
+        Assert.Contains("previous config.json could not start either", report.Problems[1]);
+        _run = null;
+    }
+
+    [Fact]
+    public async Task A_name_in_another_case_changes_that_setting_and_keeps_the_files_spelling()
+    {
+        await StartAsync(Config(DefaultBridge().Replace("\"RetainBuilds\"", "\"retainbuilds\"", StringComparison.Ordinal)));
+
+        var response = await PutConfigAsync("{\"retainBuilds\": 3}", await EtagAsync());
+
+        Assert.Equal(HttpStatusCode.Accepted, response.StatusCode);
+        var info = await WaitForGenerationAsync(2);
+        Assert.Equal(3, info["activeConfig"]!["RetainBuilds"]!.GetValue<int>());
+        Assert.Equal(3, JsonNode.Parse(File.ReadAllText(ConfigPath))!["Bridge"]!["retainbuilds"]!.GetValue<int>());
+    }
+
+    [Fact]
+    public async Task Two_names_for_one_setting_are_a_conflict()
+    {
+        await StartAsync();
+
+        var response = await PutConfigAsync("{\"RetainBuilds\": 3, \"retainBuilds\": 4}", await EtagAsync());
+
+        Assert.Equal((HttpStatusCode)422, response.StatusCode);
     }
 
     [Fact]

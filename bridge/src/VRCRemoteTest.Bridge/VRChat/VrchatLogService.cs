@@ -160,6 +160,10 @@ public sealed class VrchatLogService : BackgroundService
         }
 
         var observation = _observer.Observe(read, cancellationToken);
+
+        // Reading can outlast the host's stop timeout; a host being replaced must not publish
+        // over the next host's files.
+        cancellationToken.ThrowIfCancellationRequested();
         _logSources?.Publish(read, observation.Clients);
 
         if (read.Latest.IsAvailable)
