@@ -81,6 +81,28 @@ namespace VRCRemoteTest
             return limit == null ? null : "Bridge rejected artifact upload (HTTP 413): " + limit + ".";
         }
 
+        /// <summary>
+        /// The UPLOAD_FAILED message for a commit the Bridge refused. A Bridge that is about to
+        /// restart its host (v0.8.0) answers 409 {error: "busy", operation: "restart"}: the
+        /// artifact was uploaded but not committed, so the same build can be deployed again
+        /// once the Bridge is back. Otherwise the body, cut and stripped of controls.
+        /// </summary>
+        internal static string CommitRejectedMessage(long statusCode, string body)
+        {
+            var prefix = "Bridge rejected build commit (HTTP " + statusCode + ")";
+            if (statusCode == 409 && ErrorOf(body) == "busy")
+            {
+                var operation = ParseObject(body)?["operation"];
+                var what = operation != null && operation.Type == JTokenType.String ? (string)operation : null;
+                return what == "restart"
+                    ? prefix + ": the Bridge is restarting. Deploy again once it is back (Deploy Last Build)."
+                    : prefix + ": the Bridge is busy" + (what == null ? string.Empty : " (" + Sanitize(what, 40) + ")")
+                        + ". Deploy again when it is done (Deploy Last Build).";
+            }
+
+            return string.IsNullOrWhiteSpace(body) ? prefix + "." : prefix + ": " + Sanitize(body, 500);
+        }
+
         /// <summary>"the Bridge accepts at most N bytes (MaxArtifactSizeBytes)", or null.</summary>
         internal static string DescribeTooLarge(string body)
         {

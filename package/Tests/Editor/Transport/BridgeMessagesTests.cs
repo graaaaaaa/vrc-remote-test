@@ -121,6 +121,38 @@ namespace VRCRemoteTest.Tests
         }
 
         [Test]
+        public void A_commit_refused_while_the_Bridge_restarts_says_to_deploy_again()
+        {
+            var message = BridgeMessages.CommitRejectedMessage(409, "{\"error\":\"busy\",\"operation\":\"restart\"}");
+
+            Assert.AreEqual(
+                "Bridge rejected build commit (HTTP 409): the Bridge is restarting. "
+                + "Deploy again once it is back (Deploy Last Build).",
+                message);
+        }
+
+        [Test]
+        public void A_commit_refused_by_another_operation_names_it()
+        {
+            StringAssert.Contains("the Bridge is busy (config)",
+                BridgeMessages.CommitRejectedMessage(409, "{\"error\":\"busy\",\"operation\":\"config\"}"));
+            StringAssert.Contains("the Bridge is busy.",
+                BridgeMessages.CommitRejectedMessage(409, "{\"error\":\"busy\",\"operation\":null}"));
+        }
+
+        [Test]
+        public void Any_other_refused_commit_keeps_its_body_cut_and_cleaned()
+        {
+            Assert.AreEqual("Bridge rejected build commit (HTTP 400): Invalid manifest.",
+                BridgeMessages.CommitRejectedMessage(400, "Invalid manifest."));
+            Assert.AreEqual("Bridge rejected build commit (HTTP 409).",
+                BridgeMessages.CommitRejectedMessage(409, null), "no body, or one over the read limit");
+            Assert.AreEqual("Bridge rejected build commit (HTTP 400): a b",
+                BridgeMessages.CommitRejectedMessage(400, "a" + (char)0x1b + "b"));
+            StringAssert.EndsWith("...", BridgeMessages.CommitRejectedMessage(400, new string('x', 600)));
+        }
+
+        [Test]
         public void A_transport_without_the_management_API_says_so()
         {
             var response = BridgeAdminResponse.NotSupported("FakeRemoteTransport");

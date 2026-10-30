@@ -151,14 +151,19 @@ namespace VRCRemoteTest
                 await UploadWithUnityAsync(artifact, buildId, cancellationToken).ConfigureAwait(false);
 
             var json = JsonConvert.SerializeObject(manifest);
-            using (var body = new StringContent(json, Encoding.UTF8, "application/json"))
-            using (var response = await _http.PostAsync(Url("/builds/" + buildId + "/commit"), body,
+            using (var request = new HttpRequestMessage(HttpMethod.Post, Url("/builds/" + buildId + "/commit"))
+                   {
+                       Content = new StringContent(json, Encoding.UTF8, "application/json"),
+                   })
+            using (var response = await _http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead,
                        cancellationToken).ConfigureAwait(false))
             {
                 if (!response.IsSuccessStatusCode)
+                {
+                    var body = await ReadErrorBodyAsync(response.Content, cancellationToken).ConfigureAwait(false);
                     throw new RemoteBuildException(ErrorCode.UploadFailed,
-                        "Bridge rejected build commit (HTTP " + (int)response.StatusCode + "): "
-                        + await response.Content.ReadAsStringAsync().ConfigureAwait(false));
+                        BridgeMessages.CommitRejectedMessage((int)response.StatusCode, body));
+                }
             }
         }
 

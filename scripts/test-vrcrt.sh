@@ -1,13 +1,16 @@
 #!/usr/bin/env bash
 # Checks scripts/vrcrt.sh against local protocol fixtures: the files are
 # shaped like the ones the Bridge v0.6.0 writes (status/vrchat-clients.json and
-# logs/clients/). Run from anywhere: bash scripts/test-vrcrt.sh
+# logs/clients/). The last checks talk to a small HTTPS server on 127.0.0.1 instead, to
+# exercise the real request code (they need openssl to make its certificate).
+# Run from anywhere: bash scripts/test-vrcrt.sh
 set -u
 
 here="$(cd "$(dirname "$0")" && pwd)"
 vrcrt="$here/vrcrt.sh"
 share="$(mktemp -d "${TMPDIR:-/tmp}/vrcrt-test.XXXXXX")"
-trap 'rm -rf "$share"' EXIT
+server=""
+trap '[ -n "$server" ] && kill "$server" 2>/dev/null; rm -rf "$share"' EXIT
 export VRCRT_FIXTURE_DIR="$share"
 mkdir -p "$share/status" "$share/logs/clients" "$share/results"
 
@@ -291,8 +294,126 @@ expect "close-clients refused" 1 "problem: A VRChat the Bridge did not launch is
 http POST_api_v1_clients_close DOWN
 expect "close-clients without an answer" 3 "cannot reach the Bridge" "$vrcrt" close-clients
 
+http POST_api_v1_clients_close '{}'
+expect "close-clients with an answer that is not a close report is an invalid answer" 3 "not a close report" \
+    "$vrcrt" close-clients
+http POST_api_v1_clients_close 'not json'
+expect "close-clients with an answer that is not JSON is an invalid answer" 3 "not a close report" \
+    "$vrcrt" close-clients
+
+clients joined joined ', "warnings": ['"$(python3 -I -c 'print(",".join(["\"w\""] * 80))')"']'
+expect "status prints at most 50 warnings per slot" 0 "slot 1: ... and 30 more" "$vrcrt" status
+clients joined joined ""
+expect "a slot that is a digit but not 0-3 is a usage error" 2 "a slot is 0 to 3" \
+    "$vrcrt" log "$(python3 -I -c 'print(chr(0xB2))')"
+expect "a cursor with a wrong type is a usage error" 2 "is not a cursor" \
+    "$vrcrt" wait-same-instance 0 --after '{"slots":{"0":{"seq":"x"}}}'
+
 rm "$share/status/vrchat-clients.json"
 expect "without vrchat-clients.json" 3 "Bridge client status is unavailable" "$vrcrt" status
+
+# --- The real request code, against an HTTPS server on 127.0.0.1 with a throwaway certificate.
+cat > "$share/server.py" <<'SERVER'
+import hashlib, json, os, socket, ssl, sys, threading, time
+
+directory = sys.argv[1]
+context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+context.load_cert_chain(os.path.join(directory, "cert.pem"), os.path.join(directory, "key.pem"))
+with open(os.path.join(directory, "cert.pem")) as stream:
+    fingerprint = hashlib.sha256(ssl.PEM_cert_to_DER_cert(stream.read())).hexdigest()
+listener = socket.socket()
+listener.bind(("127.0.0.1", 0))
+listener.listen(16)
+counts, lock = {}, threading.Lock()
+
+
+def answer(conn, status, body):
+    # Content-Length and Connection: close, as Kestrel answers when it closes the connection.
+    data = json.dumps(body).encode()
+    conn.sendall(b"HTTP/1.1 %d X\r\nContent-Type: application/json\r\nContent-Length: %d\r\n"
+                 b"Connection: close\r\n\r\n" % (status, len(data)) + data)
+
+
+def trickle(conn):
+    # A header one byte every 50 ms for up to 10 s: each socket wait is short, their sum is not.
+    end = time.monotonic() + 10
+    for byte in b"HTTP/1.1 200 OK\r\nX-Slow: " + b"a" * 1000:
+        if time.monotonic() > end:
+            break
+        conn.sendall(bytes([byte]))
+        time.sleep(0.05)
+
+
+def handle(raw):
+    try:
+        conn = context.wrap_socket(raw, server_side=True)
+        request = b""
+        while b"\r\n\r\n" not in request:
+            chunk = conn.recv(4096)
+            if not chunk:
+                return
+            request += chunk
+        method, path = request.split(b"\r\n", 1)[0].decode().split(" ")[:2]
+        key = method + " " + path
+        with lock:
+            counts[key] = counts.get(key, 0) + 1
+            n = counts[key]
+        if key == "POST /api/v1/clients/close":
+            answer(conn, 200, {"closed": 0, "notConfirmed": 0, "othersRunning": 0, "problem": None})
+        elif key == "GET /api/v1/profiles":
+            answer(conn, 200, {})
+        elif key == "GET /api/v1/bridge" and n == 1:
+            answer(conn, 200, {"version": "0.8.0", "hostGeneration": 1})
+        elif key == "GET /api/v1/bridge":
+            trickle(conn)
+        elif key == "POST /api/v1/bridge/restart":
+            answer(conn, 202, {"restart": "scheduled", "hostGeneration": 1})
+        else:
+            answer(conn, 404, {})
+        conn.close()
+    except (OSError, ValueError):
+        pass
+
+
+with open(os.path.join(directory, "server.tmp"), "w") as stream:
+    stream.write("%d %s\n" % (listener.getsockname()[1], fingerprint))
+os.rename(os.path.join(directory, "server.tmp"), os.path.join(directory, "server.ready"))
+while True:
+    raw, _ = listener.accept()
+    threading.Thread(target=handle, args=(raw,), daemon=True).start()
+SERVER
+
+now_ms() { python3 -I -c 'import time; print(int(time.time() * 1000))'; }
+if command -v openssl >/dev/null 2>&1 \
+    && openssl req -x509 -newkey rsa:2048 -nodes -keyout "$share/key.pem" -out "$share/cert.pem" \
+        -subj /CN=127.0.0.1 -days 1 >/dev/null 2>&1; then
+    python3 -I "$share/server.py" "$share" &
+    server=$!
+    for _ in $(seq 50); do [ -f "$share/server.ready" ] && break; sleep 0.1; done
+    if [ -f "$share/server.ready" ]; then
+        read -r port fingerprint < "$share/server.ready"
+        real() {
+            env -u VRCRT_FIXTURE_DIR VRCRT_BRIDGE_URL="https://127.0.0.1:$port" VRCRT_CERT_SHA256="$fingerprint" \
+                VRCRT_TOKEN=test-token "$@"
+        }
+        expect "a complete answer with Connection: close is read (no EBADF)" 0 "closed 0, not confirmed 0" \
+            real "$vrcrt" close-clients
+        expect "a 2-byte body with Connection: close is read" 0 "No profile has been seen" real "$vrcrt" profiles
+        started=$(now_ms)
+        expect "a trickling header cannot stretch the wait past its deadline" 1 "did not come back" \
+            real env VRCRT_TEST_APPLY_TIMEOUT=1 VRCRT_TEST_POLL_SECONDS=0.1 "$vrcrt" restart
+        elapsed=$(( $(now_ms) - started ))
+        if [ "$elapsed" -le 2500 ]; then
+            pass "the deadline holds against a trickling server (${elapsed} ms for a 1 s wait)"
+        else
+            fail "the deadline holds against a trickling server (${elapsed} ms for a 1 s wait)"
+        fi
+    else
+        fail "the local HTTPS server did not start"
+    fi
+else
+    printf 'skip the local HTTPS checks: openssl could not make a certificate\n'
+fi
 
 if [ "$failures" -ne 0 ]; then
     printf '%d check(s) failed\n' "$failures"
