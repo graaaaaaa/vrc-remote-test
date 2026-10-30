@@ -10,10 +10,11 @@ Fixes replacing the Windows Bridge with `scripts/install-bridge.ps1`, which stop
 - An existing task whose definition (action, trigger, principal, settings and description) already matches is kept and started, instead of being unregistered and registered again. During the 0.8.0 update, `Unregister-ScheduledTask` failed with "Access is denied" on the task 0.7.1 had registered, after the executable had been replaced, and the script ended without registering or starting anything. When the definition differs and the task cannot be removed, the script lists the differences and how to remove the task, then stops.
 - When the task step fails, the script prints the state it stopped in (the executable replaced or not; the task kept, left as it was, removed or registered) and the command to run again.
 - The messages for a running Bridge and for a refused replacement include the command to run again.
+- `uninstall-bridge.ps1`, `deploy-test.ps1` and `start-vrchat-dev.ps1` get the same treatment: a BOM, no `#Requires`, and under 5.1 a `pwsh.exe -NoProfile -ExecutionPolicy Bypass -Command "& '…' …"` line with the same arguments. They use `-Command` because `-File` cannot pass an array: `-Profiles 0,1` would arrive as the single number 1.
 
 ### Tests
 
-- `scripts/test-install-bridge.ps1` runs with `pwsh` on any OS: the BOM, parsing, no PowerShell 7-only operators, the 5.1 message, and the task-definition comparison with stand-in objects.
+- `scripts/test-windows-scripts.ps1` runs with `pwsh` on any OS: for every script the BOM, parsing, no PowerShell 7-only operators, and the 5.1 message run in a child pwsh, including that its command binds the same arguments; for `install-bridge.ps1` also the task-definition comparison with stand-in objects.
 
 ## [0.8.0] - 2026-10-31
 

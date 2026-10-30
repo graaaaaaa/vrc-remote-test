@@ -1,9 +1,12 @@
-#Requires -Version 7.0
-<#
+﻿<#
 .SYNOPSIS
     VRChatを開発/検証用引数で起動する（1台、または検証用に複数台）。
 
 .DESCRIPTION
+    PowerShell 7（pwsh.exe）で実行する。Windows PowerShell 5.1 で起動されたときは、
+    何もせずに pwsh.exe での起動し直し方を示して終わる。5.1 が日本語を読み違えないよう、
+    このファイルは BOM 付きの UTF-8 で保存し、PowerShell 7 にしかない構文は使わない。
+
     仕様書 §28 の Launch configuration に基づき、--watch-worlds 付きで
     VRChat.exe を直接起動する（Steam経由のlaunch optionsは使わない）。
 
@@ -85,6 +88,43 @@ param(
     [ValidateRange(0, 60)]
     [int]$LaunchIntervalSeconds = 3
 )
+
+# 5.1 で起動されたときに示す、pwsh.exe での起動し直し方。-File では配列の引数を
+# 渡せない（-Profiles 0,1 が 1 つの数 1 になる）ので、-Command で同じ引数を付けて呼ぶ。
+# 版の確認より前に使うので、Windows PowerShell 5.1 でも動く書き方にする。
+function Format-PwshRestartCommand {
+    param([string]$ScriptPath, [System.Collections.IDictionary]$Parameters)
+
+    $quote = { param($v) "'" + ("$v" -replace "'", "''") + "'" }
+    $parts = @('&', (& $quote $ScriptPath))
+    foreach ($name in $Parameters.Keys) {
+        $value = $Parameters[$name]
+        if ($value -is [switch] -or $value -is [bool]) {
+            if ($value) {
+                $parts += "-$name"
+            }
+        }
+        elseif ($value -is [array]) {
+            $parts += "-$name"
+            $parts += (@($value | ForEach-Object { & $quote $_ }) -join ',')
+        }
+        elseif ($null -ne $value) {
+            $parts += "-$name"
+            $parts += (& $quote $value)
+        }
+    }
+
+    'pwsh.exe -NoProfile -ExecutionPolicy Bypass -Command "' + ($parts -join ' ') + '"'
+}
+
+# #Requires -Version 7.0 は使わない。5.1 はそれを英語の一文で断るだけで、
+# どう起動し直せばよいかが分からない。
+if ($PSVersionTable.PSVersion.Major -lt 7) {
+    Write-Host "このスクリプトは PowerShell 7（pwsh.exe）で実行してください。いまは Windows PowerShell $($PSVersionTable.PSVersion) で動いています。何もせずに終わります。" -ForegroundColor Red
+    Write-Host "次のコマンドで起動し直してください:" -ForegroundColor Red
+    Write-Host ("  " + (Format-PwshRestartCommand -ScriptPath $PSCommandPath -Parameters $PSBoundParameters))
+    exit 1
+}
 
 $ErrorActionPreference = 'Stop'
 

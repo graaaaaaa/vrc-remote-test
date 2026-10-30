@@ -25,7 +25,7 @@ pwsh.exe -NoProfile -ExecutionPolicy Bypass -File <リポジトリ>\scripts\inst
 - `& .\install-bridge.ps1` のように今の PowerShell の中で動かすと、Windows PowerShell 5.1 では実行ポリシー（既定は Restricted）で止まります。ダウンロードしたスクリプトは、PowerShell 7 の RemoteSigned でも止まることがあります。上の形なら、このコマンドに限って実行ポリシーを迂回します。
 - 5.1 で起動したときは、何も変更せずに、上の形のコマンドを示して止まります。
 - winget で入れた PowerShell 7 はストア版になり、`%LOCALAPPDATA%\Microsoft\WindowsApps\pwsh.exe` にあります。
-- Windows PowerShell 5.1 は、BOM の無い UTF-8 の日本語を読み違えます。`install-bridge.ps1` は BOM 付きで保存してあります。5.1 で動かすスクリプトを足すときは、ASCII にするか BOM 付きで保存してください。
+- Windows PowerShell 5.1 は、BOM の無い UTF-8 の日本語を読み違えます。`scripts` の ps1 はどれも BOM 付きで保存してあり、5.1 で起動すると何もせずに `pwsh.exe` での起動し直し方を示します。スクリプトを足すときも、BOM 付きで保存し、冒頭で同じように版を確かめてください（`pwsh -NoProfile -File scripts/test-windows-scripts.ps1` で確かめられます）。
 
 ### 版を入れ替える
 

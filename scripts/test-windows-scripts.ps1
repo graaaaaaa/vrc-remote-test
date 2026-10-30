@@ -1,10 +1,11 @@
-﻿# Checks scripts/install-bridge.ps1 without Windows. The file must stay readable
-# by Windows PowerShell 5.1 (UTF-8 with a BOM, no PowerShell 7-only syntax) so
-# that 5.1 reaches the "run me with pwsh.exe" message instead of a parse error,
-# and its task-definition comparison, stop-state report and rerun commands are
-# exercised with stand-in objects. Task Scheduler and the file-system checks
-# need Windows and are not covered here.
-# Run from anywhere: pwsh -NoProfile -File scripts/test-install-bridge.ps1
+﻿# Checks the Windows PowerShell scripts without Windows. Each one must stay
+# readable by Windows PowerShell 5.1 (UTF-8 with a BOM, no PowerShell 7-only
+# syntax) so that 5.1 reaches the "run me with pwsh.exe" message instead of a
+# parse error, and that message must carry the same arguments. The
+# task-definition comparison, stop-state report and rerun commands of
+# install-bridge.ps1 are exercised with stand-in objects. Task Scheduler,
+# VRChat and the file-system checks need Windows and are not covered here.
+# Run from anywhere: pwsh -NoProfile -File scripts/test-windows-scripts.ps1
 
 $ErrorActionPreference = 'Stop'
 
@@ -26,60 +27,134 @@ function Check {
     }
 }
 
-# --- The file as Windows PowerShell 5.1 reads it ---
+function Read-Script {
+    param([string]$Path)
 
-$bytes = [System.IO.File]::ReadAllBytes($scriptPath)
-Check 'saved as UTF-8 with a BOM' ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF)
-
-$tokens = $null
-$parseErrors = $null
-$ast = [System.Management.Automation.Language.Parser]::ParseFile($scriptPath, [ref]$tokens, [ref]$parseErrors)
-Check 'parses without errors' ($parseErrors.Count -eq 0) (($parseErrors | ForEach-Object { "$($_.Extent.StartLineNumber): $($_.Message)" }) -join "`n")
-
-Check 'has no #Requires (5.1 would refuse in English before the pwsh.exe message)' ($null -eq $ast.ScriptRequirements)
-
-$ps7Kinds = @('AndAnd', 'OrOr', 'QuestionMark', 'QuestionQuestionEquals', 'QuestionQuestion', 'QuestionDot', 'QuestionLBracket')
-$ps7Tokens = @($tokens | Where-Object { "$($_.Kind)" -in $ps7Kinds })
-Check 'uses no PowerShell 7-only operators' ($ps7Tokens.Count -eq 0) (($ps7Tokens | ForEach-Object { "$($_.Extent.StartLineNumber): $($_.Text)" }) -join "`n")
-
-$statements = @($ast.EndBlock.Statements)
-$gateIndex = -1
-for ($i = 0; $i -lt $statements.Count; $i++) {
-    if ($statements[$i].Extent.Text -match '^if \(\$PSVersionTable\.PSVersion\.Major -lt 7\)') {
-        $gateIndex = $i
-        break
-    }
+    $tokens = $null
+    $parseErrors = $null
+    $ast = [System.Management.Automation.Language.Parser]::ParseFile($Path, [ref]$tokens, [ref]$parseErrors)
+    [pscustomobject]@{ Ast = $ast; Tokens = $tokens; Errors = $parseErrors }
 }
-$beforeGate = @($statements | Select-Object -First ([Math]::Max($gateIndex, 0)))
-Check 'the version check comes first, after only function definitions' (
-    $gateIndex -ge 0 -and @($beforeGate | Where-Object { $_ -isnot [System.Management.Automation.Language.FunctionDefinitionAst] }).Count -eq 0)
 
-# Runs everything up to the version check in a child pwsh that pretends to be 5.1.
-$fakeDir = Join-Path ([System.IO.Path]::GetTempPath()) ('install-bridge-test-' + [guid]::NewGuid().ToString('N'))
-New-Item -ItemType Directory -Path $fakeDir | Out-Null
-try {
-    $gateEnd = $statements[$gateIndex].Extent.EndOffset
-    $text = [System.IO.File]::ReadAllText($scriptPath).Substring(0, $gateEnd)
-    $paramEnd = $ast.ParamBlock.Extent.EndOffset
+function Get-GateIndex {
+    param($Ast)
+
+    $statements = @($Ast.EndBlock.Statements)
+    for ($i = 0; $i -lt $statements.Count; $i++) {
+        if ($statements[$i].Extent.Text -match '^if \(\$PSVersionTable\.PSVersion\.Major -lt 7\)') {
+            return $i
+        }
+    }
+    -1
+}
+
+# Runs everything up to the version check in a child pwsh that pretends to be
+# 5.1. -Command, because -File cannot pass an array argument (-Profiles 0,1).
+function Invoke-As51 {
+    param([string]$Path, $Ast, [string]$Arguments, [string]$Directory)
+
+    $gateEnd = @($Ast.EndBlock.Statements)[(Get-GateIndex $Ast)].Extent.EndOffset
+    $text = [System.IO.File]::ReadAllText($Path).Substring(0, $gateEnd)
+    $paramEnd = $Ast.ParamBlock.Extent.EndOffset
     $fake = $text.Substring(0, $paramEnd) + "`n`$FakeVersionTable = @{ PSVersion = [version]'5.1.22621.4391' }`n" +
         $text.Substring($paramEnd).Replace('$PSVersionTable', '$FakeVersionTable') + "`nWrite-Host 'PAST THE GATE'`n"
-    $fakePath = Join-Path $fakeDir 'install-bridge.ps1'
+    $fakePath = Join-Path $Directory (Split-Path -Path $Path -Leaf)
     [System.IO.File]::WriteAllText($fakePath, $fake, [System.Text.UTF8Encoding]::new($true))
 
-    $env:LOCALAPPDATA = $fakeDir
-    $hash = 'AB' * 32
-    $output = & pwsh -NoProfile -File $fakePath -ExpectedSha256 $hash -SourcePath 'C:\Users\U S\Downloads\VRCRemoteTest.Bridge.exe' -StartNow 2>&1 | Out-String
-    $exitCode = $LASTEXITCODE
-    Check 'on 5.1 it stops with exit code 1' ($exitCode -eq 1) $output
-    Check 'on 5.1 it does not go past the version check' ($output -notmatch 'PAST THE GATE') $output
-    $expected = "pwsh.exe -NoProfile -ExecutionPolicy Bypass -File `"$fakePath`" -ExpectedSha256 `"$hash`" -SourcePath `"C:\Users\U S\Downloads\VRCRemoteTest.Bridge.exe`" -StartNow"
-    Check 'on 5.1 it prints the pwsh.exe command with the given arguments' ($output.Contains($expected)) $output
+    $output = & pwsh -NoProfile -Command "& '$fakePath' $Arguments; exit `$LASTEXITCODE" 2>&1 | Out-String
+    [pscustomobject]@{ Path = $fakePath; Output = $output; ExitCode = $LASTEXITCODE }
+}
+
+# Runs the -Command that the 5.1 message printed against a stand-in with the
+# same param block, and returns what it bound as "Name=value" lines.
+function Get-BoundByPrintedCommand {
+    param([string]$Output, [string]$FakePath, [string]$Path, $Ast, [string]$Directory)
+
+    if ($Output -notmatch 'pwsh\.exe -NoProfile -ExecutionPolicy Bypass -Command "(.*)"') {
+        return @('<no -Command in the output>')
+    }
+
+    $command = $Matches[1]
+    $stubPath = Join-Path $Directory ('stub-' + (Split-Path -Path $Path -Leaf))
+    $stub = [System.IO.File]::ReadAllText($Path).Substring(0, $Ast.ParamBlock.Extent.EndOffset) +
+        "`n`$PSBoundParameters.Keys | Sort-Object | ForEach-Object { `"`$_=`$(@(`$PSBoundParameters[`$_]) -join '|')`" }`n"
+    [System.IO.File]::WriteAllText($stubPath, $stub, [System.Text.UTF8Encoding]::new($true))
+
+    @(& pwsh -NoProfile -Command $command.Replace("'$FakePath'", "'$stubPath'") 2>&1 | ForEach-Object { "$_" })
+}
+
+# --- Every script as Windows PowerShell 5.1 reads it ---
+
+$ps7Kinds = @('AndAnd', 'OrOr', 'QuestionMark', 'QuestionQuestionEquals', 'QuestionQuestion', 'QuestionDot', 'QuestionLBracket')
+
+# Arguments for the 5.1 run, and what the printed command must bind (sorted by name).
+$restartCases = [ordered]@{
+    'uninstall-bridge.ps1' = @{
+        Arguments = "-TaskName 'it''s a task' -StopRunning"
+        Bound = @("StopRunning=True", "TaskName=it's a task")
+    }
+    'deploy-test.ps1' = @{
+        Arguments = "-SourcePath 'C:\a b\build.vrcw'"
+        Bound = @('SourcePath=C:\a b\build.vrcw')
+    }
+    'start-vrchat-dev.ps1' = @{
+        Arguments = "-Mode VR -Profiles 0,1 -WorldPath 'C:\a b\w.vrcw' -LaunchIntervalSeconds 0 -NoWatchWorlds"
+        Bound = @('LaunchIntervalSeconds=0', 'Mode=VR', 'NoWatchWorlds=True', 'Profiles=0|1', 'WorldPath=C:\a b\w.vrcw')
+    }
+}
+
+$fakeDir = Join-Path ([System.IO.Path]::GetTempPath()) ('windows-scripts-test-' + [guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Path $fakeDir | Out-Null
+# Parameter defaults read these, and they are not set outside Windows.
+$env:LOCALAPPDATA = $fakeDir
+$env:USERPROFILE = $fakeDir
+try {
+    foreach ($leaf in @('install-bridge.ps1') + @($restartCases.Keys)) {
+        $path = Join-Path $PSScriptRoot $leaf
+        $bytes = [System.IO.File]::ReadAllBytes($path)
+        Check "${leaf}: saved as UTF-8 with a BOM" ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF)
+
+        $read = Read-Script $path
+        Check "${leaf}: parses without errors" ($read.Errors.Count -eq 0) (($read.Errors | ForEach-Object { "$($_.Extent.StartLineNumber): $($_.Message)" }) -join "`n")
+        Check "${leaf}: has no #Requires (5.1 would refuse in English before the pwsh.exe message)" ($null -eq $read.Ast.ScriptRequirements)
+
+        $ps7Tokens = @($read.Tokens | Where-Object { "$($_.Kind)" -in $ps7Kinds })
+        Check "${leaf}: uses no PowerShell 7-only operators" ($ps7Tokens.Count -eq 0) (($ps7Tokens | ForEach-Object { "$($_.Extent.StartLineNumber): $($_.Text)" }) -join "`n")
+
+        $gateIndex = Get-GateIndex $read.Ast
+        $beforeGate = @(@($read.Ast.EndBlock.Statements) | Select-Object -First ([Math]::Max($gateIndex, 0)))
+        Check "${leaf}: the version check comes first, after only function definitions" (
+            $gateIndex -ge 0 -and @($beforeGate | Where-Object { $_ -isnot [System.Management.Automation.Language.FunctionDefinitionAst] }).Count -eq 0)
+        if ($gateIndex -lt 0) {
+            continue
+        }
+
+        if ($leaf -eq 'install-bridge.ps1') {
+            $hash = 'AB' * 32
+            $run = Invoke-As51 -Path $path -Ast $read.Ast -Directory $fakeDir `
+                -Arguments "-ExpectedSha256 $hash -SourcePath 'C:\Users\U S\Downloads\VRCRemoteTest.Bridge.exe' -StartNow"
+            $expected = "pwsh.exe -NoProfile -ExecutionPolicy Bypass -File `"$($run.Path)`" -ExpectedSha256 `"$hash`" -SourcePath `"C:\Users\U S\Downloads\VRCRemoteTest.Bridge.exe`" -StartNow"
+            Check "${leaf}: on 5.1 it prints the pwsh.exe command with the given arguments" ($run.Output.Contains($expected)) $run.Output
+        }
+        else {
+            $case = $restartCases[$leaf]
+            $run = Invoke-As51 -Path $path -Ast $read.Ast -Directory $fakeDir -Arguments $case.Arguments
+            $bound = Get-BoundByPrintedCommand -Output $run.Output -FakePath $run.Path -Path $path -Ast $read.Ast -Directory $fakeDir
+            Check "${leaf}: on 5.1 the printed pwsh.exe command passes the same arguments" (
+                ($bound -join "`n") -ceq ($case.Bound -join "`n")) ("printed:`n$($run.Output)`nbound:`n$($bound -join "`n")")
+        }
+
+        Check "${leaf}: on 5.1 it stops with exit code 1" ($run.ExitCode -eq 1) $run.Output
+        Check "${leaf}: on 5.1 it does not go past the version check" ($run.Output -notmatch 'PAST THE GATE') $run.Output
+    }
 }
 finally {
     Remove-Item -LiteralPath $fakeDir -Recurse -Force -ErrorAction SilentlyContinue
 }
 
-# --- The functions, loaded from the script without running it ---
+# --- install-bridge.ps1's functions, loaded from the script without running it ---
+
+$ast = (Read-Script $scriptPath).Ast
 
 foreach ($function in $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $false)) {
     . ([scriptblock]::Create($function.Extent.Text))

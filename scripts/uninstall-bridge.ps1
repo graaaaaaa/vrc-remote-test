@@ -1,9 +1,12 @@
-#Requires -Version 7.0
-<#
+﻿<#
 .SYNOPSIS
     install-bridge.ps1 で登録した Task Scheduler タスクを解除する（仕様書§21）。
 
 .DESCRIPTION
+    PowerShell 7（pwsh.exe）で実行する。Windows PowerShell 5.1 で起動されたときは、
+    何もせずに pwsh.exe での起動し直し方を示して終わる。5.1 が日本語を読み違えないよう、
+    このファイルは BOM 付きの UTF-8 で保存し、PowerShell 7 にしかない構文は使わない。
+
     タスクが本スクリプト群の管理下にあると判別できた場合のみ削除する。
     無関係な同名タスクは誤って削除しない。
 
@@ -35,6 +38,43 @@ param(
 
     [switch]$StopRunning
 )
+
+# 5.1 で起動されたときに示す、pwsh.exe での起動し直し方。-File では配列の引数を
+# 渡せない（-Profiles 0,1 が 1 つの数 1 になる）ので、-Command で同じ引数を付けて呼ぶ。
+# 版の確認より前に使うので、Windows PowerShell 5.1 でも動く書き方にする。
+function Format-PwshRestartCommand {
+    param([string]$ScriptPath, [System.Collections.IDictionary]$Parameters)
+
+    $quote = { param($v) "'" + ("$v" -replace "'", "''") + "'" }
+    $parts = @('&', (& $quote $ScriptPath))
+    foreach ($name in $Parameters.Keys) {
+        $value = $Parameters[$name]
+        if ($value -is [switch] -or $value -is [bool]) {
+            if ($value) {
+                $parts += "-$name"
+            }
+        }
+        elseif ($value -is [array]) {
+            $parts += "-$name"
+            $parts += (@($value | ForEach-Object { & $quote $_ }) -join ',')
+        }
+        elseif ($null -ne $value) {
+            $parts += "-$name"
+            $parts += (& $quote $value)
+        }
+    }
+
+    'pwsh.exe -NoProfile -ExecutionPolicy Bypass -Command "' + ($parts -join ' ') + '"'
+}
+
+# #Requires -Version 7.0 は使わない。5.1 はそれを英語の一文で断るだけで、
+# どう起動し直せばよいかが分からない。
+if ($PSVersionTable.PSVersion.Major -lt 7) {
+    Write-Host "このスクリプトは PowerShell 7（pwsh.exe）で実行してください。いまは Windows PowerShell $($PSVersionTable.PSVersion) で動いています。何もせずに終わります。" -ForegroundColor Red
+    Write-Host "次のコマンドで起動し直してください:" -ForegroundColor Red
+    Write-Host ("  " + (Format-PwshRestartCommand -ScriptPath $PSCommandPath -Parameters $PSBoundParameters))
+    exit 1
+}
 
 $ErrorActionPreference = 'Stop'
 
