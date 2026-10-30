@@ -1,8 +1,8 @@
 # Changelog
 
-## [0.8.1] - Unreleased
+## [0.8.1] - 2026-10-31
 
-Fixes replacing the Windows Bridge with `scripts/install-bridge.ps1`, which stopped twice during the 0.7.1 → 0.8.0 update on 2026-10-31. The Bridge and the Unity package have no functional changes. Follow `docs/setup-windows.md`, step 1 ("版を入れ替える").
+Fixes replacing the Windows Bridge with `scripts/install-bridge.ps1`, which stopped twice during the 0.7.1 → 0.8.0 update on 2026-10-31. The Bridge and the Unity package have no functional changes, but the Remote Test window warns while their versions differ, so **update both the Windows Bridge** (`docs/setup-windows.md`, step 1, "版を入れ替える", with the fixed script) **and the Unity package**. An existing `config.json` and pairing keep working.
 
 ### Fixed (Windows scripts)
 
