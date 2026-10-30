@@ -34,7 +34,7 @@ pwsh.exe -NoProfile -ExecutionPolicy Bypass -File <リポジトリ>\scripts\inst
 2. 上のコマンドを `-StartNow` 付きで実行します。スクリプトは新しい実行体を SHA-256 で照合して置き換え、次にタスクを調べます。
    - 前の版で登録したタスクの定義（Action、Trigger、Principal、Settings、Description）が同じなら、削除も再登録もせずに残して起動します。
    - 定義が違えば、削除して登録し直します。削除できなければ（「アクセスが拒否されました」など）、違う箇所と直し方（タスク スケジューラ `taskschd.msc` で削除する、消せなければ管理者の PowerShell で `Unregister-ScheduledTask`）を示して止まります。タスクの記述子から削除できないと分かるときは、実行体を置き換える前に止まります。
-   - 前の版を管理者の権限で入れていた場合は、タスクを自分で削除できません。定義が同じなら残して進み、直し方を表示します。直すには、管理者の PowerShell で `Unregister-ScheduledTask -TaskName VRCRemoteTestBridge -Confirm:$false` を実行してから、管理者でない PowerShell で上のコマンドをもう一度実行します。
+   - 前の版を管理者の権限で入れていた場合は、タスクを自分で削除できません。定義が同じなら残して進み、直し方を表示します。直すには、`Stop-ScheduledTask -TaskName VRCRemoteTestBridge` で Bridge を止め、管理者の PowerShell で `Unregister-ScheduledTask -TaskName VRCRemoteTestBridge -Confirm:$false` を実行してから、管理者でない PowerShell で上のコマンドをもう一度実行します。タスクを削除しても、そのタスクが起動した Bridge は動き続けるので、止めるのは削除の前です。
    - タスクの段階で止まったときは、実行体とタスクがどの状態で残ったかと、やり直すコマンドを表示します。実行体はもう照合済みなので、やり直しに `-SourcePath` は要りません。
 3. Mac で `vrcrt.sh doctor` を実行し、Bridge の版と実行体の SHA-256 を確かめます。
 - Claude デスクトップアプリのシェルから `%LOCALAPPDATA%` や `LocalLow` に書いたファイルは、アプリ専用の領域に仮想化され、タスクスケジューラーの Bridge からは見えません。`config.json` は、自分で開いた PowerShell 7 で書いてください。`pair` も自分のターミナルで実行してください。

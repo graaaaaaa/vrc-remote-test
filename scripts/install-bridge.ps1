@@ -726,18 +726,20 @@ if ($existingTask) {
     $tokenSids = @($identitySid) + @($currentIdentity.Groups | ForEach-Object { $_.Value })
     $deleteAccess = Get-SddlDeleteAccess -Sddl (Get-TaskSddl -TaskName $TaskName -TaskPath $TaskPathRoot) -Sids $tokenSids
     if ($deleteAccess -eq 'no') {
-        $unregisterCommand = "Unregister-ScheduledTask -TaskName '$TaskName' -TaskPath '$TaskPathRoot' -Confirm:`$false"
+        # タスクを削除しても、そのタスクが起動した Bridge は動き続ける。削除の前に止める
+        # （止めないと -StartNow が「既に実行中」で起動を飛ばし、古いプロセスが残る。2026-10-31）。
+        $fixSteps = "  1. Stop-ScheduledTask -TaskName '$TaskName' -TaskPath '$TaskPathRoot'（Bridge を止める）`n" +
+            "  2. 管理者の PowerShell で: Unregister-ScheduledTask -TaskName '$TaskName' -TaskPath '$TaskPathRoot' -Confirm:`$false`n" +
+            "  3. 管理者でない PowerShell で: $RerunCommand"
         if ($differences.Count -gt 0) {
             throw "既存タスク '$TaskName' の定義が違うため登録し直す必要がありますが、このユーザーにはタスクを削除する権利がありません" +
                 "（管理者の権限で登録されたタスクと見られます）。実行体とタスクは変更していません。`n" +
                 "違い:`n" + (($differences | ForEach-Object { "  $_" }) -join "`n") + "`n" +
-                "直し方: 管理者の PowerShell で次を実行してタスクを削除してから、管理者でない PowerShell で、もう一度実行してください。`n" +
-                "  $unregisterCommand`n  $RerunCommand"
+                "直し方:`n$fixSteps"
         }
 
         Write-Host ("既存タスク '$TaskName' は管理者の権限で登録されたと見られ、このユーザーには削除できません。" +
-            "今回は定義が同じなので残しますが、定義が変わる入れ替えでは止まります。" +
-            "直しておくには、管理者の PowerShell で $unregisterCommand を実行してから、管理者でない PowerShell でこのスクリプトをもう一度実行してください。") -ForegroundColor Yellow
+            "今回は定義が同じなので残しますが、定義が変わる入れ替えでは止まります。直しておくには:`n$fixSteps") -ForegroundColor Yellow
     }
 }
 
@@ -830,7 +832,9 @@ try {
             }
             catch {
                 throw "既存タスク '$TaskName' を削除できませんでした: $($_.Exception.Message)`n" +
-                    "直し方: タスク スケジューラ（taskschd.msc）でタスク '$TaskName' を削除してください。" +
+                    "直し方: Bridge が動いていれば、先に Stop-ScheduledTask -TaskName '$TaskName' -TaskPath '$TaskPathRoot' で止めてください" +
+                    "（タスクを削除しても、そのタスクが起動した Bridge は動き続けます）。" +
+                    "そのあとタスク スケジューラ（taskschd.msc）でタスク '$TaskName' を削除してください。" +
                     "削除できなければ、管理者の PowerShell で Unregister-ScheduledTask -TaskName '$TaskName' -TaskPath '$TaskPathRoot' -Confirm:`$false を実行してください。" +
                     "そのあとのやり直しは、管理者でない PowerShell で行ってください。"
             }
