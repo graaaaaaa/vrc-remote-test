@@ -1,5 +1,11 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed (Bridge)
+
+- A build larger than 30,000,000 bytes (about 28.6 MiB) was refused with HTTP 413 Payload Too Large on `PUT /builds/{id}/artifact`, before `MaxArtifactSizeBytes` (500 MiB by default) was ever checked: Kestrel's default request body limit applied to the artifact upload too. The artifact route now raises the limit to `MaxArtifactSizeBytes` for its own request; every other route keeps the default. Update the Windows Bridge only (`docs/setup-windows.md`, step 1).
+
 ## [0.7.0] — LAN Direct (breaking)
 
 - Replaced the legacy transfer and observation path with certificate-pinned, token-authenticated HTTPS. Bridge and Unity must be updated together.
