@@ -1,6 +1,8 @@
 # Changelog
 
-## [Unreleased]
+## [0.7.1] - 2026-10-30
+
+Fixes the Windows Bridge refusing worlds over 30 MB. The fix is in the Bridge only and the Unity package has no functional changes, so **update the Windows Bridge** (`docs/setup-windows.md`, step 1). An existing `config.json` and pairing keep working.
 
 ### Fixed (Bridge)
 
