@@ -3,6 +3,9 @@ using System.Net.Http.Headers;
 using System.Security.Cryptography;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
+using Microsoft.AspNetCore.Hosting.Server;
+using Microsoft.AspNetCore.Hosting.Server.Features;
+using Microsoft.Extensions.DependencyInjection;
 using VRCRemoteTest.Bridge.Configuration;
 using VRCRemoteTest.Bridge.Lan;
 using VRCRemoteTest.Bridge.VRChat;
@@ -24,12 +27,9 @@ public sealed class BridgeLanApiLargeArtifactTests : IAsyncLifetime
     public async Task InitializeAsync()
     {
         var identity = BridgeIdentity.LoadOrCreate(_root);
-        var listener = new System.Net.Sockets.TcpListener(IPAddress.Loopback, 0);
-        listener.Start();
-        var port = ((IPEndPoint)listener.LocalEndpoint).Port;
-        listener.Stop();
         var builder = WebApplication.CreateBuilder();
-        builder.WebHost.ConfigureKestrel(server => server.Listen(IPAddress.Loopback, port,
+        // Port 0: Kestrel takes a free port itself, so no other process can take it between choosing and binding.
+        builder.WebHost.ConfigureKestrel(server => server.Listen(IPAddress.Loopback, 0,
             endpoint => endpoint.UseHttps(identity.Certificate)));
         _app = builder.Build();
         var options = new BridgeOptions
@@ -39,14 +39,18 @@ public sealed class BridgeLanApiLargeArtifactTests : IAsyncLifetime
         };
         BridgeLanApi.Map(_app, options, identity, new LogSourceRegistry());
         await _app.StartAsync();
+        var bound = new Uri(_app.Services.GetRequiredService<IServer>().Features.Get<IServerAddressesFeature>()!.Addresses.Single());
         var handler = new HttpClientHandler
         {
             ServerCertificateCustomValidationCallback = (_, certificate, _, _) =>
                 certificate is not null &&
                 Convert.ToHexString(SHA256.HashData(certificate.RawData)).ToLowerInvariant() == identity.Fingerprint,
         };
-        _client = new HttpClient(handler) { BaseAddress = new Uri($"https://127.0.0.1:{port}/api/v1/") };
+        _client = new HttpClient(handler) { BaseAddress = new Uri($"https://127.0.0.1:{bound.Port}/api/v1/") };
         _client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", identity.Token);
+        // Expect: 100-continue lets the Bridge answer a refused upload before the body is sent, so the refusal is a
+        // real 413 and not a connection closed mid-upload (which any other failure could also look like).
+        _client.DefaultRequestHeaders.ExpectContinue = true;
     }
 
     public async Task DisposeAsync()
@@ -74,15 +78,9 @@ public sealed class BridgeLanApiLargeArtifactTests : IAsyncLifetime
     {
         var bytes = new byte[KestrelDefaultLimit + 5 * 1024 * 1024];
 
-        // The Bridge answers 413 without reading the body, so the client may see the connection closed mid-upload.
-        try
-        {
-            var response = await _client!.PutAsync("builds/buildTooLarge/artifact", new ByteArrayContent(bytes));
-            Assert.Equal(HttpStatusCode.RequestEntityTooLarge, response.StatusCode);
-        }
-        catch (HttpRequestException)
-        {
-        }
+        var response = await _client!.PutAsync("builds/buildTooLarge/artifact", new ByteArrayContent(bytes));
+
+        Assert.Equal(HttpStatusCode.RequestEntityTooLarge, response.StatusCode);
 
         Assert.False(File.Exists(Path.Combine(_root, "state", "incoming", "buildTooLarge.vrcw")));
     }
