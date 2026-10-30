@@ -179,6 +179,34 @@ Check 'account: SID' (Test-CurrentUserAccount -Value $sid -IdentityName $identit
 Check 'account: someone else' (-not (Test-CurrentUserAccount -Value 'PC\other' -IdentityName $identity -Sid $sid))
 Check 'account: empty' (-not (Test-CurrentUserAccount -Value '' -IdentityName $identity -Sid $sid))
 
+# A non-elevated token: the user, Users, Authenticated Users, Everyone,
+# Interactive. Administrators is deny-only there and not among the SIDs.
+$tokenSids = @($sid, 'S-1-5-32-545', 'S-1-5-11', 'S-1-1-0', 'S-1-5-4')
+$sddlCases = [ordered]@{
+    # The task on the Windows PC on 2026-10-31, registered from an elevated shell.
+    "O:BAG:${sid}D:(A;ID;0x1f019f;;;BA)(A;ID;0x1f019f;;;SY)(A;ID;FA;;;BA)(A;;FR;;;$sid)" = 'no'
+    # A task the user registered without elevation.
+    "O:${sid}G:S-1-5-21-1-2-3-513D:(A;;FA;;;BA)(A;;FA;;;SY)(A;;FA;;;$sid)" = 'yes'
+    "D:(A;;0x10000;;;$sid)" = 'yes'
+    "D:(A;;FRSD;;;$sid)" = 'yes'
+    'D:(A;;GA;;;AU)' = 'yes'
+    "D:(A;IO;FA;;;$sid)(A;;FR;;;$sid)" = 'no'
+    "D:(D;;FA;;;$sid)(A;;FR;;;$sid)" = 'no'
+    "O:DAG:DUD:(A;;FR;;;$sid)" = 'no'
+    "D:(A;;WD;;;$sid)" = 'unknown'
+    'D:(A;;FA;;;XX)' = 'unknown'
+    "D:(OA;;FA;;;$sid)" = 'unknown'
+    'O:BAD:NO_ACCESS_CONTROL' = 'unknown'
+    'not an SDDL' = 'unknown'
+    '' = 'unknown'
+}
+foreach ($sddl in $sddlCases.Keys) {
+    $got = Get-SddlDeleteAccess -Sddl $sddl -Sids $tokenSids
+    Check "delete right: '$sddl' is $($sddlCases[$sddl])" ($got -eq $sddlCases[$sddl]) "got $got"
+}
+$elevated = Get-SddlDeleteAccess -Sddl "O:BAG:${sid}D:(A;ID;FA;;;BA)(A;;FR;;;$sid)" -Sids ($tokenSids + 'S-1-5-32-544')
+Check 'delete right: an elevated token can delete the elevated task' ($elevated -eq 'yes') "got $elevated"
+
 function New-Cim {
     param([string]$Class, [hashtable]$Properties)
 

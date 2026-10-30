@@ -43,8 +43,12 @@
     Settings、Description）が登録したい定義と同じなら、削除も再登録もせずに残す。
     違うときだけ削除・再登録し、削除できなければ、何をすれば直るかを示して止まる
     （v0.7.1 から v0.8.0 への入れ替えで、Unregister-ScheduledTask が「アクセスが
-    拒否されました」で失敗した。2026-10-31）。タスクの段階で止まったときは、
+    拒否されました」で失敗した。2026-10-31）。タスクの記述子から削除できないと
+    分かるときは、実行体を置き換える前に止まる。タスクの段階で止まったときは、
     実行体とタスクがどの状態で残ったかと、やり直すコマンドを表示する。
+
+    管理者として実行されたときは、何も変更せずに止まる。管理者の権限で登録した
+    タスクは所有者が Administrators になり、本人が削除できなくなるため（上の失敗の原因）。
 
 .PARAMETER ExpectedSha256
     配置する実行体の SHA-256（16進64文字、大文字小文字は不問）。必須。
@@ -509,7 +513,134 @@ function Format-StopState {
     $lines -join [Environment]::NewLine
 }
 
+# Task Scheduler の SDDL（例: O:BAG:…D:(A;ID;0x1f019f;;;BA)(A;;FR;;;S-1-5-21-…)）で、
+# Sids のどれかに DELETE を許す ACE があるかを 'yes' / 'no' / 'unknown' で返す。
+# 'no' のときだけ先に止めるので、読み違えても止まらない側に倒す（Deny の ACE は見ず、
+# 書き換えの権利や知らない書き方は 'unknown' にする）。
+function Get-SddlDeleteAccess {
+    param([string]$Sddl, [string[]]$Sids)
+
+    $pattern = '^(?:O:(?:S-[0-9-]+|[A-Z]{2}))?(?:G:(?:S-[0-9-]+|[A-Z]{2}))?D:(?<flags>[A-Z_]*)(?<aces>(?:\([^)]*\))*)'
+    if ([string]::IsNullOrEmpty($Sddl) -or $Sddl -cnotmatch $pattern) {
+        return 'unknown'
+    }
+
+    # NO_ACCESS_CONTROL（null DACL）は全員に全部を許す。
+    if ($Matches['flags'].Contains('NO_ACCESS_CONTROL')) {
+        return 'unknown'
+    }
+
+    $aces = @([regex]::Matches($Matches['aces'], '\(([^)]*)\)') | ForEach-Object { $_.Groups[1].Value })
+    $aliases = @{
+        BA = 'S-1-5-32-544'; BU = 'S-1-5-32-545'; PU = 'S-1-5-32-547'; SY = 'S-1-5-18'; LS = 'S-1-5-19'; NS = 'S-1-5-20'
+        AU = 'S-1-5-11'; IU = 'S-1-5-4'; WD = 'S-1-1-0'; CO = 'S-1-3-0'; OW = 'S-1-3-4'
+    }
+    $grantCodes = @('GA', 'SD', 'FA', 'KA')
+    $maybeCodes = @('GW', 'WD', 'WO')
+    # DELETE と GENERIC_ALL / GENERIC_WRITE、WRITE_DAC、WRITE_OWNER。
+    $grantBits = [int64](0x10000 -bor 0x10000000)
+    $maybeBits = [int64](0x40000000 -bor 0x40000 -bor 0x80000)
+
+    $unknown = $false
+    foreach ($ace in $aces) {
+        $fields = $ace.Split(';')
+        if ($fields.Count -lt 6) {
+            $unknown = $true
+            continue
+        }
+
+        $type = $fields[0]
+        $flags = $fields[1]
+        $rights = $fields[2]
+        $sid = $fields[5]
+
+        if ($type -eq 'D') {
+            continue
+        }
+        # IO（継承専用）の ACE はこの物自体には効かない。フラグは2文字ずつ並ぶ。
+        if ($flags -cmatch '^(?:..)*IO') {
+            continue
+        }
+
+        $grants = $false
+        $maybe = $false
+        if ($rights -match '^0[xX][0-9A-Fa-f]+$') {
+            $mask = [Convert]::ToInt64($rights.Substring(2), 16)
+            $grants = ($mask -band $grantBits) -ne 0
+            $maybe = ($mask -band $maybeBits) -ne 0
+        }
+        elseif ($rights.Length % 2 -eq 0) {
+            $codes = for ($i = 0; $i -lt $rights.Length; $i += 2) { $rights.Substring($i, 2) }
+            $grants = @($codes | Where-Object { $_ -in $grantCodes }).Count -gt 0
+            $maybe = @($codes | Where-Object { $_ -in $maybeCodes }).Count -gt 0
+        }
+        else {
+            $unknown = $true
+            continue
+        }
+
+        if (-not ($grants -or $maybe)) {
+            continue
+        }
+
+        if ($sid -notmatch '^S-') {
+            if ($aliases.ContainsKey($sid)) {
+                $sid = $aliases[$sid]
+            }
+            else {
+                $unknown = $true
+                continue
+            }
+        }
+
+        if ($Sids -notcontains $sid) {
+            continue
+        }
+
+        if ($type -ne 'A' -or -not $grants) {
+            $unknown = $true
+            continue
+        }
+
+        return 'yes'
+    }
+
+    if ($unknown) {
+        return 'unknown'
+    }
+
+    'no'
+}
+
+# 読めなければ $null（判断しない）。
+function Get-TaskSddl {
+    param([string]$TaskName, [string]$TaskPath)
+
+    try {
+        $service = New-Object -ComObject 'Schedule.Service'
+        $service.Connect()
+        # OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION
+        $service.GetFolder($TaskPath).GetTask($TaskName).GetSecurityDescriptor(0x5)
+    }
+    catch {
+        $null
+    }
+}
+
 # --- パラメーターと配置先の検査（ここまでは何も変更しない。配置先ディレクトリの作成のみ） ---
+
+# 管理者の権限で登録したタスクは所有者が Administrators になり、本人には読み取りしか
+# 許されない。すると次の入れ替えで本人がタスクを削除できず、Unregister-ScheduledTask が
+# 「アクセスが拒否されました」で止まる（2026-10-31、v0.7.1 から v0.8.0 への入れ替え。
+# タスクの記述子は O:BA で、本人の ACE は FR だけだった）。
+$currentIdentity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+$identity = $currentIdentity.Name
+$identitySid = $currentIdentity.User.Value
+if (([System.Security.Principal.WindowsPrincipal]::new($currentIdentity)).IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    throw "管理者として実行しないでください。何も変更していません。`n" +
+        "管理者の権限で登録したタスクは、あとでこのユーザーが削除できなくなり、次の入れ替えで止まります。" +
+        "管理者でない PowerShell を開いて、次を実行してください:`n  $RerunCommand"
+}
 
 Assert-ExeLeafName -Path $ExePath -ParamName '-ExePath'
 Assert-LocalAbsolutePath -Path $ExePath -ParamName '-ExePath'
@@ -577,6 +708,37 @@ if ($otherBridges.Count -gt 0) {
         "同じ共有を二重に処理しないよう、不要なら停止してください。")
 }
 
+# --- タスクの定義と削除の権利の確認（何も変更しない） ---
+
+$action = New-ScheduledTaskAction -Execute $ExePath -WorkingDirectory $destDir
+$trigger = New-ScheduledTaskTrigger -AtLogOn -User $identity
+$principal = New-ScheduledTaskPrincipal -UserId $identity -LogonType Interactive -RunLevel Limited
+$settings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -ExecutionTimeLimit ([TimeSpan]::Zero) -StartWhenAvailable -Disable:$wasDisabled
+
+$differences = @()
+if ($existingTask) {
+    $differences = @(Get-TaskDefinitionDifference -Existing $existingTask -Action $action -Trigger $trigger `
+            -Principal $principal -Settings $settings -Description $OwnershipDescription -IdentityName $identity -Sid $identitySid)
+
+    # 削除できないと分かっていれば、実行体を置き換える前に止まる。
+    $tokenSids = @($identitySid) + @($currentIdentity.Groups | ForEach-Object { $_.Value })
+    $deleteAccess = Get-SddlDeleteAccess -Sddl (Get-TaskSddl -TaskName $TaskName -TaskPath $TaskPathRoot) -Sids $tokenSids
+    if ($deleteAccess -eq 'no') {
+        $unregisterCommand = "Unregister-ScheduledTask -TaskName '$TaskName' -TaskPath '$TaskPathRoot' -Confirm:`$false"
+        if ($differences.Count -gt 0) {
+            throw "既存タスク '$TaskName' の定義が違うため登録し直す必要がありますが、このユーザーにはタスクを削除する権利がありません" +
+                "（管理者の権限で登録されたタスクと見られます）。実行体とタスクは変更していません。`n" +
+                "違い:`n" + (($differences | ForEach-Object { "  $_" }) -join "`n") + "`n" +
+                "直し方: 管理者の PowerShell で次を実行してタスクを削除してから、管理者でない PowerShell で、もう一度実行してください。`n" +
+                "  $unregisterCommand`n  $RerunCommand"
+        }
+
+        Write-Host ("既存タスク '$TaskName' は管理者の権限で登録されたと見られ、このユーザーには削除できません。" +
+            "今回は定義が同じなので残しますが、定義が変わる入れ替えでは止まります。" +
+            "直しておくには、管理者の PowerShell で $unregisterCommand を実行してから、管理者でない PowerShell でこのスクリプトをもう一度実行してください。") -ForegroundColor Yellow
+    }
+}
+
 # --- 実行体の配置 ---
 
 $exeReplaced = $false
@@ -639,10 +801,6 @@ else {
 
 # --- タスク登録 ---
 
-$currentIdentity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
-$identity = $currentIdentity.Name
-$identitySid = $currentIdentity.User.Value
-
 Write-Host "Exe:      $ExePath"
 Write-Host "Identity: $identity"
 Write-Host "TaskName: $TaskName"
@@ -654,16 +812,8 @@ if ($existingTask) {
 
 # ここから先で止まったときは、実行体とタスクがどの状態で残ったかを必ず示す。
 try {
-    $action = New-ScheduledTaskAction -Execute $ExePath -WorkingDirectory $destDir
-    $trigger = New-ScheduledTaskTrigger -AtLogOn -User $identity
-    $principal = New-ScheduledTaskPrincipal -UserId $identity -LogonType Interactive -RunLevel Limited
-    $settings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -ExecutionTimeLimit ([TimeSpan]::Zero) -StartWhenAvailable -Disable:$wasDisabled
-
     $needsRegister = $true
     if ($existingTask) {
-        $differences = @(Get-TaskDefinitionDifference -Existing $existingTask -Action $action -Trigger $trigger `
-                -Principal $principal -Settings $settings -Description $OwnershipDescription -IdentityName $identity -Sid $identitySid)
-
         if ($differences.Count -eq 0) {
             $needsRegister = $false
             $taskState = 'kept'
@@ -679,7 +829,8 @@ try {
             catch {
                 throw "既存タスク '$TaskName' を削除できませんでした: $($_.Exception.Message)`n" +
                     "直し方: タスク スケジューラ（taskschd.msc）でタスク '$TaskName' を削除してください。" +
-                    "削除できなければ、管理者の PowerShell で Unregister-ScheduledTask -TaskName '$TaskName' -TaskPath '$TaskPathRoot' -Confirm:`$false を実行してください。"
+                    "削除できなければ、管理者の PowerShell で Unregister-ScheduledTask -TaskName '$TaskName' -TaskPath '$TaskPathRoot' -Confirm:`$false を実行してください。" +
+                    "そのあとのやり直しは、管理者でない PowerShell で行ってください。"
             }
 
             $taskState = 'removed'
