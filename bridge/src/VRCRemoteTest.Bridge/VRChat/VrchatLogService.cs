@@ -67,10 +67,14 @@ public sealed class VrchatLogService : BackgroundService
         VrchatClientObserver observer,
         VrchatLogNotice notice,
         ILogger<VrchatLogService> logger,
-        LogSourceRegistry logSources)
+        LogSourceRegistry logSources,
+        IHostApplicationLifetime lifetime)
         : this(options, logReader, observer, notice, logger, DefaultPollInterval, logSources)
     {
+        _lifetime = lifetime;
     }
+
+    private readonly IHostApplicationLifetime? _lifetime;
 
     /// <summary>Test-only seam: a short poll interval keeps unit tests fast without a full clock abstraction.</summary>
     internal VrchatLogService(
@@ -99,6 +103,16 @@ public sealed class VrchatLogService : BackgroundService
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
+        // A host that fails to start must not replace the published logs (BridgeHost).
+        try
+        {
+            await Runtime.HostReady.WaitAsync(_lifetime, stoppingToken);
+        }
+        catch (OperationCanceledException)
+        {
+            return;
+        }
+
         while (!stoppingToken.IsCancellationRequested)
         {
             try

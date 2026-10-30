@@ -5,6 +5,7 @@ using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using VRCRemoteTest.Bridge.Configuration;
 using VRCRemoteTest.Bridge.Protocol;
+using VRCRemoteTest.Bridge.Runtime;
 using VRCRemoteTest.Bridge.VRChat;
 
 namespace VRCRemoteTest.Bridge.Deployment;
@@ -53,7 +54,14 @@ public sealed class StagingWatcher : BackgroundService, IBridgeWatcher
     private readonly IVrchatClientCoordinator _clientCoordinator;
     private readonly VrchatLogNotice _logNotice;
     private readonly ILogger<StagingWatcher> _logger;
+    private readonly BridgeOperationGate? _gate;
+    private readonly IHostApplicationLifetime? _lifetime;
+    private readonly ProfileAccountStore? _profileAccounts;
 
+    /// <summary>
+    /// <paramref name="gate"/>, <paramref name="lifetime"/> and <paramref name="profileAccounts"/>
+    /// are always given by the host; unit tests that drive <see cref="RunOnceAsync"/> directly may leave them out.
+    /// </summary>
     public StagingWatcher(
         IOptions<BridgeOptions> options,
         IPackageValidator validator,
@@ -62,7 +70,10 @@ public sealed class StagingWatcher : BackgroundService, IBridgeWatcher
         ICleanupService cleanupService,
         IVrchatClientCoordinator clientCoordinator,
         VrchatLogNotice logNotice,
-        ILogger<StagingWatcher> logger)
+        ILogger<StagingWatcher> logger,
+        BridgeOperationGate? gate = null,
+        IHostApplicationLifetime? lifetime = null,
+        ProfileAccountStore? profileAccounts = null)
     {
         _options = options.Value;
         _validator = validator;
@@ -72,7 +83,12 @@ public sealed class StagingWatcher : BackgroundService, IBridgeWatcher
         _clientCoordinator = clientCoordinator;
         _logNotice = logNotice;
         _logger = logger;
+        _gate = gate;
+        _lifetime = lifetime;
+        _profileAccounts = profileAccounts;
     }
+
+    private const string DeployOperation = "deploy";
 
     // HTTP commits arrive in a private queue; no directory is network-shared.
     private string IncomingDir => Path.Combine(_options.StateDirectory, "incoming");
@@ -90,10 +106,41 @@ public sealed class StagingWatcher : BackgroundService, IBridgeWatcher
         Unavailable,
     }
 
+    /// <summary>
+    /// Nothing is recovered, deployed or cleaned up until the host has fully started
+    /// (<see cref="HostReady"/>): a host that cannot listen must not change Worlds. Recovery
+    /// takes the operation gate like every deploy, waiting for a management operation that
+    /// got in first.
+    /// </summary>
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
+        try
+        {
+            await HostReady.WaitAsync(_lifetime, stoppingToken);
+        }
+        catch (OperationCanceledException)
+        {
+            return;
+        }
+
         EnsureDirectoriesExist();
-        await RecoverProcessingAsync(stoppingToken);
+        IDisposable? recoveryLease;
+        while ((recoveryLease = EnterGate()) is null)
+        {
+            try
+            {
+                await Task.Delay(TimeSpan.FromSeconds(1), stoppingToken);
+            }
+            catch (OperationCanceledException)
+            {
+                return;
+            }
+        }
+
+        using (recoveryLease)
+        {
+            await RecoverProcessingAsync(stoppingToken);
+        }
 
         while (!stoppingToken.IsCancellationRequested)
         {
@@ -129,6 +176,14 @@ public sealed class StagingWatcher : BackgroundService, IBridgeWatcher
         foreach (var readyFile in Directory.EnumerateFiles(IncomingDir, $"*{ProtocolConstants.ManifestExtension}"))
         {
             cancellationToken.ThrowIfCancellationRequested();
+
+            // A management operation (or a pending restart) holds the gate: the build stays
+            // committed in incoming/ and the next scan, or the next host, deploys it.
+            using var lease = EnterGate();
+            if (lease is null)
+            {
+                return;
+            }
 
             // One file the Bridge cannot handle must not stall every build queued behind
             // it: the share is attacker-writable, so a single crafted name or a transient
@@ -174,6 +229,59 @@ public sealed class StagingWatcher : BackgroundService, IBridgeWatcher
             await ProcessClaimedManifestSafelyAsync(readyFile, cancellationToken);
         }
     }
+
+    /// <summary>A lease that releases nothing when there is no gate (unit tests).</summary>
+    private IDisposable? EnterGate() => _gate is null ? NoGate.Instance : _gate.TryEnter(DeployOperation);
+
+    private sealed class NoGate : IDisposable
+    {
+        public static readonly NoGate Instance = new();
+
+        public void Dispose()
+        {
+        }
+    }
+
+    private LaunchReport? LaunchBeforeInstall(VrchatPreparation preparation)
+    {
+        if (!_options.AutoLaunchVrchat)
+        {
+            return new LaunchReport { Attempted = false, Outcome = LaunchReport.Disabled };
+        }
+
+        return preparation.Kind == VrchatPreparationKind.DeployOnly
+            ? new LaunchReport { Attempted = false, Outcome = LaunchReport.ReusedRunning }
+            : NotReached(preparation);
+    }
+
+    private static LaunchReport NotReached(VrchatPreparation preparation) => new()
+    {
+        Attempted = false,
+        Outcome = LaunchReport.NotReached,
+        Closed = preparation.ClosedClients > 0 ? preparation.ClosedClients : null,
+    };
+
+    private static LaunchReport LaunchAfter(VrchatPreparation preparation, VrchatLaunchOutcome outcome)
+    {
+        var closed = preparation.ClosedClients > 0 ? preparation.ClosedClients : (int?)null;
+        var outcomeName = outcome.Succeeded
+            ? closed is null ? LaunchReport.Launched : LaunchReport.Relaunched
+            : outcome.Started is > 0 ? LaunchReport.Partial : LaunchReport.Failed;
+        return new LaunchReport
+        {
+            Attempted = true,
+            Outcome = outcomeName,
+            Requested = outcome.Requested,
+            Started = outcome.Started,
+            Closed = closed,
+        };
+    }
+
+    /// <summary>Relaunch mode expects one account per profile; two on the same one is worth a line in the result.</summary>
+    private IReadOnlyList<string>? AccountWarnings() =>
+        _options.IsRelaunchMode && _profileAccounts?.SameAccountWarnings(_options.VrchatProfiles) is { Count: > 0 } warnings
+            ? warnings
+            : null;
 
     private void EnsureDirectoriesExist()
     {
@@ -486,7 +594,9 @@ public sealed class StagingWatcher : BackgroundService, IBridgeWatcher
                 _logger.LogError(
                     ex, "Unexpected error during VRChat readiness check for build {BuildId}.", manifest.BuildId);
                 MoveToFailed(claimedManifestPath, artifactPath);
-                _resultWriter.WriteFailure(manifest.BuildId, ErrorCode.VrchatStartFailed, ex.Message, ResultsDir);
+                _resultWriter.WriteFailure(
+                    manifest.BuildId, ErrorCode.VrchatStartFailed, ex.Message, ResultsDir,
+                    new BuildResultExtras(new LaunchReport { Attempted = false, Outcome = LaunchReport.NotReached }));
                 return;
             }
 
@@ -497,7 +607,8 @@ public sealed class StagingWatcher : BackgroundService, IBridgeWatcher
                     manifest.BuildId, preparation.ErrorCode, preparation.ErrorMessage);
                 MoveToFailed(claimedManifestPath, artifactPath);
                 _resultWriter.WriteFailure(
-                    manifest.BuildId, preparation.ErrorCode!, preparation.ErrorMessage!, ResultsDir);
+                    manifest.BuildId, preparation.ErrorCode!, preparation.ErrorMessage!, ResultsDir,
+                    new BuildResultExtras(LaunchBeforeInstall(preparation), AccountWarnings()));
                 return;
             }
         }
@@ -511,20 +622,26 @@ public sealed class StagingWatcher : BackgroundService, IBridgeWatcher
         {
             _logger.LogError(ex, "Deploy failed for build {BuildId}.", manifest.BuildId);
             MoveToFailed(claimedManifestPath, artifactPath);
-            _resultWriter.WriteFailure(manifest.BuildId, ErrorCode.DeployFailed, ex.Message, ResultsDir);
+            _resultWriter.WriteFailure(
+                manifest.BuildId, ErrorCode.DeployFailed, ex.Message, ResultsDir,
+                new BuildResultExtras(_options.AutoLaunchVrchat
+                    ? NotReached(preparation)
+                    : new LaunchReport { Attempted = false, Outcome = LaunchReport.Disabled }));
             return;
         }
 
         if (preparation.Kind == VrchatPreparationKind.ColdStart)
         {
             await LaunchAfterDeployAsync(
-                claimedManifestPath, artifactPath, manifest, deployedFileName, progress, cancellationToken);
+                claimedManifestPath, artifactPath, manifest, deployedFileName, preparation, progress, cancellationToken);
             return;
         }
 
         try
         {
-            _resultWriter.WriteSuccess(manifest.BuildId, deployedFileName, manifest.Sha256, ResultsDir);
+            _resultWriter.WriteSuccess(
+                manifest.BuildId, deployedFileName, manifest.Sha256, ResultsDir,
+                new BuildResultExtras(LaunchBeforeInstall(preparation), AccountWarnings()));
             TryArchiveProcessed(claimedManifestPath, artifactPath, manifest.BuildId);
             _cleanupService.Cleanup(_options.VrchatWorldsDirectory, _options.RetainBuilds, deployedFileName);
             _logger.LogInformation("Build {BuildId} deployed as {DeployedFileName}.", manifest.BuildId, deployedFileName);
@@ -552,6 +669,7 @@ public sealed class StagingWatcher : BackgroundService, IBridgeWatcher
         string artifactPath,
         BuildManifest manifest,
         string deployedFileName,
+        VrchatPreparation preparation,
         ClaimProgress progress,
         CancellationToken cancellationToken)
     {
@@ -562,7 +680,8 @@ public sealed class StagingWatcher : BackgroundService, IBridgeWatcher
                 manifest.BuildId,
                 ErrorCode.UnknownError,
                 "The build was installed but could not be recorded as processed, so VRChat was not launched.",
-                ResultsDir);
+                ResultsDir,
+                new BuildResultExtras(NotReached(preparation)));
             return;
         }
 
@@ -584,9 +703,10 @@ public sealed class StagingWatcher : BackgroundService, IBridgeWatcher
         // and Unity reports RESULT_TIMEOUT, the same as a stop between two launches.
         cancellationToken.ThrowIfCancellationRequested();
 
+        var extras = new BuildResultExtras(LaunchAfter(preparation, outcome), AccountWarnings());
         if (outcome.Succeeded)
         {
-            _resultWriter.WriteSuccess(manifest.BuildId, deployedFileName, manifest.Sha256, ResultsDir);
+            _resultWriter.WriteSuccess(manifest.BuildId, deployedFileName, manifest.Sha256, ResultsDir, extras);
             _logger.LogInformation(
                 "Build {BuildId} deployed as {DeployedFileName} and VRChat launched with it.",
                 manifest.BuildId, deployedFileName);
@@ -594,7 +714,8 @@ public sealed class StagingWatcher : BackgroundService, IBridgeWatcher
         else
         {
             _resultWriter.WriteFailure(
-                manifest.BuildId, outcome.ErrorCode ?? ErrorCode.VrchatStartFailed, outcome.ErrorMessage!, ResultsDir);
+                manifest.BuildId, outcome.ErrorCode ?? ErrorCode.VrchatStartFailed, outcome.ErrorMessage!, ResultsDir,
+                extras);
         }
 
         _cleanupService.Cleanup(_options.VrchatWorldsDirectory, _options.RetainBuilds, deployedFileName);

@@ -1,14 +1,10 @@
 using Microsoft.Extensions.Configuration;
-using Microsoft.AspNetCore.Builder;
-using Microsoft.AspNetCore.Hosting;
-using Microsoft.Extensions.DependencyInjection;
-using Microsoft.Extensions.Options;
 using System.Net;
+using System.Security.Cryptography;
 using Serilog;
 using VRCRemoteTest.Bridge;
-using VRCRemoteTest.Bridge.Configuration;
-using VRCRemoteTest.Bridge.Deployment;
 using VRCRemoteTest.Bridge.Lan;
+using VRCRemoteTest.Bridge.Runtime;
 using VRCRemoteTest.Bridge.VRChat;
 
 var localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
@@ -67,108 +63,34 @@ Log.Logger = new LoggerConfiguration()
 
 try
 {
-    Log.Information("VRC Remote Test Bridge starting. Config directory: {ConfigDir}", configDir);
-
-    var builder = WebApplication.CreateBuilder(args);
+    Log.Information(
+        "VRC Remote Test Bridge {Version} starting. Config directory: {ConfigDir}", BridgeRuntime.Version, configDir);
 
     // Windows Service is deliberately not used (spec section 20 / plan security posture):
     // the Bridge runs in the interactive user session, non-elevated, started via
     // Task Scheduler "At log on" (see scripts/install-bridge.ps1).
-    builder.Configuration.AddJsonFile(
-        Path.Combine(configDir, "config.json"),
-        optional: true,
-        reloadOnChange: false);
+    var stateDirectory = Path.Combine(configDir, "state");
 
-    builder.Services.AddSerilog();
-
-    builder.Services
-        .AddOptions<BridgeOptions>()
-        .Bind(builder.Configuration.GetSection(BridgeOptions.SectionName))
-        .PostConfigure(options =>
-        {
-            // Fixed rather than configurable: see BridgeOptions.StateDirectory.
-            options.StateDirectory = Path.Combine(configDir, "state");
-        });
-
-    if (builder.Configuration["Bridge:StagingDirectory"] is not null)
-        throw new InvalidOperationException("Bridge:StagingDirectory is obsolete; remove it and pair LAN Direct.");
-
-    var lanConfig = builder.Configuration.GetSection(BridgeOptions.SectionName).Get<BridgeOptions>() ?? new BridgeOptions();
-    if (!IPAddress.TryParse(lanConfig.LanBindAddress, out var lanAddress))
-    {
-        throw new InvalidOperationException("Bridge:LanBindAddress must name the Windows LAN IP.");
-    }
-
-    var identity = BridgeIdentity.LoadOrCreate(configDir);
-    builder.WebHost.ConfigureKestrel(server =>
-        server.Listen(lanAddress, lanConfig.LanPort, listen => listen.UseHttps(identity.Certificate)));
-
-    builder.Services.AddSingleton<IValidateOptions<BridgeOptions>, BridgeOptionsValidator>();
-
-    builder.Services.AddSingleton<IPackageValidator, PackageValidator>();
-    builder.Services.AddSingleton<IWorldInstaller, WorldInstaller>();
-    builder.Services.AddSingleton<IResultWriter, ResultWriter>();
-    builder.Services.AddSingleton<ICleanupService, CleanupService>();
-    builder.Services.AddSingleton<StagingWatcher>();
-    builder.Services.AddSingleton<IBridgeWatcher>(sp => sp.GetRequiredService<StagingWatcher>());
-    builder.Services.AddHostedService(sp => sp.GetRequiredService<StagingWatcher>());
-
-    // Phase 4a: independent of StagingWatcher, see VrchatMonitorService's doc comment.
-    builder.Services.AddSingleton<IVrchatProcessMonitor, VrchatProcessMonitor>();
-    builder.Services.AddSingleton<IVrchatStatusWriter, VrchatStatusWriter>();
-    builder.Services.AddHostedService<VrchatMonitorService>();
-
-    // Phase 4.1 / multi-client: reuses IVrchatProcessMonitor above; only invoked by StagingWatcher when AutoLaunchVrchat is true.
-    // VrchatClientMode picks the flow: Reload (same account, --watch-worlds) or Relaunch
-    // (separate accounts, the Bridge closes and relaunches the clients it recorded).
-    builder.Services.AddSingleton<IVrchatLauncher, VrchatLauncher>();
-    builder.Services.AddSingleton<IManagedClientStore, ManagedClientStore>();
-    builder.Services.AddSingleton<VrchatClientCoordinator>();
-    builder.Services.AddSingleton<VrchatRelaunchCoordinator>();
-    builder.Services.AddSingleton<IVrchatClientCoordinator>(sp =>
-        sp.GetRequiredService<IOptions<BridgeOptions>>().Value.IsRelaunchMode
-            ? sp.GetRequiredService<VrchatRelaunchCoordinator>()
-            : sp.GetRequiredService<VrchatClientCoordinator>());
-
-    // Phase 5: snapshot reader + its own polling BackgroundService. Since the client
-    // observation plan's P1 every client has a slot (VrchatClientRoster, observation only) and
-    // its own log, state and marker lines (VrchatClientObserver); vrchat-latest.log stays on
-    // the first VRChat client's log (in Relaunch mode the first one the record lists). While a
-    // Relaunch replaces the clients, the deploy flow sets VrchatLogNotice and the service
-    // publishes it instead of the logs.
-    builder.Services.AddSingleton<VrchatClientRoster>();
-    builder.Services.AddSingleton<IVrchatLogReader, VrchatLogReader>();
-    builder.Services.AddSingleton<VrchatClientObserver>();
-    builder.Services.AddSingleton<LogSourceRegistry>();
-    builder.Services.AddSingleton<VrchatLogNotice>();
-    builder.Services.AddHostedService<VrchatLogService>();
-
-    await using var host = builder.Build();
-
-    // Fail fast on invalid configuration (e.g. missing VrchatWorldsDirectory) before
-    // the watcher loop ever starts (spec section 11 preflight philosophy, applied
-    // Bridge-side).
-    var options = host.Services.GetRequiredService<IOptions<BridgeOptions>>().Value;
-    BridgeLanApi.Map(host, options, identity, host.Services.GetRequiredService<LogSourceRegistry>());
-
-    // Acquired before any hosted service starts, so a second Bridge never touches the
-    // state directory or VRChat.
-    using var instanceLock = BridgeInstanceLock.TryAcquire(options.StateDirectory);
+    // Acquired once for the whole process, before any host starts, so a second Bridge
+    // never touches the state directory or VRChat; restarts keep it.
+    using var instanceLock = BridgeInstanceLock.TryAcquire(stateDirectory);
     if (instanceLock is null)
     {
         Log.Fatal(
             "Another VRC Remote Test Bridge is already running (lock file {LockFile} is in use); refusing to start.",
-            BridgeInstanceLock.PathFor(options.StateDirectory));
+            BridgeInstanceLock.PathFor(stateDirectory));
         Environment.ExitCode = 1;
         return;
     }
 
-    await host.RunAsync();
-}
-catch (OptionsValidationException ex)
-{
-    Log.Fatal("Configuration error: {Errors}", string.Join("; ", ex.Failures));
-    Environment.ExitCode = 1;
+    var runtime = new BridgeRuntime(
+        configDir,
+        BridgeIdentity.LoadOrCreate(configDir),
+        AccountDigest.LoadOrCreate(stateDirectory),
+        HashExecutable());
+    Log.Information("Executable SHA-256: {ExeSha256}", runtime.ExeSha256 ?? "unknown");
+
+    Environment.ExitCode = await BridgeHost.RunAsync(runtime, args, test: null, CancellationToken.None);
 }
 catch (Exception ex)
 {
@@ -178,4 +100,23 @@ catch (Exception ex)
 finally
 {
     Log.CloseAndFlush();
+}
+
+static string? HashExecutable()
+{
+    try
+    {
+        var path = Environment.ProcessPath;
+        if (string.IsNullOrEmpty(path) || !File.Exists(path))
+        {
+            return null;
+        }
+
+        using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+        return Convert.ToHexString(SHA256.HashData(stream)).ToLowerInvariant();
+    }
+    catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+    {
+        return null;
+    }
 }

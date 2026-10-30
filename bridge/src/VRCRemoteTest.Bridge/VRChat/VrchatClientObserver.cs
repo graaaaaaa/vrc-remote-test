@@ -88,8 +88,11 @@ public sealed class VrchatClientObserver
         IOptions<BridgeOptions> options,
         VrchatClientRoster roster,
         IManagedClientStore managedClients,
+        AccountDigest accountDigest,
+        ProfileAccountStore profileAccounts,
         ILogger<VrchatClientObserver> logger)
-        : this(options.Value, roster, managedClients, File.GetCreationTimeUtc, () => DateTimeOffset.UtcNow, logger)
+        : this(options.Value, roster, managedClients, File.GetCreationTimeUtc, () => DateTimeOffset.UtcNow, logger,
+            accountDigest.Of, profileAccounts)
     {
     }
 
@@ -100,7 +103,9 @@ public sealed class VrchatClientObserver
         IManagedClientStore? managedClients,
         Func<string, DateTime> creationTimeUtc,
         Func<DateTimeOffset> utcNow,
-        ILogger? logger = null)
+        ILogger? logger = null,
+        Func<string, string>? accountDigest = null,
+        ProfileAccountStore? profileAccounts = null)
     {
         _options = options;
         _roster = roster;
@@ -108,7 +113,14 @@ public sealed class VrchatClientObserver
         _creationTimeUtc = creationTimeUtc;
         _utcNow = utcNow;
         _logger = logger ?? NullLogger.Instance;
+        _accountDigest = accountDigest;
+        _profileAccounts = profileAccounts;
     }
+
+    /// <summary>Turns a usr_ ID into its digest where the log is read (<see cref="AccountDigest"/>).</summary>
+    private readonly Func<string, string>? _accountDigest;
+
+    private readonly ProfileAccountStore? _profileAccounts;
 
     private IReadOnlyList<string> Prefixes => _options.ResolvedLogMarkerPrefixes;
 
@@ -339,7 +351,7 @@ public sealed class VrchatClientObserver
 
         if (observation.Scanner is null)
         {
-            observation.StartReading(new VrchatLogScanner(path, created), Prefixes, observation.Epoch);
+            observation.StartReading(new VrchatLogScanner(path, created), Prefixes, observation.Epoch, _accountDigest);
             _logger.LogInformation(
                 "Reading {Path} for VRChat client {ProcessId} in slot {Slot} (observation epoch {Epoch}).",
                 path, observation.Entry.ProcessId, observation.Entry.Slot, observation.Epoch);
@@ -405,7 +417,7 @@ public sealed class VrchatClientObserver
             return false;
         }
 
-        observation.StartReading(new VrchatLogScanner(path, created), Prefixes, epoch);
+        observation.StartReading(new VrchatLogScanner(path, created), Prefixes, epoch, _accountDigest);
         _logger.LogInformation(
             "Reading {Path} from its start for VRChat client {ProcessId} in slot {Slot} (observation epoch {Epoch}, {Reason}).",
             path, observation.Entry.ProcessId, observation.Entry.Slot, epoch, reason);
@@ -483,6 +495,39 @@ public sealed class VrchatClientObserver
             notices.Add(notice);
         }
 
+        var running = rosterSlot.Liveness == RosterLiveness.Running;
+        var logReadToEnd = useLog && observation is { ReadFailed: false } && !catchingUp;
+        var loginState = tracker is { Authenticated: true } && running
+            ? "authenticated"
+            : running && logReadToEnd && loggingLevel == "full"
+                ? pastGrace ? "likelyLoggedOut" : "notSeen"
+                : "unknown";
+
+        // A login time that the local time zone cannot place (a skipped hour) gives no account.
+        VrchatClientAccount? account = null;
+        if (tracker?.Account is { } seen && VrchatLogLine.ToUtc(seen.LocalTime, TimeZoneInfo.Local) is { } authenticatedAt)
+        {
+            account = new VrchatClientAccount
+            {
+                DisplayName = LogRedactor.Redact(seen.Name),
+                IdDigest = seen.IdDigest,
+                AuthenticatedAtUtc = authenticatedAt,
+            };
+
+            if (record is not null)
+            {
+                _profileAccounts?.Record(new ProfileAccount
+                {
+                    Profile = record.Profile,
+                    DisplayName = account.DisplayName,
+                    IdDigest = account.IdDigest,
+                    AuthenticatedAtUtc = account.AuthenticatedAtUtc,
+                    Slot = slot,
+                    ClientGeneration = entry.ClientGeneration,
+                });
+            }
+        }
+
         var clientEntry = new VrchatClientEntry
         {
             Slot = slot,
@@ -507,6 +552,8 @@ public sealed class VrchatClientObserver
             IsMaster = inAttempt ? tracker!.IsMaster : null,
             LoggingLevel = loggingLevel,
             Authenticated = tracker is { Authenticated: true } ? true : null,
+            LoginState = loginState,
+            Account = account,
             JoinAttemptSeq = tracker?.JoinAttemptSeq,
             JoinedSeq = tracker?.JoinedSeq,
             ObservedThroughSeq = tracker?.ObservedThroughSeq ?? 0,
@@ -613,12 +660,13 @@ public sealed class VrchatClientObserver
         public void Acknowledge(object key) => _acknowledged = key;
 
         /// <summary>Starts reading <paramref name="scanner"/>'s file from its start, with fresh state, under <paramref name="epoch"/>.</summary>
-        public void StartReading(VrchatLogScanner scanner, IReadOnlyList<string> prefixes, long epoch)
+        public void StartReading(
+            VrchatLogScanner scanner, IReadOnlyList<string> prefixes, long epoch, Func<string, string>? accountDigest)
         {
             Scanner = scanner;
             Prefixes = prefixes;
             Epoch = epoch;
-            Tracker = new VrchatClientStateTracker();
+            Tracker = new VrchatClientStateTracker(accountDigest);
             Markers = new VrchatMarkerLog(prefixes);
             CatchingUp = true;
             ReadFailed = false;

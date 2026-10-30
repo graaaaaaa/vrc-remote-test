@@ -68,6 +68,21 @@ internal sealed partial class VrchatClientStateTracker
     private readonly List<(string Name, string UserId)> _players = [];
     private readonly LinkedList<VrchatClientLogEvent> _events = new();
 
+    /// <summary>Turns the raw usr_ ID into its digest right where it is read; null keeps no account (unit tests).</summary>
+    private readonly Func<string, string>? _accountDigest;
+
+    internal VrchatClientStateTracker(Func<string, string>? accountDigest = null)
+    {
+        _accountDigest = accountDigest;
+    }
+
+    /// <summary>
+    /// The latest "User Authenticated" line of this log: the name as logged (unmasked; the
+    /// observer masks it), the digest of the usr_ ID (<see cref="AccountDigest"/>), and the
+    /// line's local time. The raw ID itself is never kept.
+    /// </summary>
+    public (string Name, string IdDigest, DateTime LocalTime)? Account { get; private set; }
+
     /// <summary>A Joining was seen and no Rejoining or OnLeftRoom since: players and master belong to it.</summary>
     private bool _inAttempt;
 
@@ -190,9 +205,14 @@ internal sealed partial class VrchatClientStateTracker
     private void OnDebugMessage(string body, long seq, DateTime time)
     {
         if (body.StartsWith(UserAuthenticatedPrefix, StringComparison.Ordinal)
-            && TrySplitUser(body[UserAuthenticatedPrefix.Length..], out _, out _))
+            && TrySplitUser(body[UserAuthenticatedPrefix.Length..], out var accountName, out var accountId))
         {
             Authenticated = true;
+            if (_accountDigest is not null)
+            {
+                Account = (accountName, _accountDigest(accountId), time);
+            }
+
             AddEvent("UserAuthenticated", seq, time);
             return;
         }

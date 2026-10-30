@@ -27,14 +27,17 @@ public sealed class VrchatMonitorService : BackgroundService
     private readonly IVrchatStatusWriter _statusWriter;
     private readonly ILogger<VrchatMonitorService> _logger;
     private readonly TimeSpan _pollInterval;
+    private readonly IHostApplicationLifetime? _lifetime;
 
     public VrchatMonitorService(
         IOptions<BridgeOptions> options,
         IVrchatProcessMonitor processMonitor,
         IVrchatStatusWriter statusWriter,
-        ILogger<VrchatMonitorService> logger)
+        ILogger<VrchatMonitorService> logger,
+        IHostApplicationLifetime lifetime)
         : this(options, processMonitor, statusWriter, logger, DefaultPollInterval)
     {
+        _lifetime = lifetime;
     }
 
     /// <summary>Test-only seam: a short poll interval keeps unit tests fast without a full clock abstraction.</summary>
@@ -56,6 +59,16 @@ public sealed class VrchatMonitorService : BackgroundService
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
+        // A host that fails to start must not replace the published status (BridgeHost).
+        try
+        {
+            await Runtime.HostReady.WaitAsync(_lifetime, stoppingToken);
+        }
+        catch (OperationCanceledException)
+        {
+            return;
+        }
+
         while (!stoppingToken.IsCancellationRequested)
         {
             try

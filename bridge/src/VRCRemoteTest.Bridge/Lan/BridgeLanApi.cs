@@ -25,8 +25,12 @@ public static class BridgeLanApi
         UnmappedMemberHandling = JsonUnmappedMemberHandling.Disallow,
     };
 
+    /// <summary>
+    /// <paramref name="runtime"/> adds the management routes (<see cref="BridgeAdminApi"/>);
+    /// without it (tests of the build routes alone) they are not mapped.
+    /// </summary>
     public static void Map(WebApplication app, BridgeOptions options, BridgeIdentity identity,
-        LogSourceRegistry logSources)
+        LogSourceRegistry logSources, Runtime.BridgeRuntime? runtime = null)
     {
         app.Use(async (context, next) =>
         {
@@ -66,7 +70,24 @@ public static class BridgeLanApi
             ExportLog(context, options, logSources, request));
         api.MapGet("/log-exports/{exportId}", (string exportId) =>
             ReadExport(options, exportId));
+
+        if (runtime is not null)
+        {
+            BridgeAdminApi.Map(api, runtime);
+        }
     }
+
+    /// <summary>
+    /// Every 413 says what was too large and the limit (v0.8.0); before, the body was empty
+    /// and a 47.7 MB world looked like any other failure. <paramref name="declared"/> is the
+    /// Content-Length, or null for a body sent without one.
+    /// </summary>
+    internal static IResult TooLarge(string error, long limit, long? declared) =>
+        Results.Json(new { error, limitBytes = limit, declaredBytes = declared },
+            statusCode: StatusCodes.Status413PayloadTooLarge);
+
+    private static bool IsTooLarge(Exception ex) =>
+        ex is Microsoft.AspNetCore.Http.BadHttpRequestException { StatusCode: StatusCodes.Status413PayloadTooLarge };
 
     public sealed record LogExportRequest(int Slot, long ClientGeneration, long ObservationEpoch);
 
@@ -80,16 +101,17 @@ public static class BridgeLanApi
         var size = context.Request.ContentLength;
         if (size > options.MaxArtifactSizeBytes)
         {
-            return Results.StatusCode(StatusCodes.Status413PayloadTooLarge);
+            return TooLarge("artifactTooLarge", options.MaxArtifactSizeBytes, size);
         }
 
         // Kestrel stops every request body at 30,000,000 bytes by default (413) before MaxArtifactSizeBytes is checked,
         // and a world is often larger. This route enforces MaxArtifactSizeBytes itself below, so the server's limit
-        // follows it here; every other route keeps the default.
+        // follows it here (one byte above, so this route's own check answers first, with a body); every other route
+        // keeps the default.
         var bodyLimit = context.Features.Get<IHttpMaxRequestBodySizeFeature>();
         if (bodyLimit is { IsReadOnly: false })
         {
-            bodyLimit.MaxRequestBodySize = options.MaxArtifactSizeBytes;
+            bodyLimit.MaxRequestBodySize = options.MaxArtifactSizeBytes + 1;
         }
 
         await Ingress.WaitAsync(context.RequestAborted);
@@ -110,11 +132,25 @@ public static class BridgeLanApi
             await using (var destination = new FileStream(partial, FileMode.CreateNew, FileAccess.Write, FileShare.None))
             {
                 int read;
-                while ((read = await context.Request.Body.ReadAsync(buffer, context.RequestAborted)) > 0)
+                while (true)
                 {
+                    try
+                    {
+                        read = await context.Request.Body.ReadAsync(buffer, context.RequestAborted);
+                    }
+                    catch (Exception ex) when (IsTooLarge(ex))
+                    {
+                        return TooLarge("artifactTooLarge", options.MaxArtifactSizeBytes, size);
+                    }
+
+                    if (read == 0)
+                    {
+                        break;
+                    }
+
                     if (read > options.MaxArtifactSizeBytes - total)
                     {
-                        return Results.StatusCode(StatusCodes.Status413PayloadTooLarge);
+                        return TooLarge("artifactTooLarge", options.MaxArtifactSizeBytes, size);
                     }
 
                     total += read;
@@ -162,7 +198,7 @@ public static class BridgeLanApi
 
         if (context.Request.ContentLength > MaxManifestBytes)
         {
-            return Results.StatusCode(StatusCodes.Status413PayloadTooLarge);
+            return TooLarge("manifestTooLarge", MaxManifestBytes, context.Request.ContentLength);
         }
 
         byte[] bytes;
@@ -174,7 +210,7 @@ public static class BridgeLanApi
             {
                 if (memory.Length + read > MaxManifestBytes)
                 {
-                    return Results.StatusCode(StatusCodes.Status413PayloadTooLarge);
+                    return TooLarge("manifestTooLarge", MaxManifestBytes, context.Request.ContentLength);
                 }
 
                 await memory.WriteAsync(buffer.AsMemory(0, read), context.RequestAborted);
@@ -279,7 +315,10 @@ public static class BridgeLanApi
         try
         {
             var info = new FileInfo(path);
-            if (info.Length > maxBytes) return Results.StatusCode(StatusCodes.Status413PayloadTooLarge);
+            if (info.Length > maxBytes)
+            {
+                return TooLarge(directory == "exports" ? "logTooLarge" : "snapshotTooLarge", maxBytes, info.Length);
+            }
             return Results.File(path, type, enableRangeProcessing: false);
         }
         catch (IOException)
@@ -310,7 +349,7 @@ public static class BridgeLanApi
             var initialLength = input.Length;
             if (initialLength > MaxFullLogBytes)
             {
-                return Results.StatusCode(StatusCodes.Status413PayloadTooLarge);
+                return TooLarge("logTooLarge", MaxFullLogBytes, initialLength);
             }
 
             if (File.GetCreationTimeUtc(source.Path) != source.CreationTimeUtc)
@@ -346,7 +385,7 @@ public static class BridgeLanApi
                             line.Append(chars[i]);
                             if (line.Length > MaxFullLogLineChars)
                             {
-                                return Results.StatusCode(StatusCodes.Status413PayloadTooLarge);
+                                return TooLarge("logLineTooLong", MaxFullLogLineChars, null);
                             }
                         }
                     }
@@ -370,7 +409,7 @@ public static class BridgeLanApi
             var size = new FileInfo(partial).Length;
             if (size > MaxFullLogBytes)
             {
-                return Results.StatusCode(StatusCodes.Status413PayloadTooLarge);
+                return TooLarge("logTooLarge", MaxFullLogBytes, size);
             }
 
             File.Move(partial, final);

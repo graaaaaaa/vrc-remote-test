@@ -119,8 +119,14 @@ public sealed class ManagedClientStore : IManagedClientStore
     }
 
     internal ManagedClientStore(string stateDirectory)
+        : this(stateDirectory, FileName)
     {
-        FilePath = Path.Combine(stateDirectory, FileName);
+    }
+
+    /// <summary>The same record under another name (<see cref="ReloadClientStore"/>).</summary>
+    internal ManagedClientStore(string stateDirectory, string fileName)
+    {
+        FilePath = Path.Combine(stateDirectory, fileName);
     }
 
     public string FilePath { get; }
