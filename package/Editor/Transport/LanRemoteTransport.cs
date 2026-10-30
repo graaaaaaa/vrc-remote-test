@@ -20,6 +20,7 @@ namespace VRCRemoteTest
     public sealed class LanRemoteTransport : IRemoteTransport, IDisposable
     {
         public const int SlotCount = 4;
+        private const int MaxAdminResponseBytes = 1024 * 1024;
         private readonly string _baseUrl;
         private readonly string _fingerprint;
         private readonly string _token;
@@ -80,21 +81,12 @@ namespace VRCRemoteTest
             if (_connected) return;
             try
             {
-                using (var response = await _http.GetAsync(Url("/capabilities"), cancellationToken).ConfigureAwait(false))
-                {
-                    if (response.StatusCode == HttpStatusCode.NotFound)
-                        throw new RemoteBuildException(ErrorCode.ProtocolVersionMismatch,
-                            "Bridge has no LAN Direct capabilities endpoint; update Bridge and Unity together.");
-                    if (response.StatusCode == HttpStatusCode.Unauthorized)
-                        throw new RemoteBuildException(ErrorCode.InvalidConfiguration, "Bridge pairing token was rejected.");
-                    response.EnsureSuccessStatusCode();
-                    var json = JObject.Parse(await response.Content.ReadAsStringAsync().ConfigureAwait(false));
-                    if ((int?)json["apiVersion"] != 1
-                        || (int?)json["buildProtocolVersion"] != ProtocolConstants.CurrentProtocolVersion)
-                        throw new RemoteBuildException(ErrorCode.ProtocolVersionMismatch,
-                            "Bridge and Unity package versions are incompatible; update both together.");
-                    _connected = true;
-                }
+                var json = await ReadCapabilitiesAsync(cancellationToken).ConfigureAwait(false);
+                if ((int?)json["apiVersion"] != 1
+                    || (int?)json["buildProtocolVersion"] != ProtocolConstants.CurrentProtocolVersion)
+                    throw new RemoteBuildException(ErrorCode.ProtocolVersionMismatch,
+                        "Bridge and Unity package versions are incompatible; update both together.");
+                _connected = true;
             }
             catch (RemoteBuildException) { _connected = false; throw; }
             catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException or JsonException)
@@ -102,6 +94,38 @@ namespace VRCRemoteTest
                 _connected = false;
                 throw new RemoteBuildException(ErrorCode.BridgeUnavailable,
                     "Could not connect securely to the Windows Bridge: " + ex.Message);
+            }
+        }
+
+        private async Task<JObject> ReadCapabilitiesAsync(CancellationToken cancellationToken)
+        {
+            using (var response = await _http.GetAsync(Url("/capabilities"), cancellationToken).ConfigureAwait(false))
+            {
+                if (response.StatusCode == HttpStatusCode.NotFound)
+                    throw new RemoteBuildException(ErrorCode.ProtocolVersionMismatch,
+                        "Bridge has no LAN Direct capabilities endpoint; update Bridge and Unity together.");
+                if (response.StatusCode == HttpStatusCode.Unauthorized)
+                    throw new RemoteBuildException(ErrorCode.InvalidConfiguration, "Bridge pairing token was rejected.");
+                response.EnsureSuccessStatusCode();
+                return JObject.Parse(await response.Content.ReadAsStringAsync().ConfigureAwait(false));
+            }
+        }
+
+        /// <summary>
+        /// Read afresh for every upload rather than kept from the first probe: the limit can
+        /// change on the Bridge (PUT /config restarts its host) while this Editor stays connected.
+        /// </summary>
+        public async Task<long?> GetMaxArtifactSizeBytesAsync(CancellationToken cancellationToken = default)
+        {
+            try
+            {
+                var limit = (await ReadCapabilitiesAsync(cancellationToken).ConfigureAwait(false))["maxArtifactSizeBytes"];
+                return limit != null && limit.Type == JTokenType.Integer ? (long?)limit : null;
+            }
+            catch (Exception ex) when (ex is RemoteBuildException or HttpRequestException or JsonException
+                || (ex is TaskCanceledException && !cancellationToken.IsCancellationRequested))
+            {
+                return null;
             }
         }
 
@@ -141,8 +165,16 @@ namespace VRCRemoteTest
                        content, cancellationToken).ConfigureAwait(false))
             {
                 if (!response.IsSuccessStatusCode)
+                {
+                    var status = (int)response.StatusCode;
+                    var body = status == 413
+                        ? await ReadBoundedAsync(response.Content, BridgeMessages.MaxErrorBodyBytes, cancellationToken)
+                            .ConfigureAwait(false)
+                        : null;
                     throw new RemoteBuildException(ErrorCode.UploadFailed,
-                        "Bridge rejected artifact upload (HTTP " + (int)response.StatusCode + ").");
+                        BridgeMessages.TooLargeUploadMessage(status, body)
+                        ?? "Bridge rejected artifact upload (HTTP " + status + ").");
+                }
             }
         }
 
@@ -171,8 +203,12 @@ namespace VRCRemoteTest
                     if (request.result == UnityWebRequest.Result.Success && request.responseCode == 200)
                         completion.TrySetResult(true);
                     else
+                    {
+                        var body = request.responseCode == 413 ? BridgeMessages.Decode(request.downloadHandler?.data) : null;
                         completion.TrySetException(new RemoteBuildException(ErrorCode.UploadFailed,
-                            "Bridge artifact upload failed (HTTP " + request.responseCode + "): " + request.error));
+                            BridgeMessages.TooLargeUploadMessage(request.responseCode, body)
+                            ?? "Bridge artifact upload failed (HTTP " + request.responseCode + "): " + request.error));
+                    }
                     request.Dispose();
                 };
                 registration = cancellationToken.Register(() => _mainContext.Post(__ => request.Abort(), null));
@@ -207,6 +243,86 @@ namespace VRCRemoteTest
         public VrchatClients PollVrchatClients() => Parse<VrchatClients>(GetCached("/clients", 5));
         public string PollClientLog(int slot) => SlotText("/logs/clients/", slot);
         public string PollClientMarkers(int slot) => SlotText("/markers/clients/", slot);
+        public BridgeInfo PollBridgeInfo() => Parse<BridgeInfo>(GetCached("/bridge", 10));
+
+        public Task<BridgeAdminResponse> GetBridgeInfoAsync(CancellationToken cancellationToken = default) =>
+            SendAdminAsync(HttpMethod.Get, "/bridge", null, null, cancellationToken);
+
+        public Task<BridgeAdminResponse> GetProfilesAsync(CancellationToken cancellationToken = default) =>
+            SendAdminAsync(HttpMethod.Get, "/profiles", null, null, cancellationToken);
+
+        public Task<BridgeAdminResponse> GetConfigAsync(CancellationToken cancellationToken = default) =>
+            SendAdminAsync(HttpMethod.Get, "/config", null, null, cancellationToken);
+
+        public Task<BridgeAdminResponse> PutConfigAsync(string etag, string mergePatchJson,
+            CancellationToken cancellationToken = default)
+        {
+            // The etag goes into a header: only the characters an etag from GET /config has.
+            if (etag == null || etag.Length == 0 || etag.Length > 256 || !IsEtagText(etag))
+                throw new ArgumentException("PUT /config needs the etag from GET /config.", nameof(etag));
+            if (string.IsNullOrEmpty(mergePatchJson))
+                throw new ArgumentException("PUT /config needs a JSON object.", nameof(mergePatchJson));
+            return SendAdminAsync(HttpMethod.Put, "/config", mergePatchJson, etag, cancellationToken);
+        }
+
+        public Task<BridgeAdminResponse> RestartBridgeAsync(CancellationToken cancellationToken = default) =>
+            SendAdminAsync(HttpMethod.Post, "/bridge/restart", null, null, cancellationToken);
+
+        public Task<BridgeAdminResponse> CloseClientsAsync(CancellationToken cancellationToken = default) =>
+            SendAdminAsync(HttpMethod.Post, "/clients/close", null, null, cancellationToken);
+
+        private async Task<BridgeAdminResponse> SendAdminAsync(HttpMethod method, string path, string json,
+            string ifMatch, CancellationToken cancellationToken)
+        {
+            try
+            {
+                using (var request = new HttpRequestMessage(method, Url(path)))
+                {
+                    if (json != null)
+                        request.Content = new StringContent(json, Encoding.UTF8, "application/json");
+                    if (ifMatch != null)
+                        request.Headers.TryAddWithoutValidation("If-Match", "\"" + ifMatch + "\"");
+                    using (var response = await _http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead,
+                               cancellationToken).ConfigureAwait(false))
+                    {
+                        var body = await ReadBoundedAsync(response.Content, MaxAdminResponseBytes, cancellationToken)
+                            .ConfigureAwait(false);
+                        return new BridgeAdminResponse(true, (int)response.StatusCode, body, null);
+                    }
+                }
+            }
+            catch (Exception ex) when (ex is HttpRequestException
+                || (ex is TaskCanceledException && !cancellationToken.IsCancellationRequested))
+            {
+                return BridgeAdminResponse.Unreachable("Could not reach the Windows Bridge: " + ex.Message);
+            }
+        }
+
+        /// <summary>At most <paramref name="limit"/> bytes of the body as UTF-8 text (a longer body is cut), or null when empty.</summary>
+        private static async Task<string> ReadBoundedAsync(HttpContent content, int limit, CancellationToken cancellationToken)
+        {
+            if (content == null) return null;
+            using (var stream = await content.ReadAsStreamAsync().ConfigureAwait(false))
+            using (var memory = new MemoryStream())
+            {
+                var buffer = new byte[8192];
+                while (memory.Length < limit)
+                {
+                    var read = await stream.ReadAsync(buffer, 0, (int)Math.Min(buffer.Length, limit - memory.Length),
+                        cancellationToken).ConfigureAwait(false);
+                    if (read == 0) break;
+                    memory.Write(buffer, 0, read);
+                }
+                return memory.Length == 0 ? null : Encoding.UTF8.GetString(memory.GetBuffer(), 0, (int)memory.Length);
+            }
+        }
+
+        private static bool IsEtagText(string text)
+        {
+            foreach (var c in text)
+                if (c <= ' ' || c > '~' || c == '"' || c == ',') return false;
+            return true;
+        }
 
         public async Task DownloadFullLogAsync(int slot, long clientGeneration, long observationEpoch,
             string destinationPath, CancellationToken cancellationToken = default)

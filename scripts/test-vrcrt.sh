@@ -146,6 +146,107 @@ expect "an old client list is warned about" 0 "warning:" "$vrcrt" status
 clients joined joined ', "catchingUp": true'
 expect "a client still being read has no cursor" 3 "catchingUp" "$vrcrt" cursor
 
+# --- Bridge v0.8.0 management commands: http/<METHOD>_api_v1_<route>[.n] stand in for the routes.
+http_reset() { rm -rf "$share/http"; mkdir -p "$share/http"; }
+# http <fixture name> [status] <body>
+http() {
+    if [ "$#" -eq 3 ]; then printf 'HTTP %s\n%s' "$2" "$3" > "$share/http/$1"; else printf '%s' "$2" > "$share/http/$1"; fi
+}
+# bridge_info <hostGeneration> [lastConfigApply JSON]
+bridge_info() {
+    printf '{"version":"0.8.0+abc","exeSha256":"00","processStartedAtUtc":"2026-10-30T00:00:00+00:00","hostGeneration":%s,' "$1"
+    printf '"hostStartedAtUtc":"2026-10-30T00:00:01+00:00","listenUrl":"https://192.168.1.2:38443","certificateSha256":"ab",'
+    printf '"activeConfigEtag":"etag1","savedConfigEtag":"etag1","activeConfig":{},'
+    printf '"paths":{"vrchatWorldsDirectory":{"display":"C:\\\\Users\\\\*\\\\Worlds","exists":true},"vrchatExecutable":{"display":"C:\\\\VRChat.exe","exists":false}},'
+    printf '"lastConfigApply":%s,"busy":null,"restartPending":false,' "${2:-null}"
+    printf '"configNotes":["AutoLaunchVrchat is false\\u001b[31m: a deploy installs the world but launches no VRChat."],'
+    printf '"stateExportsBytes":1048576,"freeDiskBytes":53687091200}'
+}
+apply_report() { printf '{"operationId":"op1","requestedEtag":"etag2","outcome":"%s","problems":%s,"atUtc":"2026-10-30T00:00:05+00:00"}' "$1" "${2:-[]}"; }
+PROFILES='{"configuredProfiles":[0,1],"profiles":[{"profile":0,"displayName":"Tester","idDigest":"0123456789ab","authenticatedAtUtc":"2026-10-30T00:00:02+00:00","slot":0,"clientGeneration":11},{"profile":1,"displayName":"Tester","idDigest":"0123456789ab","authenticatedAtUtc":"2026-10-30T00:00:03+00:00","slot":1,"clientGeneration":22}],"warnings":["Profiles 0 and 1 are logged in to the same account (Tester)."]}'
+CONFIG='{"etag":"etag1","values":{"AutoLaunchVrchat":true},"active":{},"editable":[{"name":"AutoLaunchVrchat","kind":"boolean"}],"executableCandidates":[]}'
+
+http_reset
+clients joined joined ', "loginState": "authenticated", "account": {"displayName": "Tester\u202e", "idDigest": "0123456789ab", "authenticatedAtUtc": "2026-10-30T00:00:03+00:00"}'
+http GET_api_v1_bridge "$(bridge_info 3 "$(apply_report rolledBack '["VrchatClientCount must be 1 to 4"]')")"
+http GET_api_v1_profiles "$PROFILES"
+printf '2026-10-30 00:00:01 info: started\n2026-10-30 00:00:02 warn: \033[31mred\n' > "$share/http/GET_api_v1_logs_bridge"
+expect "doctor shows the version" 0 "Bridge        0.8.0+abc" "$vrcrt" doctor
+expect "doctor escapes configuration notes" 0 'note: AutoLaunchVrchat is false\x1b[31m' "$vrcrt" doctor
+expect "doctor shows the last config change" 0 "Last change   rolledBack" "$vrcrt" doctor
+expect "doctor lists its problems" 0 "  - VrchatClientCount must be 1 to 4" "$vrcrt" doctor
+expect "doctor marks a missing VRChat.exe" 0 'C:\VRChat.exe (missing)' "$vrcrt" doctor
+expect "doctor shows profile warnings" 0 "warning: Profiles 0 and 1 are logged in to the same account" "$vrcrt" doctor
+expect "doctor shows each client's login" 0 'authenticated  Tester\u202e' "$vrcrt" doctor
+expect "doctor escapes the Bridge log" 0 '  2026-10-30 00:00:02 warn: \x1b[31mred' "$vrcrt" doctor
+if grep -qF '"path": "/api/v1/logs/bridge?lines=30"' "$share/http/requests.log"; then
+    pass "doctor asks for the last 30 log lines"
+else
+    fail "doctor asks for the last 30 log lines"
+fi
+rm "$share/http/GET_api_v1_bridge"
+expect "doctor says when the Bridge is older than 0.8.0" 3 "older than v0.8.0" "$vrcrt" doctor
+expect "profiles" 0 "warning: Profiles 0 and 1" "$vrcrt" profiles
+expect "profiles lists the configured ones" 0 "Configured profiles: 0,1" "$vrcrt" profiles
+http GET_api_v1_config "$CONFIG"
+expect "config get" 0 '"etag": "etag1"' "$vrcrt" config get
+expect "config needs get or set" 2 "" "$vrcrt" config
+expect "config set needs KEY=VALUE" 2 "expected KEY=VALUE" "$vrcrt" config set AutoLaunchVrchat
+expect "config set refuses a key given twice" 2 "more than once" "$vrcrt" config set RetainBuilds=3 RetainBuilds=4
+
+http_reset
+http GET_api_v1_config "$CONFIG"
+http GET_api_v1_bridge.1 "$(bridge_info 1)"
+http GET_api_v1_bridge.2 "DOWN"
+http GET_api_v1_bridge.3 "$(bridge_info 2 "$(apply_report pending)")"
+http GET_api_v1_bridge.4 "$(bridge_info 2 "$(apply_report applied)")"
+http PUT_api_v1_config 202 '{"operationId":"op1","requestedEtag":"etag2","restart":"scheduled"}'
+expect "config set waits for the restart and reports applied" 0 "outcome: applied" \
+    "$vrcrt" config set AutoLaunchVrchat=false 'VrchatProfiles=[0,1]' VrchatMode=Desktop RetainBuilds=null LogMarkerPrefixes='["[A]"]'
+if grep -qF '"ifMatch": "etag1"' "$share/http/requests.log" \
+    && grep -qF '\"AutoLaunchVrchat\": false, \"VrchatProfiles\": [0, 1], \"VrchatMode\": \"Desktop\", \"RetainBuilds\": null' "$share/http/requests.log"; then
+    pass "config set sends a merge patch with If-Match"
+else
+    fail "config set sends a merge patch with If-Match"
+    sed 's/^/     /' "$share/http/requests.log"
+fi
+
+http_reset
+http GET_api_v1_config "$CONFIG"
+http GET_api_v1_bridge.1 "$(bridge_info 1)"
+http GET_api_v1_bridge.2 "$(bridge_info 2 "$(apply_report rolledBack '["VrchatClientCount must be 1 to 4"]')")"
+http PUT_api_v1_config 202 '{"operationId":"op1","requestedEtag":"etag2","restart":"scheduled"}'
+expect "config set reports a rollback" 1 "outcome: rolledBack" "$vrcrt" config set VrchatClientCount=9
+expect "config set lists why" 1 "  - VrchatClientCount must be 1 to 4" "$vrcrt" config set VrchatClientCount=9
+
+http_reset
+http GET_api_v1_config "$CONFIG"
+http GET_api_v1_bridge "$(bridge_info 1)"
+http PUT_api_v1_config 202 '{"operationId":"op1","requestedEtag":"etag2","restart":"scheduled"}'
+expect "config set gives up when the Bridge never reports" 1 "did not report operation op1" \
+    "$vrcrt" config set AutoLaunchVrchat=true
+http PUT_api_v1_config 412 '{"error":"etagMismatch","etag":"etag9"}'
+expect "config set reports a changed config.json" 1 "etagMismatch (etag9)" "$vrcrt" config set AutoLaunchVrchat=true
+http PUT_api_v1_config 409 '{"error":"busy","operation":"deploy"}'
+expect "config set reports a busy Bridge" 1 "busy (deploy)" "$vrcrt" config set AutoLaunchVrchat=true
+http PUT_api_v1_config 422 '{"error":"invalidConfig","problems":["VrchatExecutable does not exist\u001b"]}'
+expect "config set escapes the problems" 1 '  - VrchatExecutable does not exist\x1b' "$vrcrt" config set AutoLaunchVrchat=true
+
+http_reset
+http GET_api_v1_bridge.1 "$(bridge_info 4)"
+http GET_api_v1_bridge.2 "DOWN"
+http GET_api_v1_bridge.3 "$(bridge_info 5)"
+http POST_api_v1_bridge_restart 202 '{"restart":"scheduled","hostGeneration":4}'
+expect "restart waits for a new host" 0 "restarted: host generation 5" "$vrcrt" restart
+http POST_api_v1_bridge_restart 429 '{"error":"tooSoon","retryAfterSeconds":30}'
+expect "restart too soon" 1 "tooSoon (30)" "$vrcrt" restart
+http POST_api_v1_clients_close '{"closed":2,"notConfirmed":0,"othersRunning":0,"problem":null}'
+expect "close-clients" 0 "closed 2, not confirmed 0, others running 0" "$vrcrt" close-clients
+http POST_api_v1_clients_close 409 '{"closed":0,"notConfirmed":0,"othersRunning":1,"problem":"A VRChat the Bridge did not launch is running."}'
+expect "close-clients refused" 1 "problem: A VRChat the Bridge did not launch is running." "$vrcrt" close-clients
+http POST_api_v1_clients_close DOWN
+expect "close-clients without an answer" 3 "cannot reach the Bridge" "$vrcrt" close-clients
+
 rm "$share/status/vrchat-clients.json"
 expect "without vrchat-clients.json" 3 "Bridge client status is unavailable" "$vrcrt" status
 

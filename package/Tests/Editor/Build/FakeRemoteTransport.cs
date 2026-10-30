@@ -68,5 +68,32 @@ namespace VRCRemoteTest.Tests
 
         public Task DownloadFullLogAsync(int slot, long clientGeneration, long observationEpoch,
             string destinationPath, CancellationToken cancellationToken = default) => Task.CompletedTask;
+
+        /// <summary>What GetMaxArtifactSizeBytesAsync answers; null (the default) skips the size check.</summary>
+        public long? MaxArtifactSizeBytes { get; set; }
+
+        public Task<long?> GetMaxArtifactSizeBytesAsync(CancellationToken cancellationToken = default) =>
+            Task.FromResult(MaxArtifactSizeBytes);
+
+        public BridgeInfo BridgeInfoToReturn { get; set; }
+
+        public BridgeInfo PollBridgeInfo() => BridgeInfoToReturn;
+
+        // No management API: the answer every transport without it gives.
+        private static Task<BridgeAdminResponse> NotSupported() =>
+            Task.FromResult(BridgeAdminResponse.NotSupported(nameof(FakeRemoteTransport)));
+
+        public Task<BridgeAdminResponse> GetBridgeInfoAsync(CancellationToken cancellationToken = default) => NotSupported();
+
+        public Task<BridgeAdminResponse> GetProfilesAsync(CancellationToken cancellationToken = default) => NotSupported();
+
+        public Task<BridgeAdminResponse> GetConfigAsync(CancellationToken cancellationToken = default) => NotSupported();
+
+        public Task<BridgeAdminResponse> PutConfigAsync(string etag, string mergePatchJson,
+            CancellationToken cancellationToken = default) => NotSupported();
+
+        public Task<BridgeAdminResponse> RestartBridgeAsync(CancellationToken cancellationToken = default) => NotSupported();
+
+        public Task<BridgeAdminResponse> CloseClientsAsync(CancellationToken cancellationToken = default) => NotSupported();
     }
 }

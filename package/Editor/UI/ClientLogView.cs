@@ -204,6 +204,39 @@ namespace VRCRemoteTest
             return string.Join(" · ", parts);
         }
 
+        /// <summary>
+        /// "profile 1 · authenticated · Name (1a2b3c4d)", for the Bridge section: the login
+        /// state, then the account's display name and the start of its digest (equal digests
+        /// mean the same account). Null from a Bridge before v0.8.0, which has no loginState.
+        /// </summary>
+        internal static string DescribeLogin(VrchatClientEntry client)
+        {
+            if (client == null || string.IsNullOrEmpty(client.LoginState))
+            {
+                return null;
+            }
+
+            var parts = new List<string>();
+            if (client.Profile.HasValue)
+            {
+                parts.Add($"profile {client.Profile.Value}");
+            }
+
+            parts.Add(BridgeMessages.Sanitize(client.LoginState, 32));
+            var account = client.Account;
+            if (account != null && !string.IsNullOrEmpty(account.DisplayName))
+            {
+                parts.Add(BridgeMessages.Sanitize(account.DisplayName, 64)
+                    + (string.IsNullOrEmpty(account.IdDigest) ? string.Empty : $" ({ShortDigest(account.IdDigest)})"));
+            }
+
+            return string.Join(" · ", parts);
+        }
+
+        /// <summary>The first 8 characters of an account digest: enough to tell accounts apart at a glance.</summary>
+        internal static string ShortDigest(string digest) =>
+            BridgeMessages.Sanitize(digest.Length > 8 ? digest.Substring(0, 8) : digest, 8);
+
         internal static bool IsStale(VrchatClients clients, DateTimeOffset now) =>
             clients == null || now - clients.UpdatedAtUtc > StaleAfter;
 

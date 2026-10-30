@@ -33,8 +33,8 @@ namespace VRCRemoteTest
             [ErrorCode.SizeMismatch] =
                 "The uploaded file's size did not match the manifest. Try again.",
             [ErrorCode.SizeExceeded] =
-                "The build artifact exceeds the Bridge's configured size limit. " +
-                "Check MaxArtifactSizeBytes in config.json.",
+                "The build artifact exceeds the Bridge's configured size limit. Raise MaxArtifactSizeBytes " +
+                "(scripts/vrcrt.sh config set, or config.json on Windows) or make the world smaller.",
             [ErrorCode.BuildAlreadyProcessed] =
                 "This build was already processed by the Bridge. No action needed.",
             [ErrorCode.DeployFailed] =

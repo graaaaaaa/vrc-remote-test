@@ -81,6 +81,14 @@ namespace VRCRemoteTest
         [JsonProperty("authenticated")]
         public bool? Authenticated { get; set; }
 
+        /// <summary>authenticated, notSeen, likelyLoggedOut or unknown (Bridge v0.8.0 and later); null from an older Bridge.</summary>
+        [JsonProperty("loginState")]
+        public string LoginState { get; set; }
+
+        /// <summary>The account this client logged in to, or null (not seen yet, or an older Bridge).</summary>
+        [JsonProperty("account")]
+        public VrchatClientAccount Account { get; set; }
+
         [JsonProperty("observedThroughSeq")]
         public long ObservedThroughSeq { get; set; }
 
@@ -89,5 +97,20 @@ namespace VRCRemoteTest
 
         [JsonProperty("warnings")]
         public List<string> Warnings { get; set; }
+    }
+
+    [Serializable]
+    public sealed class VrchatClientAccount
+    {
+        /// <summary>Untrusted: whatever name the client's log carried, masked by the Bridge.</summary>
+        [JsonProperty("displayName")]
+        public string DisplayName { get; set; }
+
+        /// <summary>Equal values mean the same account on this Bridge.</summary>
+        [JsonProperty("idDigest")]
+        public string IdDigest { get; set; }
+
+        [JsonProperty("authenticatedAtUtc")]
+        public DateTimeOffset? AuthenticatedAtUtc { get; set; }
     }
 }
