@@ -85,22 +85,53 @@ namespace VRCRemoteTest
         internal static string DescribeTooLarge(string body)
         {
             var json = ParseObject(body);
-            var limit = json?["limitBytes"];
-            if (limit == null || limit.Type != JTokenType.Integer)
+            var limit = ByteCount(json?["limitBytes"]);
+            if (limit == null)
             {
                 return null;
             }
 
             var error = json["error"]?.Type == JTokenType.String ? (string)json["error"] : null;
-            var text = "the Bridge accepts at most " + FormatBytes((long)limit)
+            var text = "the Bridge accepts at most " + FormatBytes(limit.Value)
                 + (error == "artifactTooLarge" ? " (MaxArtifactSizeBytes)" : string.Empty);
-            var declared = json["declaredBytes"];
-            if (declared != null && declared.Type == JTokenType.Integer)
+            var declared = ByteCount(json["declaredBytes"]);
+            if (declared != null)
             {
-                text += "; this upload was " + FormatBytes((long)declared);
+                text += "; this upload was " + FormatBytes(declared.Value);
             }
 
             return text;
+        }
+
+        /// <summary>
+        /// A JSON integer from 0 to Int64.MaxValue, or null for anything else (missing, not an
+        /// integer, negative, or too large for Int64, which Newtonsoft keeps as a BigInteger).
+        /// Never throws, unlike a (long) cast of the token.
+        /// </summary>
+        internal static long? ByteCount(JToken token)
+        {
+            if (!(token is JValue value) || value.Type != JTokenType.Integer)
+            {
+                return null;
+            }
+
+            long number;
+            switch (value.Value)
+            {
+                case long l:
+                    number = l;
+                    break;
+                case int i:
+                    number = i;
+                    break;
+                case ulong u when u <= (ulong)long.MaxValue:
+                    number = (long)u;
+                    break;
+                default:
+                    return null;
+            }
+
+            return number >= 0 ? number : (long?)null;
         }
 
         /// <summary>The "error" member of a JSON object body, or null.</summary>
@@ -110,23 +141,16 @@ namespace VRCRemoteTest
             return error != null && error.Type == JTokenType.String ? Sanitize((string)error, 100) : null;
         }
 
-        /// <summary>The first <see cref="MaxErrorBodyBytes"/> bytes as UTF-8 text, or null.</summary>
-        internal static string Decode(byte[] bytes)
-        {
-            if (bytes == null || bytes.Length == 0)
-            {
-                return null;
-            }
-
-            return Encoding.UTF8.GetString(bytes, 0, Math.Min(bytes.Length, MaxErrorBodyBytes));
-        }
-
         /// <summary>"52428800 bytes (50.0 MiB)".</summary>
         internal static string FormatBytes(long bytes) =>
             bytes.ToString(CultureInfo.InvariantCulture) + " bytes ("
             + (bytes / (1024.0 * 1024.0)).ToString("0.0", CultureInfo.InvariantCulture) + " MiB)";
 
-        /// <summary>Untrusted text for one line of the UI or the Console: controls become spaces, and it is cut to <paramref name="maxLength"/>.</summary>
+        /// <summary>
+        /// Untrusted text for one line of the UI or the Console: controls, format characters
+        /// (bidirectional overrides and isolates, zero-width characters) and line or paragraph
+        /// separators become spaces, and it is cut to <paramref name="maxLength"/>.
+        /// </summary>
         internal static string Sanitize(string text, int maxLength)
         {
             if (string.IsNullOrEmpty(text))
@@ -142,10 +166,24 @@ namespace VRCRemoteTest
                     return builder.Append("...").ToString();
                 }
 
-                builder.Append(char.IsControl(c) ? ' ' : c);
+                builder.Append(IsUnsafe(c) ? ' ' : c);
             }
 
             return builder.ToString();
+        }
+
+        private static bool IsUnsafe(char c)
+        {
+            switch (char.GetUnicodeCategory(c))
+            {
+                case UnicodeCategory.Control:
+                case UnicodeCategory.Format:
+                case UnicodeCategory.LineSeparator:
+                case UnicodeCategory.ParagraphSeparator:
+                    return true;
+                default:
+                    return false;
+            }
         }
 
         internal static T Parse<T>(string json) where T : class
@@ -163,7 +201,7 @@ namespace VRCRemoteTest
                     MaxDepth = MaxJsonDepth,
                 });
             }
-            catch (JsonException)
+            catch (Exception ex) when (ex is JsonException or OverflowException)
             {
                 return null;
             }
@@ -192,5 +230,49 @@ namespace VRCRemoteTest
                 return null;
             }
         }
+    }
+
+    /// <summary>
+    /// Keeps at most a fixed number of the bytes appended to it and drops the rest, so an
+    /// answer of any length costs at most its capacity in memory. Used for every body this
+    /// package reads from the Bridge's error and management answers.
+    /// </summary>
+    internal sealed class BoundedBytes
+    {
+        private readonly byte[] _buffer;
+        private int _count;
+
+        public BoundedBytes(int capacity)
+        {
+            _buffer = new byte[capacity];
+        }
+
+        /// <summary>True once more bytes arrived than the capacity.</summary>
+        public bool Overflowed { get; private set; }
+
+        public int Count => _count;
+
+        public void Append(byte[] data, int offset, int count)
+        {
+            if (data == null || count <= 0)
+            {
+                return;
+            }
+
+            var take = Math.Min(count, _buffer.Length - _count);
+            if (take > 0)
+            {
+                Buffer.BlockCopy(data, offset, _buffer, _count, take);
+                _count += take;
+            }
+
+            if (take < count)
+            {
+                Overflowed = true;
+            }
+        }
+
+        /// <summary>The bytes as UTF-8 text; null when none arrived or when more than the capacity did (a cut body is not read).</summary>
+        public string Text => _count == 0 || Overflowed ? null : Encoding.UTF8.GetString(_buffer, 0, _count);
     }
 }

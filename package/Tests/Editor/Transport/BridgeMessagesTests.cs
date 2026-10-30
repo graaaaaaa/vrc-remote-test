@@ -51,12 +51,62 @@ namespace VRCRemoteTest.Tests
         }
 
         [Test]
-        public void Decode_reads_at_most_4_KiB()
+        public void BoundedBytes_keeps_at_most_its_capacity_and_does_not_read_a_cut_body()
         {
-            Assert.IsNull(BridgeMessages.Decode(null));
-            Assert.IsNull(BridgeMessages.Decode(new byte[0]));
-            Assert.AreEqual(ArtifactTooLarge, BridgeMessages.Decode(Encoding.UTF8.GetBytes(ArtifactTooLarge)));
-            Assert.AreEqual(BridgeMessages.MaxErrorBodyBytes, BridgeMessages.Decode(new byte[10000]).Length);
+            var empty = new BoundedBytes(BridgeMessages.MaxErrorBodyBytes);
+            empty.Append(null, 0, 10);
+            Assert.IsNull(empty.Text);
+
+            var small = new BoundedBytes(BridgeMessages.MaxErrorBodyBytes);
+            var bytes = Encoding.UTF8.GetBytes(ArtifactTooLarge);
+            small.Append(bytes, 0, 10);
+            small.Append(bytes, 10, bytes.Length - 10);
+            Assert.AreEqual(ArtifactTooLarge, small.Text);
+            Assert.IsFalse(small.Overflowed);
+
+            // What the upload's download handler and ReadBoundedAsync keep of a long answer:
+            // never more than the capacity, and nothing to parse once it overflowed.
+            var large = new BoundedBytes(BridgeMessages.MaxErrorBodyBytes);
+            for (var i = 0; i < 100; i++)
+            {
+                large.Append(new byte[1000], 0, 1000);
+            }
+
+            Assert.AreEqual(BridgeMessages.MaxErrorBodyBytes, large.Count);
+            Assert.IsTrue(large.Overflowed);
+            Assert.IsNull(large.Text);
+            Assert.IsNull(BridgeMessages.TooLargeUploadMessage(413, large.Text));
+        }
+
+        [Test]
+        public void Byte_counts_outside_Int64_or_below_zero_are_unknown()
+        {
+            Assert.IsNull(BridgeMessages.TooLargeUploadMessage(413,
+                "{\"error\":\"artifactTooLarge\",\"limitBytes\":9223372036854775808}"), "above Int64.MaxValue");
+            Assert.IsNull(BridgeMessages.TooLargeUploadMessage(413,
+                "{\"error\":\"artifactTooLarge\",\"limitBytes\":-1}"));
+            Assert.IsNull(BridgeMessages.TooLargeUploadMessage(413,
+                "{\"error\":\"artifactTooLarge\",\"limitBytes\":1.5}"));
+            Assert.IsNull(BridgeMessages.TooLargeUploadMessage(413,
+                "{\"error\":\"artifactTooLarge\",\"limitBytes\":true}"));
+
+            var message = BridgeMessages.TooLargeUploadMessage(413,
+                "{\"error\":\"artifactTooLarge\",\"limitBytes\":9223372036854775807,\"declaredBytes\":99999999999999999999}");
+            StringAssert.Contains("at most 9223372036854775807 bytes", message);
+            StringAssert.DoesNotContain("this upload was", message, "an out-of-range declared size is left out");
+
+            Assert.AreEqual(0L, BridgeMessages.ByteCount(new Newtonsoft.Json.Linq.JValue(0L)));
+            Assert.IsNull(BridgeMessages.ByteCount(null));
+            Assert.IsNull(BridgeMessages.ByteCount(new Newtonsoft.Json.Linq.JValue(-5L)));
+            Assert.IsNull(BridgeMessages.ByteCount(new Newtonsoft.Json.Linq.JValue(ulong.MaxValue)));
+        }
+
+        [Test]
+        public void A_management_answer_with_out_of_range_numbers_is_not_a_crash()
+        {
+            var huge = new BridgeAdminResponse(true, 200, "{\"version\":\"0.8.0\",\"hostGeneration\":99999999999999999999}", null);
+
+            Assert.IsNull(huge.As<BridgeInfo>());
         }
 
         [Test]
@@ -96,6 +146,14 @@ namespace VRCRemoteTest.Tests
         public void Sanitize_replaces_controls_and_cuts_long_text()
         {
             Assert.AreEqual("a b c", BridgeMessages.Sanitize("a\tb\nc", 10));
+
+            // Built from character codes: a raw U+2028 ends a C# string literal, and the others are
+            // invisible in review.
+            var tricky = "a" + (char)0x202E + "b" + (char)0x2066 + "c" + (char)0x200F + "d" + (char)0x85 + "e"
+                + (char)0x2028 + "f";
+            Assert.AreEqual("a b c d e f", BridgeMessages.Sanitize(tricky, 20),
+                "bidi overrides and isolates, marks, C1 controls and separators");
+            Assert.AreEqual("x y", BridgeMessages.Sanitize("x" + (char)0x200B + "y", 10), "zero-width space is a format character");
             Assert.AreEqual("abc...", BridgeMessages.Sanitize("abcdef", 3));
             Assert.AreEqual("abc", BridgeMessages.Sanitize("abc", 3));
         }

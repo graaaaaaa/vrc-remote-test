@@ -30,10 +30,11 @@
 # Set VRCRT_BRIDGE_URL and VRCRT_CERT_SHA256. The token comes from macOS Keychain,
 # or VRCRT_TOKEN in CI. <cursor> is the JSON that
 # `cursor` prints, or @<file> holding it. Exit codes: 0 done, 1 timed out (or, for config
-# set, restart and close-clients, the Bridge refused, did not apply the change, or did not
-# come back within 90 s), 2 usage error, 3 the observation cannot answer (old or missing
-# files, a client still being read, the Bridge restarted or re-read a log, Logging not Full,
-# records dropped, the Bridge unreachable or older than v0.8.0 for the commands above).
+# set, restart and close-clients, the Bridge refused, did not apply the change, could not
+# confirm every client closed, or did not come back within 90 s), 2 usage error, 3 the
+# observation cannot answer (old or missing files, a client still being read, the Bridge
+# restarted or re-read a log, Logging not Full, records dropped, the Bridge unreachable,
+# older than v0.8.0, or answering in a shape it does not send).
 #
 # Log lines are untrusted text a world can write: control characters and tabs are
 # printed escaped, JSON is parsed with Python's json module, and every regular
@@ -77,9 +78,18 @@ MAX_FULL_LOG_BYTES = 256 * 1024 * 1024
 POLL_SECONDS = 1.0
 
 MAX_ADMIN_BYTES = 1024 * 1024
-APPLY_TIMEOUT_SECONDS = 90.0
-APPLY_POLL_SECONDS = 0.0 if FIXTURE_DIR else 2.0
+# The script tests (VRCRT_FIXTURE_DIR) may shorten the wait and the polling interval; a real
+# Bridge always gets 90 s and 2 s.
+APPLY_TIMEOUT_SECONDS = float(os.environ.get("VRCRT_TEST_APPLY_TIMEOUT", "90")) if FIXTURE_DIR else 90.0
+APPLY_POLL_SECONDS = float(os.environ.get("VRCRT_TEST_POLL_SECONDS", "0")) if FIXTURE_DIR else 2.0
+MAX_APPLY_POLLS = 45
+POLL_REQUEST_TIMEOUT = 10.0
 BRIDGE_LOG_LINES = 30
+# What one answer may print: a 1 MiB answer must not become megabytes of terminal output.
+MAX_CELL_CHARS = 200
+MAX_LINE_CHARS = 1000
+MAX_TABLE_ROWS = 100
+MAX_LIST_ITEMS = 50
 
 EXIT_TIMEOUT = 1
 EXIT_NOT_DONE = 1
@@ -217,18 +227,20 @@ def bridge_connection(timeout=30):
 FIXTURE_COUNTS = {}
 
 
-def fixture_response(method, path, body, if_match):
+def fixture_response(method, path, body, headers, timeout):
     """The script tests' stand-in for one request: VRCRT_FIXTURE_DIR/http/<METHOD>_api_v1_<route>.
 
-    A file may start with "HTTP <status>" on its own line (200 otherwise), or be "DOWN" for no
-    answer. With <name>.1, <name>.2, ... the n-th request reads <name>.n, the last one repeating.
-    No file is a 404. Every request is appended to http/requests.log as JSON.
+    A file may start with "SLOW <seconds>" on its own line (an answer that takes that long; past
+    `timeout` it is no answer, like a socket timeout), then "HTTP <status>" on its own line (200
+    otherwise), or be "DOWN" for no answer. With <name>.1, <name>.2, ... the n-th request reads
+    <name>.n, the last one repeating. No file is a 404. Every request is appended to
+    http/requests.log as JSON, with the headers it would be sent with (but the token).
     """
     directory = os.path.join(FIXTURE_DIR, "http")
     name = method + "_" + path.split("?", 1)[0].strip("/").replace("/", "_")
     if os.path.isdir(directory):
         with open(os.path.join(directory, "requests.log"), "a", encoding="utf-8") as log:
-            log.write(json.dumps({"method": method, "path": path, "ifMatch": if_match,
+            log.write(json.dumps({"method": method, "path": path, "headers": headers,
                                   "body": None if body is None else body.decode("utf-8")}) + "\n")
     count = FIXTURE_COUNTS[name] = FIXTURE_COUNTS.get(name, 0) + 1
     base = os.path.join(directory, name)
@@ -242,6 +254,13 @@ def fixture_response(method, path, body, if_match):
             data = stream.read()
     except FileNotFoundError:
         return 404, b""
+    match = re.match(rb"SLOW (\d+(?:\.\d+)?)\r?\n", data)
+    if match:
+        delay, data = float(match.group(1)), data[match.end():]
+        if delay > timeout:
+            time.sleep(max(0.0, timeout))
+            raise Unreachable("cannot reach the Bridge: timed out")
+        time.sleep(delay)
     if data.startswith(b"DOWN"):
         raise Unreachable("cannot reach the Bridge: connection refused")
     match = re.match(rb"HTTP (\d{3})\r?\n", data)
@@ -250,26 +269,60 @@ def fixture_response(method, path, body, if_match):
     return 200, data
 
 
-def bridge_request(method, path, body=None, if_match=None, limit=MAX_ADMIN_BYTES, timeout=30):
-    """(status, text) for one request to the management API; Unreachable when nothing answered."""
+def request_headers(body, if_match):
+    """The headers of a management request, besides Authorization."""
+    headers = {}
+    if body is not None:
+        headers["Content-Type"] = "application/json"
+    if if_match is not None:
+        headers["If-Match"] = '"%s"' % if_match
+    return headers
+
+
+def unreachable(error):
+    return Unreachable("cannot reach the Bridge: %s" % (getattr(error, "strerror", None) or error or "timed out"))
+
+
+def bridge_request(method, path, body=None, if_match=None, limit=MAX_ADMIN_BYTES, timeout=30, deadline=None):
+    """(status, text) for one request to the management API; Unreachable when nothing answered.
+
+    With `deadline` (a time.monotonic() value) the whole request, body included, ends by then:
+    every socket wait is cut to the time left, and the body is read in chunks between checks.
+    """
+    def time_left():
+        if deadline is None:
+            return timeout
+        left = min(timeout, deadline - time.monotonic())
+        if left <= 0:
+            raise Unreachable("cannot reach the Bridge: timed out")
+        return left
+
+    headers = request_headers(body, if_match)
     if FIXTURE_DIR:
-        status, data = fixture_response(method, path, body, if_match)
+        status, data = fixture_response(method, path, body, headers, time_left())
     else:
         try:
-            conn, headers = bridge_connection(timeout)
+            conn, auth = bridge_connection(time_left())
         except (OSError, http.client.HTTPException) as error:
-            raise Unreachable("cannot reach the Bridge: %s" % (getattr(error, "strerror", None) or error))
+            raise unreachable(error)
+        # Kept: getresponse() hands the socket to the response and may clear conn.sock.
+        sock = conn.sock
         try:
-            if body is not None:
-                headers["Content-Type"] = "application/json"
-            if if_match is not None:
-                headers["If-Match"] = '"%s"' % if_match
-            conn.request(method, path, body=body, headers=headers)
+            conn.request(method, path, body=body, headers={**auth, **headers})
             response = conn.getresponse()
             status = response.status
-            data = response.read(limit + 1)
+            chunks, size = [], 0
+            read = getattr(response, "read1", response.read)
+            while size <= limit:
+                sock.settimeout(time_left())
+                chunk = read(min(65536, limit + 1 - size))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                size += len(chunk)
+            data = b"".join(chunks)
         except (OSError, http.client.HTTPException) as error:
-            raise Unreachable("cannot reach the Bridge: %s" % (getattr(error, "strerror", None) or error))
+            raise unreachable(error)
         finally:
             conn.close()
     if len(data) > limit:
@@ -278,10 +331,35 @@ def bridge_request(method, path, body=None, if_match=None, limit=MAX_ADMIN_BYTES
 
 
 def json_of(text):
+    """The parsed answer, or None when it is not JSON (too deep, or numbers past Python's limits, included)."""
     try:
         return json.loads(text) if text else None
-    except ValueError:
+    except (ValueError, RecursionError):
         return None
+
+
+def listed(value, what):
+    """A JSON array as a list; None (missing) as []; anything else is an invalid Bridge answer."""
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise Failure(EXIT_OBSERVATION, "the Bridge's %s is not a list" % what)
+    return value
+
+
+def clip(value, limit=MAX_LINE_CHARS):
+    """Untrusted text for the terminal: escaped by safe(), then cut to `limit` characters."""
+    text = safe(str(value))
+    return text if len(text) <= limit else text[:limit - 3] + "..."
+
+
+def print_items(prefix, values, what, stream=None):
+    """One line per item of a JSON array, at most MAX_LIST_ITEMS of them."""
+    values = listed(values, what)
+    for value in values[:MAX_LIST_ITEMS]:
+        print(prefix + clip(value), file=stream or sys.stdout)
+    if len(values) > MAX_LIST_ITEMS:
+        print("%s... and %d more" % (prefix, len(values) - MAX_LIST_ITEMS), file=stream or sys.stdout)
 
 
 def error_summary(text):
@@ -289,8 +367,9 @@ def error_summary(text):
     body = json_of(text)
     if not isinstance(body, dict) or not isinstance(body.get("error"), str):
         return ""
-    details = [str(body[key]) for key in ("operation", "etag", "retryAfterSeconds") if body.get(key) is not None]
-    return ": %s%s" % (body["error"], " (%s)" % ", ".join(details) if details else "")
+    details = [clip(body[key], MAX_CELL_CHARS) for key in ("operation", "etag", "retryAfterSeconds")
+               if body.get(key) is not None]
+    return ": %s%s" % (clip(body["error"], MAX_CELL_CHARS), " (%s)" % ", ".join(details) if details else "")
 
 
 def get_json(path):
@@ -309,13 +388,12 @@ def get_json(path):
 
 def refused(what, status, text):
     """Prints why the Bridge did not do it (error, problems, the rest of the body) and returns EXIT_NOT_DONE."""
-    print("%s: the Bridge answered HTTP %d%s" % (what, status, safe(error_summary(text))), file=sys.stderr)
+    print("%s: the Bridge answered HTTP %d%s" % (what, status, error_summary(text)), file=sys.stderr)
     body = json_of(text)
     if isinstance(body, dict):
-        for problem in body.get("problems") or []:
-            print("  - %s" % safe(str(problem)), file=sys.stderr)
+        print_items("  - ", body.get("problems"), "list of problems", sys.stderr)
     elif text:
-        print("  %s" % safe(text[:500]), file=sys.stderr)
+        print("  %s" % clip(text, 500), file=sys.stderr)
     return EXIT_NOT_DONE
 
 
@@ -331,14 +409,16 @@ def wait_for_host(before, operation_id=None):
     configuration change, lastConfigApply reports `operation_id` as no longer pending). The info,
     or None after APPLY_TIMEOUT_SECONDS. No answer while the host restarts is expected."""
     deadline = time.monotonic() + APPLY_TIMEOUT_SECONDS
-    for _ in range(int(APPLY_TIMEOUT_SECONDS / 2)):
-        time.sleep(APPLY_POLL_SECONDS)
-        if time.monotonic() > deadline:
+    for _ in range(MAX_APPLY_POLLS):
+        time.sleep(max(0.0, min(APPLY_POLL_SECONDS, deadline - time.monotonic())))
+        if time.monotonic() >= deadline:
             break
         try:
-            status, text = bridge_request("GET", "/api/v1/bridge", timeout=10)
+            status, text = bridge_request("GET", "/api/v1/bridge", timeout=POLL_REQUEST_TIMEOUT, deadline=deadline)
         except Unreachable:
             continue
+        if time.monotonic() > deadline:
+            break  # An answer that came after the deadline does not count.
         info = json_of(text) if status == 200 else None
         if not isinstance(info, dict) or type(info.get("hostGeneration")) is not int or info["hostGeneration"] <= before:
             continue
@@ -351,7 +431,7 @@ def wait_for_host(before, operation_id=None):
 
 
 def human_bytes(value):
-    if type(value) is not int or value < 0:
+    if type(value) is not int or value < 0 or value >= 1 << 63:
         return "unknown"
     size = float(value)
     for unit in ("bytes", "KiB", "MiB", "GiB"):
@@ -370,33 +450,39 @@ def cmd_doctor(args):
         print("Bridge: %s" % safe(str(failure)))
         info = None
     if info is not None:
-        print("Bridge        %s" % safe(str(show(info.get("version")))))
+        cell = lambda key, source=info: clip(show(source.get(key)), MAX_CELL_CHARS)
+        print("Bridge        %s" % cell("version"))
+        print("Executable    SHA-256 %s" % cell("exeSha256"))
         print("Host          generation %s, started %s (process started %s)" % (
-            safe(str(show(info.get("hostGeneration")))), safe(str(show(info.get("hostStartedAtUtc")))),
-            safe(str(show(info.get("processStartedAtUtc"))))))
-        print("Listening     %s" % safe(str(show(info.get("listenUrl")))))
+            cell("hostGeneration"), cell("hostStartedAtUtc"), cell("processStartedAtUtc")))
+        print("Listening     %s" % cell("listenUrl"))
         busy = info.get("busy")
-        print("Busy          %s%s" % ("no" if busy is None else safe(str(busy)),
-                                     ", restart pending" if info.get("restartPending") else ""))
+        print("Busy          %s%s" % ("no" if busy is None else clip(busy, MAX_CELL_CHARS),
+                                     ", restart pending" if info.get("restartPending") is True else ""))
         active, saved = info.get("activeConfigEtag"), info.get("savedConfigEtag")
         print("Config        %s" % ("as saved" if active == saved else "config.json changed since this host started"))
+        config = info.get("activeConfig")
+        if isinstance(config, dict):
+            keys = sorted(config, key=str)
+            for key in keys[:MAX_LIST_ITEMS]:
+                value = json.dumps(config[key], ensure_ascii=True) if not isinstance(config[key], str) else config[key]
+                print("  %s = %s" % (clip(key, MAX_CELL_CHARS), clip(value, MAX_CELL_CHARS)))
+            if len(keys) > MAX_LIST_ITEMS:
+                print("  ... and %d more" % (len(keys) - MAX_LIST_ITEMS))
         paths = info.get("paths") if isinstance(info.get("paths"), dict) else {}
         for key, label in (("vrchatWorldsDirectory", "Worlds dir"), ("vrchatExecutable", "VRChat.exe")):
             entry = paths.get(key) if isinstance(paths.get(key), dict) else {}
-            print("%-13s %s%s" % (label, safe(str(show(entry.get("display")))),
-                                  "" if entry.get("exists") is not False else " (missing)"))
+            print("%-13s %s%s" % (label, cell("display", entry), "" if entry.get("exists") is not False else " (missing)"))
         print("Disk          %s free, %s in log exports" % (human_bytes(info.get("freeDiskBytes")),
                                                           human_bytes(info.get("stateExportsBytes"))))
         last = info.get("lastConfigApply")
         if isinstance(last, dict):
-            print("Last change   %s at %s (operation %s)" % (safe(str(show(last.get("outcome")))),
-                  safe(str(show(last.get("atUtc")))), safe(str(show(last.get("operationId"))))))
-            for problem in last.get("problems") or []:
-                print("  - %s" % safe(str(problem)))
+            print("Last change   %s at %s (operation %s)" % (cell("outcome", last), cell("atUtc", last),
+                                                            cell("operationId", last)))
+            print_items("  - ", last.get("problems"), "list of problems")
         else:
             print("Last change   none through the LAN API since the Bridge started")
-        for note in info.get("configNotes") or []:
-            print("note: %s" % safe(str(note)))
+        print_items("note: ", info.get("configNotes"), "configNotes")
 
     print()
     try:
@@ -420,9 +506,13 @@ def cmd_doctor(args):
         rows = [("SLOT", "RUNNING", "PROFILE", "LOGIN", "ACCOUNT", "DIGEST", "AUTHENTICATED")]
         for c in sorted(clients["clients"], key=lambda c: c["slot"]):
             account = c.get("account") if isinstance(c.get("account"), dict) else {}
-            rows.append((c["slot"], show(c.get("running")), show(c.get("profile")), safe(str(show(c.get("loginState")))),
-                         safe(str(show(account.get("displayName")))), safe(str(show(account.get("idDigest")))),
-                         safe(str(show(account.get("authenticatedAtUtc"))))))
+            running = c.get("running")
+            profile = c.get("profile")
+            rows.append((c["slot"],
+                         show(running) if running is None or isinstance(running, bool) else "invalid",
+                         show(profile) if profile is None or (type(profile) is int and 0 <= profile <= 99) else "invalid",
+                         show(c.get("loginState")), show(account.get("displayName")), show(account.get("idDigest")),
+                         show(account.get("authenticatedAtUtc"))))
         if len(rows) == 1:
             print("No VRChat client has had a slot yet.")
         else:
@@ -439,28 +529,30 @@ def cmd_doctor(args):
         if lines and lines[-1] == "":
             lines.pop()
         for line in lines[-BRIDGE_LOG_LINES:]:
-            print("  " + safe(line))
+            print("  " + clip(line))
     else:
-        print("Bridge log: HTTP %d%s" % (status, safe(error_summary(text))))
+        print("Bridge log: HTTP %d%s" % (status, error_summary(text)))
     return 0 if info is not None else EXIT_OBSERVATION
 
 
 def print_profiles(data):
     configured = data.get("configuredProfiles")
-    print("Configured profiles: %s" % ("none (Reload mode)" if configured is None
-                                       else ",".join(safe(str(p)) for p in configured) if isinstance(configured, list) else "-"))
+    if configured is None:
+        print("Configured profiles: none (Reload mode)")
+    else:
+        configured = listed(configured, "configuredProfiles")
+        print("Configured profiles: %s" % clip(",".join(str(p) for p in configured[:MAX_LIST_ITEMS]), MAX_CELL_CHARS))
     rows = [("PROFILE", "ACCOUNT", "DIGEST", "AUTHENTICATED", "SLOT", "GENERATION")]
-    for p in data.get("profiles") or []:
-        if isinstance(p, dict):
-            rows.append((safe(str(show(p.get("profile")))), safe(str(show(p.get("displayName")))),
-                         safe(str(show(p.get("idDigest")))), safe(str(show(p.get("authenticatedAtUtc")))),
-                         safe(str(show(p.get("slot")))), safe(str(show(p.get("clientGeneration"))))))
+    for p in listed(data.get("profiles"), "list of profiles"):
+        if not isinstance(p, dict):
+            raise Failure(EXIT_OBSERVATION, "the Bridge's list of profiles holds something other than profiles")
+        rows.append((show(p.get("profile")), show(p.get("displayName")), show(p.get("idDigest")),
+                     show(p.get("authenticatedAtUtc")), show(p.get("slot")), show(p.get("clientGeneration"))))
     if len(rows) == 1:
         print("No profile has been seen logged in yet.")
     else:
         print_table(rows)
-    for warning in data.get("warnings") or []:
-        print("warning: %s" % safe(str(warning)))
+    print_items("warning: ", data.get("warnings"), "list of warnings")
 
 
 def cmd_profiles(args):
@@ -488,7 +580,7 @@ def parse_assignments(items):
             raise Failure(EXIT_USAGE, "%s is given more than once" % key)
         try:
             patch[key] = json.loads(raw, parse_constant=reject_constant)
-        except ValueError:
+        except (ValueError, RecursionError):
             patch[key] = raw
     return patch
 
@@ -513,11 +605,9 @@ def cmd_config_set(args):
               % (operation_id, APPLY_TIMEOUT_SECONDS), file=sys.stderr)
         return EXIT_NOT_DONE
     last = info["lastConfigApply"]
-    print("outcome: %s" % safe(str(last.get("outcome"))))
-    for problem in last.get("problems") or []:
-        print("  - %s" % safe(str(problem)))
-    for note in info.get("configNotes") or []:
-        print("note: %s" % safe(str(note)))
+    print("outcome: %s" % clip(last.get("outcome"), MAX_CELL_CHARS))
+    print_items("  - ", last.get("problems"), "list of problems")
+    print_items("note: ", info.get("configNotes"), "configNotes")
     return 0 if last.get("outcome") == "applied" else EXIT_NOT_DONE
 
 
@@ -540,12 +630,17 @@ def cmd_close_clients(args):
     status, text = bridge_request("POST", "/api/v1/clients/close")
     body = json_of(text)
     if status in (200, 409) and isinstance(body, dict) and "closed" in body:
-        print("closed %s, not confirmed %s, others running %s" % (
-            safe(str(show(body.get("closed")))), safe(str(show(body.get("notConfirmed")))),
-            safe(str(show(body.get("othersRunning"))))))
+        counts = [body.get(key) for key in ("closed", "notConfirmed", "othersRunning")]
+        if any(type(count) is not int or not 0 <= count <= 1000 for count in counts):
+            raise Failure(EXIT_OBSERVATION, "the Bridge's answer to close-clients has invalid counts")
+        closed, not_confirmed, others = counts
+        print("closed %d, not confirmed %d, others running %d" % (closed, not_confirmed, others))
         if body.get("problem"):
-            print("problem: %s" % safe(str(body["problem"])))
-        return 0 if status == 200 else EXIT_NOT_DONE
+            print("problem: %s" % clip(body["problem"]))
+        if not_confirmed:
+            print("close-clients: %d VRChat client(s) may still be running; check `vrcrt.sh status`" % not_confirmed,
+                  file=sys.stderr)
+        return 0 if status == 200 and not not_confirmed else EXIT_NOT_DONE
     return refused("close-clients", status, text)
 
 
@@ -565,7 +660,7 @@ def export_one_log(slot, client, directory):
             raise Failure(EXIT_OBSERVATION, "Bridge log export metadata is too large")
         try:
             metadata = json.loads(metadata_bytes)
-        except ValueError:
+        except (ValueError, RecursionError):
             raise Failure(EXIT_OBSERVATION, "Bridge returned invalid log export metadata")
     finally:
         conn.close()
@@ -663,11 +758,12 @@ def load_clients(required=True):
         return None
     try:
         data = json.loads(text)
-    except ValueError as error:
-        raise Failure(EXIT_OBSERVATION, "status/vrchat-clients.json is not valid JSON (%s)" % error)
+    except (ValueError, RecursionError) as error:
+        raise Failure(EXIT_OBSERVATION, "status/vrchat-clients.json is not valid JSON (%s)" % type(error).__name__)
     if not isinstance(data, dict) or not isinstance(data.get("clients"), list):
         raise Failure(EXIT_OBSERVATION, "status/vrchat-clients.json has no clients list")
-    data["clients"] = [c for c in data["clients"] if isinstance(c, dict) and c.get("slot") in SLOTS]
+    data["clients"] = [c for c in data["clients"]
+                       if isinstance(c, dict) and type(c.get("slot")) is int and c["slot"] in SLOTS]
     return data
 
 
@@ -704,7 +800,7 @@ def read_markers(slot):
         start = 1
         try:
             header = json.loads(lines[0][2:])
-        except ValueError:
+        except (ValueError, RecursionError):
             header = None
         if not isinstance(header, dict):
             header = None
@@ -793,7 +889,7 @@ def parse_cursor(value):
             raise Failure(EXIT_USAGE, "cannot read the cursor file: %s" % (error.strerror or error))
     try:
         cursor = json.loads(value)
-    except ValueError:
+    except (ValueError, RecursionError):
         raise Failure(EXIT_USAGE, "--after needs the JSON that `cursor` prints, or @<file> holding it")
     if not isinstance(cursor, dict) or not isinstance(cursor.get("slots"), dict):
         raise Failure(EXIT_USAGE, "--after is not a cursor")
@@ -809,9 +905,15 @@ def parse_slot(value, allow_all):
 
 
 def print_table(rows):
-    widths = [max(len(str(row[i])) for row in rows) for i in range(len(rows[0]))]
+    """Rows of untrusted values: every cell is escaped and cut to MAX_CELL_CHARS, and at most
+    MAX_TABLE_ROWS rows after the header are printed, all before the widths are worked out."""
+    hidden = max(0, len(rows) - 1 - MAX_TABLE_ROWS)
+    rows = [[clip(cell, MAX_CELL_CHARS) for cell in row] for row in rows[:1 + MAX_TABLE_ROWS]]
+    widths = [max(len(row[i]) for row in rows) for i in range(len(rows[0]))]
     for row in rows:
-        print("  ".join(str(cell).ljust(width) for cell, width in zip(row, widths)).rstrip())
+        print("  ".join(cell.ljust(width) for cell, width in zip(row, widths)).rstrip())
+    if hidden:
+        print("... and %d more" % hidden)
 
 
 def show(value):
@@ -857,7 +959,7 @@ def cmd_result(args):
         raise Failure(EXIT_OBSERVATION, "build result is not available")
     try:
         result = json.loads(value)
-    except ValueError:
+    except (ValueError, RecursionError):
         raise Failure(EXIT_OBSERVATION, "build result is not valid JSON")
     if not isinstance(result, dict) or result.get("buildId") != args.build_id:
         raise Failure(EXIT_OBSERVATION, "build result ID does not match")
@@ -1110,10 +1212,16 @@ def main(argv):
     try:
         return args.run(args)
     except Failure as failure:
-        print("vrcrt.sh: " + safe(str(failure)), file=sys.stderr)
+        print("vrcrt.sh: " + clip(failure), file=sys.stderr)
         return failure.code
     except KeyboardInterrupt:
         return 130
+    except (TypeError, ValueError, KeyError, AttributeError, IndexError, OverflowError, RecursionError) as error:
+        # An answer whose JSON is valid but not the shape the Bridge sends (a string where a
+        # number belongs, say) and that no check above caught: an invalid answer, not a crash.
+        print("vrcrt.sh: the Bridge's answer is not in the expected shape (%s: %s)"
+              % (type(error).__name__, clip(error, MAX_CELL_CHARS)), file=sys.stderr)
+        return EXIT_OBSERVATION
 
 
 sys.exit(main(sys.argv[1:]))

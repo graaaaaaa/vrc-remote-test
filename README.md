@@ -57,7 +57,7 @@ Windows Bridge の実行体（`VRCRemoteTest.Bridge.exe`）は、[Releases](http
 | `scripts/vrcrt.sh config get` | 変えられる設定の今の値と、`VrchatExecutable` の候補 |
 | `scripts/vrcrt.sh config set KEY=VALUE…` | 設定を変え、Bridge が起動し直して効いたかを待つ（最大90秒）。`KEY=null` で項目を消す |
 | `scripts/vrcrt.sh restart` | Bridge を起動し直し、新しい host が立つのを待つ |
-| `scripts/vrcrt.sh close-clients` | Bridge が起動した VRChat を閉じる |
+| `scripts/vrcrt.sh close-clients` | Bridge が起動した VRChat を閉じる。閉じたと確かめられない台が残れば終了コード 1 |
 | `scripts/vrcrt.sh profiles` | profile ごとに、最後にログインしたアカウント |
 
 待つ前に `cursor` で位置を取り、操作のあとに `--after` で渡すと、操作より前の行を新しい出来事と取り違えません。

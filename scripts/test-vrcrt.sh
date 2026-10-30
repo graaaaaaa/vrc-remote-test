@@ -156,7 +156,7 @@ http() {
 bridge_info() {
     printf '{"version":"0.8.0+abc","exeSha256":"00","processStartedAtUtc":"2026-10-30T00:00:00+00:00","hostGeneration":%s,' "$1"
     printf '"hostStartedAtUtc":"2026-10-30T00:00:01+00:00","listenUrl":"https://192.168.1.2:38443","certificateSha256":"ab",'
-    printf '"activeConfigEtag":"etag1","savedConfigEtag":"etag1","activeConfig":{},'
+    printf '"activeConfigEtag":"etag1","savedConfigEtag":"etag1","activeConfig":{"RetainBuilds":10,"VrchatClientMode":"Relaunch\\u001b","VrchatProfiles":[0,1]},'
     printf '"paths":{"vrchatWorldsDirectory":{"display":"C:\\\\Users\\\\*\\\\Worlds","exists":true},"vrchatExecutable":{"display":"C:\\\\VRChat.exe","exists":false}},'
     printf '"lastConfigApply":%s,"busy":null,"restartPending":false,' "${2:-null}"
     printf '"configNotes":["AutoLaunchVrchat is false\\u001b[31m: a deploy installs the world but launches no VRChat."],'
@@ -172,6 +172,9 @@ http GET_api_v1_bridge "$(bridge_info 3 "$(apply_report rolledBack '["VrchatClie
 http GET_api_v1_profiles "$PROFILES"
 printf '2026-10-30 00:00:01 info: started\n2026-10-30 00:00:02 warn: \033[31mred\n' > "$share/http/GET_api_v1_logs_bridge"
 expect "doctor shows the version" 0 "Bridge        0.8.0+abc" "$vrcrt" doctor
+expect "doctor shows the executable's SHA-256" 0 "Executable    SHA-256 00" "$vrcrt" doctor
+expect "doctor shows the active configuration" 0 "  VrchatProfiles = [0, 1]" "$vrcrt" doctor
+expect "doctor escapes the active configuration" 0 '  VrchatClientMode = Relaunch\x1b' "$vrcrt" doctor
 expect "doctor escapes configuration notes" 0 'note: AutoLaunchVrchat is false\x1b[31m' "$vrcrt" doctor
 expect "doctor shows the last config change" 0 "Last change   rolledBack" "$vrcrt" doctor
 expect "doctor lists its problems" 0 "  - VrchatClientCount must be 1 to 4" "$vrcrt" doctor
@@ -184,10 +187,32 @@ if grep -qF '"path": "/api/v1/logs/bridge?lines=30"' "$share/http/requests.log";
 else
     fail "doctor asks for the last 30 log lines"
 fi
+clients joined joined ', "running": "yes\u001b[2J", "profile": "1\u001b"'
+expect "doctor shows a running state that is not true/false as invalid" 0 \
+    "1     invalid  invalid  -" "$vrcrt" doctor
 rm "$share/http/GET_api_v1_bridge"
 expect "doctor says when the Bridge is older than 0.8.0" 3 "older than v0.8.0" "$vrcrt" doctor
+clients joined joined ""
 expect "profiles" 0 "warning: Profiles 0 and 1" "$vrcrt" profiles
 expect "profiles lists the configured ones" 0 "Configured profiles: 0,1" "$vrcrt" profiles
+many_profiles="$(python3 -I -c '
+import json
+profiles = [{"profile": i % 100, "displayName": "N" * 1000 if i == 0 else "P%d" % i, "idDigest": "0123456789ab",
+             "authenticatedAtUtc": "2026-10-30T00:00:02+00:00", "slot": 0, "clientGeneration": 1} for i in range(150)]
+print(json.dumps({"configuredProfiles": [0], "profiles": profiles, "warnings": ["w"] * 80}))')"
+http GET_api_v1_profiles "$many_profiles"
+expect "profiles prints at most 100 rows" 0 "... and 50 more" "$vrcrt" profiles
+expect "profiles cuts a long cell" 0 "$(printf 'N%.0s' $(seq 197))..." "$vrcrt" profiles
+expect "profiles prints at most 50 warnings" 0 "warning: ... and 30 more" "$vrcrt" profiles
+if [ "$("$vrcrt" profiles | wc -l)" -le 160 ]; then pass "profiles output is bounded"; else fail "profiles output is bounded"; fi
+http GET_api_v1_profiles '{"configuredProfiles":null,"profiles":"abc","warnings":[]}'
+expect "a profiles field that is not a list is an invalid answer" 3 "is not a list" "$vrcrt" profiles
+http GET_api_v1_profiles "$(python3 -I -c 'print("[" * 100000 + "]" * 100000)')"
+expect "deeply nested JSON is an invalid answer" 3 "invalid JSON" "$vrcrt" profiles
+http GET_api_v1_profiles "$PROFILES"
+clients joined joined ', "playersInInstance": 5'
+expect "an answer of the wrong shape is exit 3, not a traceback" 3 "not in the expected shape" "$vrcrt" status
+clients joined joined ""
 http GET_api_v1_config "$CONFIG"
 expect "config get" 0 '"etag": "etag1"' "$vrcrt" config get
 expect "config needs get or set" 2 "" "$vrcrt" config
@@ -203,7 +228,8 @@ http GET_api_v1_bridge.4 "$(bridge_info 2 "$(apply_report applied)")"
 http PUT_api_v1_config 202 '{"operationId":"op1","requestedEtag":"etag2","restart":"scheduled"}'
 expect "config set waits for the restart and reports applied" 0 "outcome: applied" \
     "$vrcrt" config set AutoLaunchVrchat=false 'VrchatProfiles=[0,1]' VrchatMode=Desktop RetainBuilds=null LogMarkerPrefixes='["[A]"]'
-if grep -qF '"ifMatch": "etag1"' "$share/http/requests.log" \
+if grep -F '"method": "PUT"' "$share/http/requests.log" | grep -qF '"If-Match": "\"etag1\""' \
+    && grep -F '"method": "PUT"' "$share/http/requests.log" | grep -qF '"Content-Type": "application/json"' \
     && grep -qF '\"AutoLaunchVrchat\": false, \"VrchatProfiles\": [0, 1], \"VrchatMode\": \"Desktop\", \"RetainBuilds\": null' "$share/http/requests.log"; then
     pass "config set sends a merge patch with If-Match"
 else
@@ -214,10 +240,24 @@ fi
 http_reset
 http GET_api_v1_config "$CONFIG"
 http GET_api_v1_bridge.1 "$(bridge_info 1)"
-http GET_api_v1_bridge.2 "$(bridge_info 2 "$(apply_report rolledBack '["VrchatClientCount must be 1 to 4"]')")"
+http GET_api_v1_bridge.2 "$(bridge_info 2 "$(apply_report rolledBack '["The new host did not start: VrchatExecutable does not exist."]')")"
 http PUT_api_v1_config 202 '{"operationId":"op1","requestedEtag":"etag2","restart":"scheduled"}'
-expect "config set reports a rollback" 1 "outcome: rolledBack" "$vrcrt" config set VrchatClientCount=9
-expect "config set lists why" 1 "  - VrchatClientCount must be 1 to 4" "$vrcrt" config set VrchatClientCount=9
+expect "config set reports a rollback" 1 "outcome: rolledBack" "$vrcrt" config set VrchatClientCount=3
+expect "config set lists why" 1 "  - The new host did not start" "$vrcrt" config set VrchatClientCount=3
+
+# The 90 s wait is a wall-clock bound: an answer that would arrive after it does not count.
+http_reset
+http GET_api_v1_config "$CONFIG"
+http GET_api_v1_bridge.1 "$(bridge_info 1)"
+http GET_api_v1_bridge.2 "$(printf 'SLOW 5\n%s' "$(bridge_info 2 "$(apply_report applied)")")"
+http PUT_api_v1_config 202 '{"operationId":"op1","requestedEtag":"etag2","restart":"scheduled"}'
+started=$(date +%s)
+expect "config set stops waiting at its deadline, not after a slow answer" 1 "did not report operation op1" \
+    env VRCRT_TEST_APPLY_TIMEOUT=1 VRCRT_TEST_POLL_SECONDS=0.2 "$vrcrt" config set AutoLaunchVrchat=true
+if [ $(( $(date +%s) - started )) -le 3 ]; then pass "the deadline bounds the whole wait"; else fail "the deadline bounds the whole wait"; fi
+http GET_api_v1_bridge.2 "$(printf 'SLOW 0.2\n%s' "$(bridge_info 2 "$(apply_report applied)")")"
+expect "an answer within the deadline counts" 0 "outcome: applied" \
+    env VRCRT_TEST_APPLY_TIMEOUT=2 VRCRT_TEST_POLL_SECONDS=0.1 "$vrcrt" config set AutoLaunchVrchat=true
 
 http_reset
 http GET_api_v1_config "$CONFIG"
@@ -242,6 +282,10 @@ http POST_api_v1_bridge_restart 429 '{"error":"tooSoon","retryAfterSeconds":30}'
 expect "restart too soon" 1 "tooSoon (30)" "$vrcrt" restart
 http POST_api_v1_clients_close '{"closed":2,"notConfirmed":0,"othersRunning":0,"problem":null}'
 expect "close-clients" 0 "closed 2, not confirmed 0, others running 0" "$vrcrt" close-clients
+http POST_api_v1_clients_close '{"closed":1,"notConfirmed":1,"othersRunning":0,"problem":null}'
+expect "close-clients with a client not confirmed closed is not done" 1 "may still be running" "$vrcrt" close-clients
+http POST_api_v1_clients_close '{"closed":"2","notConfirmed":0,"othersRunning":0,"problem":null}'
+expect "close-clients with counts that are not numbers is an invalid answer" 3 "invalid counts" "$vrcrt" close-clients
 http POST_api_v1_clients_close 409 '{"closed":0,"notConfirmed":0,"othersRunning":1,"problem":"A VRChat the Bridge did not launch is running."}'
 expect "close-clients refused" 1 "problem: A VRChat the Bridge did not launch is running." "$vrcrt" close-clients
 http POST_api_v1_clients_close DOWN
