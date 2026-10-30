@@ -240,12 +240,18 @@ function New-ExistingTask {
     $task
 }
 
+# Returns exactly what install-bridge.ps1 assigns to $differences: the leading
+# comma keeps the @() result from being unrolled on the way out of this helper,
+# which once hid a one-element "array holding an empty array" (2026-10-31).
 function Get-Difference {
     param($Existing)
 
-    @(Get-TaskDefinitionDifference -Existing $Existing -Action $wantAction -Trigger $wantTrigger -Principal $wantPrincipal `
+    , @(Get-TaskDefinitionDifference -Existing $Existing -Action $wantAction -Trigger $wantTrigger -Principal $wantPrincipal `
             -Settings $wantSettings -Description $description -IdentityName $identity -Sid $sid)
 }
+
+Check 'task: install-bridge.ps1 takes the differences the way Get-Difference does' (
+    [System.IO.File]::ReadAllText($scriptPath).Contains('$differences = @(Get-TaskDefinitionDifference '))
 
 $same = Get-Difference (New-ExistingTask)
 Check 'task: the same definition has no difference (a disabled task stays as it is)' ($same.Count -eq 0) ($same -join "`n")
