@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.8.1] - Unreleased
+
+Fixes replacing the Windows Bridge with `scripts/install-bridge.ps1`, which stopped twice during the 0.7.1 → 0.8.0 update on 2026-10-31. The Bridge and the Unity package have no functional changes. Follow `docs/setup-windows.md`, step 1 ("版を入れ替える").
+
+### Fixed (Windows scripts)
+
+- `install-bridge.ps1` is saved as UTF-8 with a BOM and no longer starts with `#Requires -Version 7.0`, so Windows PowerShell 5.1 reads its Japanese text and stops, changing nothing, with the command to run instead: `pwsh.exe -NoProfile -ExecutionPolicy Bypass -File …` with the same arguments. `docs/setup-windows.md` now gives that form; running the script inside 5.1 with `&` was stopped by the default Restricted execution policy.
+- An existing task whose definition (action, trigger, principal, settings and description) already matches is kept and started, instead of being unregistered and registered again. During the 0.8.0 update, `Unregister-ScheduledTask` failed with "Access is denied" on the task 0.7.1 had registered, after the executable had been replaced, and the script ended without registering or starting anything. When the definition differs and the task cannot be removed, the script lists the differences and how to remove the task, then stops.
+- When the task step fails, the script prints the state it stopped in (the executable replaced or not; the task kept, left as it was, removed or registered) and the command to run again.
+- The messages for a running Bridge and for a refused replacement include the command to run again.
+
+### Tests
+
+- `scripts/test-install-bridge.ps1` runs with `pwsh` on any OS: the BOM, parsing, no PowerShell 7-only operators, the 5.1 message, and the task-definition comparison with stand-in objects.
+
 ## [0.8.0] - 2026-10-31
 
 Day-to-day Bridge management from the Mac, so nobody has to work on the Windows PC once the Bridge is installed and paired. **Update both the Windows Bridge** (`docs/setup-windows.md`, step 1) **and the Unity package**. An existing `config.json` and pairing keep working; either side also works with the other still on 0.7.x, without the new features.
