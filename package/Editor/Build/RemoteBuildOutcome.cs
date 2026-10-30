@@ -22,7 +22,9 @@ namespace VRCRemoteTest
         public static RemoteBuildOutcome Success(string buildId, BuildResult result) =>
             new RemoteBuildOutcome(true, buildId, result, null, null);
 
-        public static RemoteBuildOutcome Failure(string buildId, string errorCode, string errorMessage) =>
-            new RemoteBuildOutcome(false, buildId, null, errorCode, errorMessage);
+        /// <summary><paramref name="result"/> is the Bridge's failed result, when there is one (for its launch and warnings).</summary>
+        public static RemoteBuildOutcome Failure(string buildId, string errorCode, string errorMessage,
+            BuildResult result = null) =>
+            new RemoteBuildOutcome(false, buildId, result, errorCode, errorMessage);
     }
 }

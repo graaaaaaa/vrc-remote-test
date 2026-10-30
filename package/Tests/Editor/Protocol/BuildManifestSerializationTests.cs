@@ -119,6 +119,62 @@ namespace VRCRemoteTest.Tests
         }
 
         [Test]
+        public void Result_from_a_Bridge_before_0_8_has_no_launch_or_warnings()
+        {
+            var result = JsonConvert.DeserializeObject<BuildResult>(TestFixtures.Read("sample-result.json"));
+
+            Assert.IsNull(result.Launch);
+            Assert.IsNull(result.Warnings);
+            Assert.IsEmpty(RemoteBuildCoordinator.ResultNotes(result));
+        }
+
+        [Test]
+        public void Parses_launch_and_warnings_from_a_Bridge_0_8_result()
+        {
+            const string json = "{\"protocolVersion\":1,\"buildId\":\"20260901T112522481Z-a91f02cc\","
+                + "\"status\":\"deployed\",\"deployedFileName\":\"vrc-remote-20260901T112522481Z-a91f02cc.vrcw\","
+                + "\"sha256\":null,\"errorCode\":null,\"errorMessage\":null,"
+                + "\"updatedAtUtc\":\"2026-10-30T01:02:03.4567891+00:00\","
+                + "\"launch\":{\"attempted\":true,\"outcome\":\"partial\",\"requested\":3,\"started\":2,\"closed\":1},"
+                + "\"warnings\":[\"Profiles 0 and 1 are logged in to the same account.\"]}";
+
+            var result = JsonConvert.DeserializeObject<BuildResult>(json);
+
+            Assert.IsNotNull(result.Launch);
+            Assert.IsTrue(result.Launch.Attempted);
+            Assert.AreEqual("partial", result.Launch.Outcome);
+            Assert.AreEqual(3, result.Launch.Requested);
+            Assert.AreEqual(2, result.Launch.Started);
+            Assert.AreEqual(1, result.Launch.Closed);
+            CollectionAssert.AreEqual(new[] { "Profiles 0 and 1 are logged in to the same account." }, result.Warnings);
+        }
+
+        [Test]
+        public void Parses_a_disabled_launch_without_counts()
+        {
+            const string json = "{\"protocolVersion\":1,\"buildId\":\"b\",\"status\":\"deployed\","
+                + "\"updatedAtUtc\":\"2026-10-30T01:02:03Z\",\"launch\":{\"attempted\":false,\"outcome\":\"disabled\"}}";
+
+            var result = JsonConvert.DeserializeObject<BuildResult>(json);
+
+            Assert.AreEqual(LaunchReport.Disabled, result.Launch.Outcome);
+            Assert.IsNull(result.Launch.Requested);
+            Assert.IsNull(result.Warnings);
+            CollectionAssert.AreEqual(new[] { RemoteBuildCoordinator.AutoLaunchOffNote },
+                RemoteBuildCoordinator.ResultNotes(result));
+        }
+
+        [Test]
+        public void A_result_without_launch_serializes_without_launch_or_warnings()
+        {
+            var json = JsonConvert.SerializeObject(new BuildResult { ProtocolVersion = 1, BuildId = "b", Status = "deployed" });
+            var produced = ParseWithoutDateConversion(json);
+
+            Assert.IsFalse(produced.ContainsKey("launch"));
+            Assert.IsFalse(produced.ContainsKey("warnings"));
+        }
+
+        [Test]
         public void Failed_result_has_null_deployed_fields()
         {
             var failed = new BuildResult

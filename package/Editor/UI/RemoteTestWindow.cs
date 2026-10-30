@@ -77,6 +77,15 @@ namespace VRCRemoteTest
         private string _lastRenderedLogContent = string.Empty;
         private double _lastLogCheckTime = double.NegativeInfinity;
 
+        // The read-only Bridge section (Bridge v0.8.0 and later): taken only at a Layout
+        // event, like the Log Viewer's clients list, so a Layout and the event after it
+        // draw the same controls.
+        private bool _showBridgeSection;
+        private BridgeInfo _bridgeInfo;
+        private VrchatClients _bridgeClients;
+        private double _lastBridgeSectionRead = double.NegativeInfinity;
+        private static string _packageVersion;
+
         private bool _bridgeConfigured;
         private bool _bridgeReachable;
         private bool _sdkAvailable;
@@ -160,10 +169,17 @@ namespace VRCRemoteTest
                 RefreshPreflightStatus();
             }
 
+            RefreshBridgeSection();
+
             _windowScrollPosition = EditorGUILayout.BeginScrollView(_windowScrollPosition);
 
             DrawPreflightSection();
             EditorGUILayout.Space();
+            if (_showBridgeSection)
+            {
+                DrawBridgeSection();
+                EditorGUILayout.Space();
+            }
             DrawBuildTargetSection();
             EditorGUILayout.Space();
             DrawActionButtons();
@@ -221,6 +237,124 @@ namespace VRCRemoteTest
                     "VRChat is running without --watch-worlds — builds will deploy but won't auto-reload.",
                     MessageType.Warning);
             }
+        }
+
+        /// <summary>
+        /// Read-only: the Bridge's version (warned about when it differs from this
+        /// package's), its notes on the active configuration, and which account each running
+        /// client is logged in to. Changing the Bridge stays with scripts/vrcrt.sh.
+        /// </summary>
+        private void DrawBridgeSection()
+        {
+            EditorGUILayout.LabelField("Bridge", EditorStyles.boldLabel);
+
+            var bridgeVersion = CoreVersion(_bridgeInfo?.Version);
+            EditorGUILayout.LabelField("Version",
+                bridgeVersion == null ? "Unknown" : BridgeMessages.Sanitize(bridgeVersion, 64));
+            if (VersionsDiffer(PackageVersion, bridgeVersion))
+            {
+                EditorGUILayout.HelpBox(
+                    $"This package is {CoreVersion(PackageVersion)} but the Bridge is " +
+                    $"{BridgeMessages.Sanitize(bridgeVersion, 64)}. Update both to the same version.",
+                    MessageType.Warning);
+            }
+
+            if (_bridgeInfo?.ConfigNotes != null)
+            {
+                foreach (var note in _bridgeInfo.ConfigNotes.Where(n => !string.IsNullOrWhiteSpace(n)).Take(10))
+                {
+                    EditorGUILayout.HelpBox(BridgeMessages.Sanitize(note, 500), MessageType.Info);
+                }
+            }
+
+            if (_bridgeClients?.Clients == null)
+            {
+                return;
+            }
+
+            foreach (var client in _bridgeClients.Clients
+                         .Where(c => c != null && c.Running != false
+                             && c.Slot >= 0 && c.Slot < LanRemoteTransport.SlotCount)
+                         .OrderBy(c => c.Slot))
+            {
+                var login = ClientLogView.DescribeLogin(client);
+                if (login != null)
+                {
+                    EditorGUILayout.LabelField($"Slot {client.Slot}", login);
+                }
+            }
+        }
+
+        private void RefreshBridgeSection()
+        {
+            var now = EditorApplication.timeSinceStartup;
+            if (Event.current.type != EventType.Layout || now - _lastBridgeSectionRead < PreflightCheckIntervalSeconds)
+            {
+                return;
+            }
+
+            _lastBridgeSectionRead = now;
+            _showBridgeSection = _bridgeConfigured;
+            _bridgeInfo = null;
+            _bridgeClients = null;
+            if (!_bridgeConfigured)
+            {
+                return;
+            }
+
+            try
+            {
+                var coordinator = RemoteBuildCommand.GetCoordinator();
+                _bridgeInfo = coordinator.BridgeInfo;
+
+                // An old list may name accounts that have since changed; the Log Viewer warns about it.
+                var clients = coordinator.VrchatClients;
+                _bridgeClients = ClientLogView.IsStale(clients, DateTimeOffset.UtcNow) ? null : clients;
+            }
+            catch (RemoteBuildException)
+            {
+                _showBridgeSection = false;
+            }
+        }
+
+        private static string PackageVersion
+        {
+            get
+            {
+                if (_packageVersion == null)
+                {
+                    var info = UnityEditor.PackageManager.PackageInfo.FindForAssembly(typeof(RemoteTestWindow).Assembly);
+                    _packageVersion = info?.version ?? string.Empty;
+                }
+
+                return _packageVersion;
+            }
+        }
+
+        /// <summary>"0.8.0+abc123" and "v0.8.0" are both "0.8.0"; null for no version.</summary>
+        internal static string CoreVersion(string version)
+        {
+            if (string.IsNullOrWhiteSpace(version))
+            {
+                return null;
+            }
+
+            var plus = version.IndexOf('+');
+            var core = (plus >= 0 ? version.Substring(0, plus) : version).Trim();
+            if (core.StartsWith("v", StringComparison.OrdinalIgnoreCase))
+            {
+                core = core.Substring(1);
+            }
+
+            return core.Length == 0 ? null : core;
+        }
+
+        /// <summary>True only when both versions are known and differ, build metadata aside.</summary>
+        internal static bool VersionsDiffer(string packageVersion, string bridgeVersion)
+        {
+            var package = CoreVersion(packageVersion);
+            var bridge = CoreVersion(bridgeVersion);
+            return package != null && bridge != null && !string.Equals(package, bridge, StringComparison.OrdinalIgnoreCase);
         }
 
         private void DrawBuildTargetSection()
@@ -281,6 +415,12 @@ namespace VRCRemoteTest
                 {
                     EditorGUILayout.HelpBox(guidance, MessageType.Info);
                 }
+            }
+
+            // AutoLaunchVrchat off, and the result's warnings (Bridge v0.8.0 and later).
+            foreach (var note in RemoteBuildCoordinator.ResultNotes(_lastOutcome.Result))
+            {
+                EditorGUILayout.HelpBox(note, MessageType.Warning);
             }
         }
 

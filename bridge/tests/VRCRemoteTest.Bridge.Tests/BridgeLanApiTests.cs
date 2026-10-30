@@ -159,6 +159,34 @@ public sealed class BridgeLanApiTests : IAsyncLifetime
         Assert.Equal(HttpStatusCode.Conflict, conflict.StatusCode);
     }
 
+    [Fact]
+    public async Task Too_large_answers_say_what_and_the_limit()
+    {
+        Authenticate();
+
+        var declared = await _client!.PutAsync("builds/buildB/artifact", new ByteArrayContent(new byte[40]));
+        Assert.Equal(HttpStatusCode.RequestEntityTooLarge, declared.StatusCode);
+        var body = JsonDocument.Parse(await declared.Content.ReadAsStringAsync()).RootElement;
+        Assert.Equal("artifactTooLarge", body.GetProperty("error").GetString());
+        Assert.Equal(32, body.GetProperty("limitBytes").GetInt64());
+        Assert.Equal(40, body.GetProperty("declaredBytes").GetInt64());
+
+        // Sent without Content-Length (chunked): caught while reading, with no declared size.
+        var chunked = new StreamContent(new MemoryStream(new byte[40]));
+        chunked.Headers.ContentLength = null;
+        using var request = new HttpRequestMessage(HttpMethod.Put, "builds/buildC/artifact") { Content = chunked };
+        request.Headers.TransferEncodingChunked = true;
+        var streamed = await _client.SendAsync(request);
+        Assert.Equal(HttpStatusCode.RequestEntityTooLarge, streamed.StatusCode);
+        body = JsonDocument.Parse(await streamed.Content.ReadAsStringAsync()).RootElement;
+        Assert.Equal("artifactTooLarge", body.GetProperty("error").GetString());
+        Assert.Equal(JsonValueKind.Null, body.GetProperty("declaredBytes").ValueKind);
+
+        var manifest = await _client.PostAsync("builds/buildD/commit", new ByteArrayContent(new byte[64 * 1024 + 1]));
+        Assert.Equal(HttpStatusCode.RequestEntityTooLarge, manifest.StatusCode);
+        Assert.Contains("manifestTooLarge", await manifest.Content.ReadAsStringAsync());
+    }
+
     private void Authenticate() => _client!.DefaultRequestHeaders.Authorization =
         new AuthenticationHeaderValue("Bearer", _identity!.Token);
 }

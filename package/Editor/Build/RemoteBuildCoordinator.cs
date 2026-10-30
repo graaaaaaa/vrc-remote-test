@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Text.RegularExpressions;
@@ -61,6 +62,9 @@ namespace VRCRemoteTest
 
         /// <summary>Null with a Bridge older than v0.6.0; see IRemoteTransport.PollVrchatClients.</summary>
         public VrchatClients VrchatClients => _transport.PollVrchatClients();
+
+        /// <summary>Null with a Bridge older than v0.8.0; see IRemoteTransport.PollBridgeInfo. Display only.</summary>
+        public BridgeInfo BridgeInfo => _transport.PollBridgeInfo();
 
         public string GetClientLog(int slot) => _transport.PollClientLog(slot);
 
@@ -194,6 +198,15 @@ namespace VRCRemoteTest
                     CreatedAtUtc = DateTimeOffset.UtcNow,
                 };
 
+                // Before uploading, so that a world over the Bridge's limit is not sent only to be
+                // refused. No ConfigureAwait(false): the upload below starts on the thread it did before.
+                var maxSize = await _transport.GetMaxArtifactSizeBytesAsync(cancellationToken);
+                var oversize = DescribeOversize(artifact.Size, maxSize);
+                if (oversize != null)
+                {
+                    throw new RemoteBuildException(ErrorCode.SizeExceeded, oversize);
+                }
+
                 Report(progress, RemoteBuildStatus.Running, "Uploading to Windows Bridge...");
                 await _transport.UploadBuildAsync(artifact, manifest, buildId, cancellationToken).ConfigureAwait(false);
                 Debug.Log($"[VRC Remote Test] Upload complete. Build ID: {buildId}");
@@ -202,18 +215,24 @@ namespace VRCRemoteTest
                 var result = await PollForResultAsync(buildId, resultTimeout, pollInterval, cancellationToken)
                     .ConfigureAwait(false);
 
+                var notes = ResultNotes(result);
+                foreach (var note in notes)
+                {
+                    Debug.LogWarning($"[VRC Remote Test] {note}");
+                }
+
                 if (result.Status == "deployed")
                 {
                     var message = $"Deployed as {result.DeployedFileName}";
-                    Report(progress, RemoteBuildStatus.Succeeded, message);
+                    Report(progress, RemoteBuildStatus.Succeeded, WithNotes(message, notes));
                     Debug.Log($"[VRC Remote Test] {message}");
                     return RemoteBuildOutcome.Success(buildId, result);
                 }
 
                 var sanitizedMessage = SanitizeErrorMessage(result.ErrorMessage) ?? "Bridge reported failure.";
-                Report(progress, RemoteBuildStatus.Failed, $"{result.ErrorCode}: {sanitizedMessage}");
+                Report(progress, RemoteBuildStatus.Failed, WithNotes($"{result.ErrorCode}: {sanitizedMessage}", notes));
                 Debug.LogError($"[VRC Remote Test] Bridge error: {result.ErrorCode} - {sanitizedMessage}");
-                return RemoteBuildOutcome.Failure(buildId, result.ErrorCode, sanitizedMessage);
+                return RemoteBuildOutcome.Failure(buildId, result.ErrorCode, sanitizedMessage, result);
             }
             catch (RemoteBuildException ex)
             {
@@ -401,6 +420,71 @@ namespace VRCRemoteTest
 
             return true;
         }
+
+        internal const string AutoLaunchOffNote =
+            "AutoLaunchVrchat is off on the Bridge: the world was installed but no VRChat was launched.";
+
+        private const int MaxResultWarnings = 10;
+        private const int MaxResultWarningLength = 500;
+
+        /// <summary>
+        /// Why the artifact cannot be uploaded to a Bridge with this limit, or null when it
+        /// fits or the limit is not known (the Bridge then decides).
+        /// </summary>
+        internal static string DescribeOversize(long size, long? maxArtifactSizeBytes)
+        {
+            if (maxArtifactSizeBytes == null || maxArtifactSizeBytes.Value <= 0 || size <= maxArtifactSizeBytes.Value)
+            {
+                return null;
+            }
+
+            return $"The world is {BridgeMessages.FormatBytes(size)}, more than the Bridge accepts "
+                + $"({BridgeMessages.FormatBytes(maxArtifactSizeBytes.Value)}, MaxArtifactSizeBytes). "
+                + "Raise MaxArtifactSizeBytes on the Bridge (scripts/vrcrt.sh config set MaxArtifactSizeBytes=<bytes>) "
+                + "or make the world smaller.";
+        }
+
+        /// <summary>
+        /// What a result says beyond deployed/failed that the developer should see: that the
+        /// Bridge launched no VRChat (AutoLaunchVrchat off), then its warnings. Empty for a
+        /// Bridge before v0.8.0. The warnings are untrusted and are cut and stripped of controls.
+        /// </summary>
+        internal static IReadOnlyList<string> ResultNotes(BuildResult result)
+        {
+            var notes = new List<string>();
+            if (result == null)
+            {
+                return notes;
+            }
+
+            if (result.Launch != null && result.Launch.Outcome == LaunchReport.Disabled)
+            {
+                notes.Add(AutoLaunchOffNote);
+            }
+
+            if (result.Warnings != null)
+            {
+                var shown = 0;
+                foreach (var warning in result.Warnings)
+                {
+                    if (shown == MaxResultWarnings)
+                    {
+                        break;
+                    }
+
+                    if (!string.IsNullOrWhiteSpace(warning))
+                    {
+                        notes.Add("Bridge warning: " + BridgeMessages.Sanitize(warning, MaxResultWarningLength));
+                        shown++;
+                    }
+                }
+            }
+
+            return notes;
+        }
+
+        private static string WithNotes(string message, IReadOnlyList<string> notes) =>
+            notes.Count == 0 ? message : message + "\n" + string.Join("\n", notes);
 
         private static string SanitizeErrorMessage(string message)
         {

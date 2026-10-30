@@ -156,6 +156,7 @@ public sealed class VrchatRelaunchCoordinator : IVrchatClientCoordinator
         }
 
         var records = load.Clients;
+        var closedCount = 0;
         using (var snapshot = _processMonitor.OpenClients())
         {
             if (Unverifiable(snapshot) is { } problem)
@@ -196,9 +197,12 @@ public sealed class VrchatRelaunchCoordinator : IVrchatClientCoordinator
                         $"Bridge (PID {ProcessIds(closed.NotConfirmed)}) within {VrchatClientTerminator.ExitDeadline.TotalSeconds}s, " +
                         "so the build was not deployed. Close them manually, then send the build again.";
                     _logger.LogError(message);
-                    return VrchatPreparation.Failure(ErrorCode.VrchatStartFailed, message);
+                    return VrchatPreparation.Failure(
+                        ErrorCode.VrchatStartFailed, message, managed.Count - closed.NotConfirmed.Count);
                 }
             }
+
+            closedCount = managed.Count;
         }
 
         // No client of the record is running any more. Writing that down before deploying
@@ -209,7 +213,7 @@ public sealed class VrchatRelaunchCoordinator : IVrchatClientCoordinator
                 $"The Bridge could not update its record of the VRChat clients it launched ({_store.FilePath}), " +
                 "so the build was not deployed and nothing was launched. Fix the file's permissions, then send the build again.";
             _logger.LogError(message);
-            return VrchatPreparation.Failure(ErrorCode.UnknownError, message);
+            return VrchatPreparation.Failure(ErrorCode.UnknownError, message, closedCount);
         }
 
         cancellationToken.ThrowIfCancellationRequested();
@@ -218,7 +222,7 @@ public sealed class VrchatRelaunchCoordinator : IVrchatClientCoordinator
         {
             if (Unverifiable(after) is { } problem)
             {
-                return Unmanaged(problem, ownClientsClosed: true);
+                return Unmanaged(problem, closedCount);
             }
 
             if (after.Handles.Count > 0)
@@ -226,11 +230,11 @@ public sealed class VrchatRelaunchCoordinator : IVrchatClientCoordinator
                 return Unmanaged(
                     $"{after.Handles.Count} VRChat client(s) that started while the Bridge was closing its own " +
                     $"(PID {ProcessIds(after.Handles)})",
-                    ownClientsClosed: true);
+                    closedCount);
             }
         }
 
-        return VrchatPreparation.ColdStart();
+        return VrchatPreparation.ColdStart(closedCount);
     }
 
     /// <summary>
@@ -283,7 +287,7 @@ public sealed class VrchatRelaunchCoordinator : IVrchatClientCoordinator
                         $"Launched {i} of {count} VRChat client(s), then stopped: {problem}. Nothing was closed; " +
                         "close that VRChat manually, then send the build again.";
                     _logger.LogError(message);
-                    return VrchatLaunchOutcome.Failure(message, ErrorCode.VrchatUnmanagedRunning);
+                    return VrchatLaunchOutcome.Failure(message, ErrorCode.VrchatUnmanagedRunning, count, i);
                 }
             }
 
@@ -315,7 +319,7 @@ public sealed class VrchatRelaunchCoordinator : IVrchatClientCoordinator
                     $"Launched {i} of {count} VRChat client(s); client {i + 1} (profile {profile}) failed to start: " +
                     result.ErrorMessage;
                 _logger.LogError(message);
-                return VrchatLaunchOutcome.Failure(message);
+                return VrchatLaunchOutcome.Failure(message, requested: count, started: i);
             }
 
             if (result.ProcessId is not { } processId
@@ -327,7 +331,7 @@ public sealed class VrchatRelaunchCoordinator : IVrchatClientCoordinator
                     $"PID {result.ProcessId}) started, but its creation time or session could not be read, so the " +
                     "Bridge cannot recognize it as its own. If it is still running, close it manually before the next build.";
                 _logger.LogError(message);
-                return VrchatLaunchOutcome.Failure(message);
+                return VrchatLaunchOutcome.Failure(message, requested: count, started: i + 1);
             }
 
             launched.Add(new ManagedClient(processId, creationTimeUtc, sessionId, profile, i));
@@ -338,7 +342,7 @@ public sealed class VrchatRelaunchCoordinator : IVrchatClientCoordinator
                     $"not be recorded in {_store.FilePath}. Close every VRChat manually before the next build; the " +
                     "Bridge does not close a client it has no record of.";
                 _logger.LogError(message);
-                return VrchatLaunchOutcome.Failure(message, ErrorCode.UnknownError);
+                return VrchatLaunchOutcome.Failure(message, ErrorCode.UnknownError, count, i + 1);
             }
 
             _logger.LogInformation(
@@ -355,7 +359,7 @@ public sealed class VrchatRelaunchCoordinator : IVrchatClientCoordinator
         }
 
         cancellationToken.ThrowIfCancellationRequested();
-        return VrchatLaunchOutcome.Success();
+        return VrchatLaunchOutcome.Success(count);
     }
 
     /// <summary>
@@ -409,16 +413,17 @@ public sealed class VrchatRelaunchCoordinator : IVrchatClientCoordinator
         }
     }
 
-    private VrchatPreparation Unmanaged(string detail, bool ownClientsClosed = false)
+    /// <param name="closedClients">How many of the Bridge's own clients were already closed; 0 means nothing was.</param>
+    private VrchatPreparation Unmanaged(string detail, int? closedClients = null)
     {
-        var outcome = ownClientsClosed
+        var outcome = closedClients is not null
             ? "The Bridge's own clients were closed, but the build was not deployed."
             : "Nothing was closed or deployed.";
         var message =
             $"VRChat is running that the Bridge did not launch or could not check ({detail}). {outcome} " +
             "Close it manually, then send the build again.";
         _logger.LogError(message);
-        return VrchatPreparation.Failure(ErrorCode.VrchatUnmanagedRunning, message);
+        return VrchatPreparation.Failure(ErrorCode.VrchatUnmanagedRunning, message, closedClients ?? 0);
     }
 
     private static string ProcessIds(IEnumerable<IVrchatProcessHandle> processes) =>

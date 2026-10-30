@@ -110,6 +110,18 @@ public sealed class VrchatClientEntry
     [JsonPropertyName("authenticated")]
     public bool? Authenticated { get; init; }
 
+    /// <summary>
+    /// authenticated (this client's log showed its login), notSeen (not yet), likelyLoggedOut
+    /// (none past the startup grace with Logging Full), or unknown (Logging not Full, the log
+    /// not read or still being caught up, or the client gone).
+    /// </summary>
+    [JsonPropertyName("loginState")]
+    public string LoginState { get; init; } = "unknown";
+
+    /// <summary>The account this client's log says it logged in to; null until then.</summary>
+    [JsonPropertyName("account")]
+    public VrchatClientAccount? Account { get; init; }
+
     [JsonPropertyName("joinAttemptSeq")]
     public long? JoinAttemptSeq { get; init; }
 
@@ -133,6 +145,20 @@ public sealed class VrchatClientEntry
 
     [JsonPropertyName("warnings")]
     public IReadOnlyList<string> Warnings { get; init; } = [];
+}
+
+/// <summary>The usr_ ID is never published: <see cref="IdDigest"/> only tells whether two accounts are the same.</summary>
+public sealed class VrchatClientAccount
+{
+    /// <summary>Untrusted and masked like every published name.</summary>
+    [JsonPropertyName("displayName")]
+    public string DisplayName { get; init; } = string.Empty;
+
+    [JsonPropertyName("idDigest")]
+    public string IdDigest { get; init; } = string.Empty;
+
+    [JsonPropertyName("authenticatedAtUtc")]
+    public DateTimeOffset AuthenticatedAtUtc { get; init; }
 }
 
 public sealed class VrchatClientEvent

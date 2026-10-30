@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # VRC Remote Test: read what the Windows Bridge (v0.6.0 and later) observes about each
-# VRChat client, over the authenticated LAN Direct API.
+# VRChat client, and look after the Bridge itself (v0.8.0 and later), over the
+# authenticated LAN Direct API.
 #
 # Builds and deploys stay with Unity (batch mode included). export-log asks
 # Bridge for a private, redacted snapshot of the selected client log.
@@ -14,11 +15,26 @@
 #   vrcrt.sh wait-marker <slot|all> <regex> <seconds> [--after <cursor>] [--any-generation]
 #   vrcrt.sh wait-same-instance <seconds> [--slots 0,1] [--after <cursor>]
 #
+# Looking after the Bridge from the Mac (Bridge v0.8.0 and later):
+#
+#   vrcrt.sh doctor                       version, configuration notes, last config change,
+#                                         profiles, each client's login, the Bridge log's tail
+#   vrcrt.sh profiles                     the account each VRChat profile last logged in to
+#   vrcrt.sh config get                   the editable settings, as JSON
+#   vrcrt.sh config set KEY=VALUE...      change settings (VALUE is JSON when it parses, else
+#                                         a string; KEY=null removes the key), then wait up to
+#                                         90 s for the Bridge to restart and report the outcome
+#   vrcrt.sh restart                      restart the Bridge host, and wait up to 90 s for it
+#   vrcrt.sh close-clients                close the VRChat clients the Bridge launched
+#
 # Set VRCRT_BRIDGE_URL and VRCRT_CERT_SHA256. The token comes from macOS Keychain,
 # or VRCRT_TOKEN in CI. <cursor> is the JSON that
-# `cursor` prints, or @<file> holding it. Exit codes: 0 done, 1 timed out, 2 usage error,
-# 3 the observation cannot answer (old or missing files, a client still being read, the
-# Bridge restarted or re-read a log, Logging not Full, records dropped).
+# `cursor` prints, or @<file> holding it. Exit codes: 0 done, 1 timed out (or, for config
+# set, restart and close-clients, the Bridge refused, did not apply the change, could not
+# confirm every client closed, or did not come back within 90 s), 2 usage error, 3 the
+# observation cannot answer (old or missing files, a client still being read, the Bridge
+# restarted or re-read a log, Logging not Full, records dropped, the Bridge unreachable,
+# older than v0.8.0, or answering in a shape it does not send).
 #
 # Log lines are untrusted text a world can write: control characters and tabs are
 # printed escaped, JSON is parsed with Python's json module, and every regular
@@ -35,15 +51,18 @@ fi
 
 exec "$python" -I - "$@" <<'PYTHON'
 import argparse
+import contextlib
 import hashlib
 import http.client
 import json
 import os
 import re
+import signal
 import ssl
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlsplit
@@ -61,7 +80,33 @@ MAX_MARKERS_BYTES = 1280 * 1024
 MAX_FULL_LOG_BYTES = 256 * 1024 * 1024
 POLL_SECONDS = 1.0
 
+MAX_ADMIN_BYTES = 1024 * 1024
+
+def test_setting(name, default, low, high):
+    """A setting only the script tests change: a number clamped to [low, high], else the default."""
+    try:
+        value = float(os.environ.get(name, default))
+    except ValueError:
+        return float(default)
+    return min(high, max(low, value)) if value == value else float(default)
+
+
+# The script tests may shorten the wait for a restart (never lengthen it past 90 s) and poll
+# faster: with fixtures (VRCRT_FIXTURE_DIR) down to no pause at all, against a server at least
+# 0.1 s apart.
+APPLY_TIMEOUT_SECONDS = test_setting("VRCRT_TEST_APPLY_TIMEOUT", "90", 0.1, 90.0)
+APPLY_POLL_SECONDS = test_setting("VRCRT_TEST_POLL_SECONDS", "0" if FIXTURE_DIR else "2", 0.0 if FIXTURE_DIR else 0.1, 2.0)
+MAX_APPLY_POLLS = 45
+POLL_REQUEST_TIMEOUT = 10.0
+BRIDGE_LOG_LINES = 30
+# What one answer may print: a 1 MiB answer must not become megabytes of terminal output.
+MAX_CELL_CHARS = 200
+MAX_LINE_CHARS = 1000
+MAX_TABLE_ROWS = 100
+MAX_LIST_ITEMS = 50
+
 EXIT_TIMEOUT = 1
+EXIT_NOT_DONE = 1
 EXIT_USAGE = 2
 EXIT_OBSERVATION = 3
 
@@ -80,6 +125,13 @@ class Failure(Exception):
     def __init__(self, code, message):
         super().__init__(message)
         self.code = code
+
+
+class Unreachable(Failure):
+    """No answer at all (connection refused or reset, a timeout): expected while the Bridge host restarts."""
+
+    def __init__(self, message):
+        super().__init__(EXIT_OBSERVATION, message)
 
 
 def safe(text):
@@ -158,7 +210,7 @@ def read_bounded(path, limit):
     return data.decode("utf-8", errors="replace")
 
 
-def bridge_connection():
+def bridge_connection(timeout=30):
     """Connect and check the certificate before returning an authenticated connection."""
     parsed = urlsplit(BRIDGE_URL)
     if parsed.scheme != "https" or not parsed.hostname or not parsed.port or parsed.path not in ("", "/"):
@@ -174,7 +226,7 @@ def bridge_connection():
             raise Failure(EXIT_OBSERVATION, "Bridge token is missing from macOS Keychain")
         token = result.stdout.strip()
     context = ssl._create_unverified_context()
-    conn = http.client.HTTPSConnection(parsed.hostname, parsed.port, context=context, timeout=30)
+    conn = http.client.HTTPSConnection(parsed.hostname, parsed.port, context=context, timeout=timeout)
     try:
         conn.connect()
         actual = hashlib.sha256(conn.sock.getpeercert(binary_form=True)).hexdigest()
@@ -184,6 +236,478 @@ def bridge_connection():
     except BaseException:
         conn.close()
         raise
+
+
+FIXTURE_COUNTS = {}
+
+
+def fixture_response(method, path, body, headers, timeout):
+    """The script tests' stand-in for one request: VRCRT_FIXTURE_DIR/http/<METHOD>_api_v1_<route>.
+
+    A file may start with "SLOW <seconds>" on its own line (an answer that takes that long; past
+    `timeout` it is no answer, like a socket timeout), then "HTTP <status>" on its own line (200
+    otherwise), or be "DOWN" for no answer. With <name>.1, <name>.2, ... the n-th request reads
+    <name>.n, the last one repeating. No file is a 404. Every request is appended to
+    http/requests.log as JSON, with the headers it would be sent with (but the token).
+    """
+    directory = os.path.join(FIXTURE_DIR, "http")
+    name = method + "_" + path.split("?", 1)[0].strip("/").replace("/", "_")
+    if os.path.isdir(directory):
+        with open(os.path.join(directory, "requests.log"), "a", encoding="utf-8") as log:
+            log.write(json.dumps({"method": method, "path": path, "headers": headers,
+                                  "body": None if body is None else body.decode("utf-8")}) + "\n")
+    count = FIXTURE_COUNTS[name] = FIXTURE_COUNTS.get(name, 0) + 1
+    base = os.path.join(directory, name)
+    if os.path.exists(base + ".1"):
+        n = count
+        while n > 1 and not os.path.exists("%s.%d" % (base, n)):
+            n -= 1
+        base = "%s.%d" % (base, n)
+    try:
+        with open(base, "rb") as stream:
+            data = stream.read()
+    except FileNotFoundError:
+        return 404, b""
+    match = re.match(rb"SLOW (\d+(?:\.\d+)?)\r?\n", data)
+    if match:
+        delay, data = float(match.group(1)), data[match.end():]
+        if delay > timeout:
+            time.sleep(max(0.0, timeout))
+            raise Unreachable("cannot reach the Bridge: timed out")
+        time.sleep(delay)
+    if data.startswith(b"DOWN"):
+        raise Unreachable("cannot reach the Bridge: connection refused")
+    match = re.match(rb"HTTP (\d{3})\r?\n", data)
+    if match:
+        return int(match.group(1)), data[match.end():]
+    return 200, data
+
+
+def request_headers(body, if_match):
+    """The headers of a management request, besides Authorization."""
+    headers = {}
+    if body is not None:
+        headers["Content-Type"] = "application/json"
+    if if_match is not None:
+        headers["If-Match"] = '"%s"' % if_match
+    return headers
+
+
+def unreachable(error):
+    return Unreachable("cannot reach the Bridge: %s" % (getattr(error, "strerror", None) or error or "timed out"))
+
+
+def network_request(method, path, body, headers, limit, time_left):
+    try:
+        conn, auth = bridge_connection(time_left())
+    except (OSError, http.client.HTTPException) as error:
+        raise unreachable(error)
+    # Kept: getresponse() hands the socket to the response and may clear conn.sock.
+    sock = conn.sock
+    response = None
+    try:
+        conn.request(method, path, body=body, headers={**auth, **headers})
+        sock.settimeout(time_left())
+        response = conn.getresponse()
+        return response.status, read_body(response, sock, limit, time_left)
+    except (OSError, http.client.HTTPException) as error:
+        raise unreachable(error)
+    finally:
+        if response is not None:
+            response.close()
+        conn.close()
+
+
+class DeadlinePassed(BaseException):
+    """Raised by the SIGALRM handler of `abort_at`. A BaseException, so that no library's
+    `except Exception` swallows it on the way out."""
+
+
+@contextlib.contextmanager
+def abort_at(deadline):
+    """Interrupts whatever runs inside (Keychain lookup, DNS, connect, TLS, a trickling header or
+    body) with DeadlinePassed at `deadline`, a time.monotonic() value. Socket timeouts alone bound
+    each wait, not their sum. SIGALRM works in the main thread only; elsewhere this does nothing."""
+    if deadline is None or threading.current_thread() is not threading.main_thread():
+        yield
+        return
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise DeadlinePassed()
+
+    def on_alarm(signum, frame):
+        raise DeadlinePassed()
+
+    previous = signal.signal(signal.SIGALRM, on_alarm)
+    try:
+        signal.setitimer(signal.ITIMER_REAL, remaining)
+        yield
+    finally:
+        try:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+        finally:
+            signal.signal(signal.SIGALRM, previous)
+
+
+def read_body(response, sock, limit, time_left):
+    """At most limit + 1 bytes of the body, each socket wait cut to time_left(). Stops touching the
+    socket once the response is complete: http.client closes it then (Connection: close), and
+    settimeout on it would fail with EBADF."""
+    chunks, size = [], 0
+    read = getattr(response, "read1", response.read)
+    while size <= limit and not response.isclosed():
+        if sock is not None and sock.fileno() != -1:
+            sock.settimeout(time_left())
+        chunk = read(min(65536, limit + 1 - size))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        size += len(chunk)
+    return b"".join(chunks)
+
+
+def bridge_request(method, path, body=None, if_match=None, limit=MAX_ADMIN_BYTES, timeout=30, deadline=None):
+    """(status, text) for one request to the management API; Unreachable when nothing answered.
+
+    With `deadline` (a time.monotonic() value) the whole request ends by then: SIGALRM aborts it
+    (abort_at), and every socket wait is also cut to the time left.
+    """
+    def time_left():
+        if deadline is None:
+            return timeout
+        left = min(timeout, deadline - time.monotonic())
+        if left <= 0:
+            raise Unreachable("cannot reach the Bridge: timed out")
+        return left
+
+    headers = request_headers(body, if_match)
+    try:
+        with abort_at(deadline):
+            if FIXTURE_DIR:
+                status, data = fixture_response(method, path, body, headers, time_left())
+            else:
+                status, data = network_request(method, path, body, headers, limit, time_left)
+    except DeadlinePassed:
+        raise Unreachable("cannot reach the Bridge: timed out")
+    if len(data) > limit:
+        raise Failure(EXIT_OBSERVATION, "the Bridge's answer to %s is larger than %d bytes; not reading it" % (path, limit))
+    return status, data.decode("utf-8", errors="replace")
+
+
+def json_of(text):
+    """The parsed answer, or None when it is not JSON (too deep, or numbers past Python's limits, included)."""
+    try:
+        return json.loads(text) if text else None
+    except (ValueError, RecursionError):
+        return None
+
+
+def listed(value, what):
+    """A JSON array as a list; None (missing) as []; anything else is an invalid Bridge answer."""
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise Failure(EXIT_OBSERVATION, "the Bridge's %s is not a list" % what)
+    return value
+
+
+def clip(value, limit=MAX_LINE_CHARS):
+    """Untrusted text for the terminal: escaped by safe(), then cut to `limit` characters."""
+    text = safe(str(value))
+    return text if len(text) <= limit else text[:limit - 3] + "..."
+
+
+def print_items(prefix, values, what, stream=None):
+    """One line per item of a JSON array, at most MAX_LIST_ITEMS of them."""
+    values = listed(values, what)
+    for value in values[:MAX_LIST_ITEMS]:
+        print(prefix + clip(value), file=stream or sys.stdout)
+    if len(values) > MAX_LIST_ITEMS:
+        print("%s... and %d more" % (prefix, len(values) - MAX_LIST_ITEMS), file=stream or sys.stdout)
+
+
+def error_summary(text):
+    """": busy (deploy)" and the like, from an error body; untrusted, so printed through safe()."""
+    body = json_of(text)
+    if not isinstance(body, dict) or not isinstance(body.get("error"), str):
+        return ""
+    details = [clip(body[key], MAX_CELL_CHARS) for key in ("operation", "etag", "retryAfterSeconds")
+               if body.get(key) is not None]
+    return ": %s%s" % (clip(body["error"], MAX_CELL_CHARS), " (%s)" % ", ".join(details) if details else "")
+
+
+def get_json(path):
+    status, text = bridge_request("GET", path)
+    if status == 404:
+        raise Failure(EXIT_OBSERVATION, "the Bridge has no %s; it is older than v0.8.0 (update it on Windows)" % path)
+    if status == 401:
+        raise Failure(EXIT_OBSERVATION, "the Bridge rejected the pairing token")
+    if status != 200:
+        raise Failure(EXIT_OBSERVATION, "Bridge returned HTTP %d for %s%s" % (status, path, error_summary(text)))
+    value = json_of(text)
+    if not isinstance(value, dict):
+        raise Failure(EXIT_OBSERVATION, "Bridge returned invalid JSON for %s" % path)
+    return value
+
+
+def refused(what, status, text):
+    """Prints why the Bridge did not do it (error, problems, the rest of the body) and returns EXIT_NOT_DONE."""
+    print("%s: the Bridge answered HTTP %d%s" % (what, status, error_summary(text)), file=sys.stderr)
+    body = json_of(text)
+    if isinstance(body, dict):
+        print_items("  - ", body.get("problems"), "list of problems", sys.stderr)
+    elif text:
+        print("  %s" % clip(text, 500), file=sys.stderr)
+    return EXIT_NOT_DONE
+
+
+def host_generation(info):
+    generation = info.get("hostGeneration")
+    if type(generation) is not int:
+        raise Failure(EXIT_OBSERVATION, "Bridge returned no hostGeneration")
+    return generation
+
+
+def wait_for_host(before, operation_id=None):
+    """GET /bridge every APPLY_POLL_SECONDS until the host generation passes `before` (and, for a
+    configuration change, lastConfigApply reports `operation_id` as no longer pending). The info,
+    or None after APPLY_TIMEOUT_SECONDS. No answer while the host restarts is expected."""
+    deadline = time.monotonic() + APPLY_TIMEOUT_SECONDS
+    for _ in range(MAX_APPLY_POLLS):
+        time.sleep(max(0.0, min(APPLY_POLL_SECONDS, deadline - time.monotonic())))
+        if time.monotonic() >= deadline:
+            break
+        try:
+            status, text = bridge_request("GET", "/api/v1/bridge", timeout=POLL_REQUEST_TIMEOUT, deadline=deadline)
+        except Unreachable:
+            continue
+        if time.monotonic() > deadline:
+            break  # An answer that came after the deadline does not count.
+        info = json_of(text) if status == 200 else None
+        if not isinstance(info, dict) or type(info.get("hostGeneration")) is not int or info["hostGeneration"] <= before:
+            continue
+        if operation_id is None:
+            return info
+        last = info.get("lastConfigApply")
+        if isinstance(last, dict) and last.get("operationId") == operation_id and last.get("outcome") != "pending":
+            return info
+    return None
+
+
+def human_bytes(value):
+    if type(value) is not int or value < 0 or value >= 1 << 63:
+        return "unknown"
+    size = float(value)
+    for unit in ("bytes", "KiB", "MiB", "GiB"):
+        if size < 1024 or unit == "GiB":
+            return "%d bytes" % value if unit == "bytes" else "%.1f %s" % (size, unit)
+        size /= 1024
+    return "unknown"
+
+
+def cmd_doctor(args):
+    try:
+        info = get_json("/api/v1/bridge")
+    except Unreachable:
+        raise
+    except Failure as failure:
+        print("Bridge: %s" % safe(str(failure)))
+        info = None
+    if info is not None:
+        cell = lambda key, source=info: clip(show(source.get(key)), MAX_CELL_CHARS)
+        print("Bridge        %s" % cell("version"))
+        print("Executable    SHA-256 %s" % cell("exeSha256"))
+        print("Host          generation %s, started %s (process started %s)" % (
+            cell("hostGeneration"), cell("hostStartedAtUtc"), cell("processStartedAtUtc")))
+        print("Listening     %s" % cell("listenUrl"))
+        busy = info.get("busy")
+        print("Busy          %s%s" % ("no" if busy is None else clip(busy, MAX_CELL_CHARS),
+                                     ", restart pending" if info.get("restartPending") is True else ""))
+        active, saved = info.get("activeConfigEtag"), info.get("savedConfigEtag")
+        print("Config        %s" % ("as saved" if active == saved else "config.json changed since this host started"))
+        config = info.get("activeConfig")
+        if isinstance(config, dict):
+            keys = sorted(config, key=str)
+            for key in keys[:MAX_LIST_ITEMS]:
+                value = json.dumps(config[key], ensure_ascii=True) if not isinstance(config[key], str) else config[key]
+                print("  %s = %s" % (clip(key, MAX_CELL_CHARS), clip(value, MAX_CELL_CHARS)))
+            if len(keys) > MAX_LIST_ITEMS:
+                print("  ... and %d more" % (len(keys) - MAX_LIST_ITEMS))
+        paths = info.get("paths") if isinstance(info.get("paths"), dict) else {}
+        for key, label in (("vrchatWorldsDirectory", "Worlds dir"), ("vrchatExecutable", "VRChat.exe")):
+            entry = paths.get(key) if isinstance(paths.get(key), dict) else {}
+            print("%-13s %s%s" % (label, cell("display", entry), "" if entry.get("exists") is not False else " (missing)"))
+        print("Disk          %s free, %s in log exports" % (human_bytes(info.get("freeDiskBytes")),
+                                                          human_bytes(info.get("stateExportsBytes"))))
+        last = info.get("lastConfigApply")
+        if isinstance(last, dict):
+            print("Last change   %s at %s (operation %s)" % (cell("outcome", last), cell("atUtc", last),
+                                                            cell("operationId", last)))
+            print_items("  - ", last.get("problems"), "list of problems")
+        else:
+            print("Last change   none through the LAN API since the Bridge started")
+        print_items("note: ", info.get("configNotes"), "configNotes")
+
+    print()
+    try:
+        print_profiles(get_json("/api/v1/profiles"))
+    except Unreachable:
+        raise
+    except Failure as failure:
+        print("Profiles: %s" % safe(str(failure)))
+
+    print()
+    try:
+        clients = load_clients(required=False)
+    except Failure as failure:
+        clients = False
+        print("Clients: %s" % safe(str(failure)))
+    if clients is None:
+        print("Clients: the Bridge has published no client list yet.")
+    elif clients:
+        if is_stale(clients):
+            print("warning: the client list is older than 15 s; the Bridge may not be running")
+        rows = [("SLOT", "RUNNING", "PROFILE", "LOGIN", "ACCOUNT", "DIGEST", "AUTHENTICATED")]
+        for c in sorted(clients["clients"], key=lambda c: c["slot"]):
+            account = c.get("account") if isinstance(c.get("account"), dict) else {}
+            running = c.get("running")
+            profile = c.get("profile")
+            rows.append((c["slot"],
+                         show(running) if running is None or isinstance(running, bool) else "invalid",
+                         show(profile) if profile is None or (type(profile) is int and 0 <= profile <= 99) else "invalid",
+                         show(c.get("loginState")), show(account.get("displayName")), show(account.get("idDigest")),
+                         show(account.get("authenticatedAtUtc"))))
+        if len(rows) == 1:
+            print("No VRChat client has had a slot yet.")
+        else:
+            print_table(rows)
+
+    print()
+    try:
+        status, text = bridge_request("GET", "/api/v1/logs/bridge?lines=%d" % BRIDGE_LOG_LINES)
+    except Unreachable:
+        raise
+    if status == 200:
+        print("Bridge log (last %d lines):" % BRIDGE_LOG_LINES)
+        lines = text.split("\n")
+        if lines and lines[-1] == "":
+            lines.pop()
+        for line in lines[-BRIDGE_LOG_LINES:]:
+            print("  " + clip(line))
+    else:
+        print("Bridge log: HTTP %d%s" % (status, error_summary(text)))
+    return 0 if info is not None else EXIT_OBSERVATION
+
+
+def print_profiles(data):
+    configured = data.get("configuredProfiles")
+    if configured is None:
+        print("Configured profiles: none (Reload mode)")
+    else:
+        configured = listed(configured, "configuredProfiles")
+        print("Configured profiles: %s" % clip(",".join(str(p) for p in configured[:MAX_LIST_ITEMS]), MAX_CELL_CHARS))
+    rows = [("PROFILE", "ACCOUNT", "DIGEST", "AUTHENTICATED", "SLOT", "GENERATION")]
+    for p in listed(data.get("profiles"), "list of profiles"):
+        if not isinstance(p, dict):
+            raise Failure(EXIT_OBSERVATION, "the Bridge's list of profiles holds something other than profiles")
+        rows.append((show(p.get("profile")), show(p.get("displayName")), show(p.get("idDigest")),
+                     show(p.get("authenticatedAtUtc")), show(p.get("slot")), show(p.get("clientGeneration"))))
+    if len(rows) == 1:
+        print("No profile has been seen logged in yet.")
+    else:
+        print_table(rows)
+    print_items("warning: ", data.get("warnings"), "list of warnings")
+
+
+def cmd_profiles(args):
+    print_profiles(get_json("/api/v1/profiles"))
+    return 0
+
+
+def cmd_config_get(args):
+    print(json.dumps(get_json("/api/v1/config"), indent=2, ensure_ascii=True))
+    return 0
+
+
+def reject_constant(name):
+    raise ValueError(name)
+
+
+def parse_assignments(items):
+    """KEY=VALUE pairs as a JSON Merge Patch: VALUE is JSON when it parses (true, 3, [0,1], null), else a string."""
+    patch = {}
+    for item in items:
+        key, eq, raw = item.partition("=")
+        if not eq or not re.fullmatch(r"[A-Za-z][A-Za-z0-9]{0,63}", key):
+            raise Failure(EXIT_USAGE, "expected KEY=VALUE, not %r" % item)
+        if key in patch:
+            raise Failure(EXIT_USAGE, "%s is given more than once" % key)
+        try:
+            patch[key] = json.loads(raw, parse_constant=reject_constant)
+        except (ValueError, RecursionError):
+            patch[key] = raw
+    return patch
+
+
+def cmd_config_set(args):
+    patch = parse_assignments(args.assignments)
+    before = host_generation(get_json("/api/v1/bridge"))
+    etag = get_json("/api/v1/config").get("etag")
+    if not isinstance(etag, str) or not re.fullmatch(r"[A-Za-z0-9._-]{1,128}", etag):
+        raise Failure(EXIT_OBSERVATION, "Bridge returned no usable etag from /api/v1/config")
+    status, text = bridge_request("PUT", "/api/v1/config", body=json.dumps(patch).encode("utf-8"), if_match=etag)
+    if status != 202:
+        return refused("config set", status, text)
+    accepted = json_of(text)
+    operation_id = accepted.get("operationId") if isinstance(accepted, dict) else None
+    if not isinstance(operation_id, str) or not re.fullmatch(r"[0-9A-Za-z-]{1,64}", operation_id):
+        raise Failure(EXIT_OBSERVATION, "Bridge accepted the change but returned no operationId")
+    print("config.json written (operation %s); waiting for the Bridge to restart..." % operation_id, file=sys.stderr)
+    info = wait_for_host(before, operation_id)
+    if info is None:
+        print("config set: the Bridge did not report operation %s within %d s; check `vrcrt.sh doctor`"
+              % (operation_id, APPLY_TIMEOUT_SECONDS), file=sys.stderr)
+        return EXIT_NOT_DONE
+    last = info["lastConfigApply"]
+    print("outcome: %s" % clip(last.get("outcome"), MAX_CELL_CHARS))
+    print_items("  - ", last.get("problems"), "list of problems")
+    print_items("note: ", info.get("configNotes"), "configNotes")
+    return 0 if last.get("outcome") == "applied" else EXIT_NOT_DONE
+
+
+def cmd_restart(args):
+    before = host_generation(get_json("/api/v1/bridge"))
+    status, text = bridge_request("POST", "/api/v1/bridge/restart")
+    if status != 202:
+        return refused("restart", status, text)
+    print("restart scheduled; waiting for the Bridge host...", file=sys.stderr)
+    info = wait_for_host(before)
+    if info is None:
+        print("restart: the Bridge host did not come back within %d s; check `vrcrt.sh doctor`"
+              % APPLY_TIMEOUT_SECONDS, file=sys.stderr)
+        return EXIT_NOT_DONE
+    print("restarted: host generation %d" % info["hostGeneration"])
+    return 0
+
+
+def cmd_close_clients(args):
+    status, text = bridge_request("POST", "/api/v1/clients/close")
+    body = json_of(text)
+    if status == 200 and not (isinstance(body, dict) and "closed" in body):
+        raise Failure(EXIT_OBSERVATION, "the Bridge's answer to close-clients is not a close report")
+    if status in (200, 409) and isinstance(body, dict) and "closed" in body:
+        counts = [body.get(key) for key in ("closed", "notConfirmed", "othersRunning")]
+        if any(type(count) is not int or not 0 <= count <= 1000 for count in counts):
+            raise Failure(EXIT_OBSERVATION, "the Bridge's answer to close-clients has invalid counts")
+        closed, not_confirmed, others = counts
+        print("closed %d, not confirmed %d, others running %d" % (closed, not_confirmed, others))
+        if body.get("problem"):
+            print("problem: %s" % clip(body["problem"]))
+        if not_confirmed:
+            print("close-clients: %d VRChat client(s) may still be running; check `vrcrt.sh status`" % not_confirmed,
+                  file=sys.stderr)
+        return 0 if status == 200 and not not_confirmed else EXIT_NOT_DONE
+    return refused("close-clients", status, text)
 
 
 def export_one_log(slot, client, directory):
@@ -202,7 +726,7 @@ def export_one_log(slot, client, directory):
             raise Failure(EXIT_OBSERVATION, "Bridge log export metadata is too large")
         try:
             metadata = json.loads(metadata_bytes)
-        except ValueError:
+        except (ValueError, RecursionError):
             raise Failure(EXIT_OBSERVATION, "Bridge returned invalid log export metadata")
     finally:
         conn.close()
@@ -251,7 +775,7 @@ def export_one_log(slot, client, directory):
 
 
 def cmd_export_log(args):
-    slot = parse_slot(args.slot, allow_all=True)
+    slot = args.slot
     directory = os.path.abspath(args.output_directory)
     if not os.path.isdir(directory):
         raise Failure(EXIT_USAGE, "output directory does not exist: %s" % directory)
@@ -300,11 +824,12 @@ def load_clients(required=True):
         return None
     try:
         data = json.loads(text)
-    except ValueError as error:
-        raise Failure(EXIT_OBSERVATION, "status/vrchat-clients.json is not valid JSON (%s)" % error)
+    except (ValueError, RecursionError) as error:
+        raise Failure(EXIT_OBSERVATION, "status/vrchat-clients.json is not valid JSON (%s)" % type(error).__name__)
     if not isinstance(data, dict) or not isinstance(data.get("clients"), list):
         raise Failure(EXIT_OBSERVATION, "status/vrchat-clients.json has no clients list")
-    data["clients"] = [c for c in data["clients"] if isinstance(c, dict) and c.get("slot") in SLOTS]
+    data["clients"] = [c for c in data["clients"]
+                       if isinstance(c, dict) and type(c.get("slot")) is int and c["slot"] in SLOTS]
     return data
 
 
@@ -341,7 +866,7 @@ def read_markers(slot):
         start = 1
         try:
             header = json.loads(lines[0][2:])
-        except ValueError:
+        except (ValueError, RecursionError):
             header = None
         if not isinstance(header, dict):
             header = None
@@ -430,25 +955,59 @@ def parse_cursor(value):
             raise Failure(EXIT_USAGE, "cannot read the cursor file: %s" % (error.strerror or error))
     try:
         cursor = json.loads(value)
-    except ValueError:
+    except (ValueError, RecursionError):
         raise Failure(EXIT_USAGE, "--after needs the JSON that `cursor` prints, or @<file> holding it")
     if not isinstance(cursor, dict) or not isinstance(cursor.get("slots"), dict):
         raise Failure(EXIT_USAGE, "--after is not a cursor")
-    return {int(k): v for k, v in cursor["slots"].items() if k.isdigit() and isinstance(v, dict)}
+    slots = {}
+    for key, entry in cursor["slots"].items():
+        if not re.fullmatch(r"[0-3]", key) or not isinstance(entry, dict):
+            raise Failure(EXIT_USAGE, "--after is not a cursor (slot %r)" % key)
+        for name in ("clientGeneration", "observationEpoch", "seq"):
+            if entry.get(name) is not None and type(entry[name]) is not int:
+                raise Failure(EXIT_USAGE, "--after is not a cursor (slot %s %s)" % (key, name))
+        if entry.get("running") is not None and not isinstance(entry["running"], bool):
+            raise Failure(EXIT_USAGE, "--after is not a cursor (slot %s running)" % key)
+        slots[int(key)] = entry
+    return slots
 
 
 def parse_slot(value, allow_all):
     if allow_all and value == "all":
         return None
-    if value.isdigit() and int(value) in SLOTS:
+    if re.fullmatch(r"[0-3]", value):
         return int(value)
     raise Failure(EXIT_USAGE, "a slot is 0 to 3%s, not %r" % (" or all" if allow_all else "", value))
 
 
+def argument(parse):
+    """An argparse type from a parser that raises Failure: a wrong argument is a usage error
+    (exit 2) found before anything is asked of the Bridge."""
+    def convert(value):
+        try:
+            return parse(value)
+        except Failure as failure:
+            raise argparse.ArgumentTypeError(clip(failure, MAX_CELL_CHARS))
+    return convert
+
+
+def slot_list(value):
+    slots = [parse_slot(s.strip(), allow_all=False) for s in value.split(",") if s.strip()]
+    if not slots:
+        raise Failure(EXIT_USAGE, "--slots needs at least one slot")
+    return slots
+
+
 def print_table(rows):
-    widths = [max(len(str(row[i])) for row in rows) for i in range(len(rows[0]))]
+    """Rows of untrusted values: every cell is escaped and cut to MAX_CELL_CHARS, and at most
+    MAX_TABLE_ROWS rows after the header are printed, all before the widths are worked out."""
+    hidden = max(0, len(rows) - 1 - MAX_TABLE_ROWS)
+    rows = [[clip(cell, MAX_CELL_CHARS) for cell in row] for row in rows[:1 + MAX_TABLE_ROWS]]
+    widths = [max(len(row[i]) for row in rows) for i in range(len(rows[0]))]
     for row in rows:
-        print("  ".join(str(cell).ljust(width) for cell, width in zip(row, widths)).rstrip())
+        print("  ".join(cell.ljust(width) for cell, width in zip(row, widths)).rstrip())
+    if hidden:
+        print("... and %d more" % hidden)
 
 
 def show(value):
@@ -479,8 +1038,7 @@ def cmd_status(args):
     else:
         print_table(rows)
     for c in sorted(clients["clients"], key=lambda c: c["slot"]):
-        for warning in c.get("warnings") or []:
-            print("slot %d: %s" % (c["slot"], safe(str(warning))))
+        print_items("slot %d: " % c["slot"], c.get("warnings"), "list of warnings of slot %d" % c["slot"])
     if clients.get("unassignedClients"):
         print("%d VRChat process(es) have no slot (not checked, unknown start time, or a fifth client)." % clients["unassignedClients"])
     return 0
@@ -494,7 +1052,7 @@ def cmd_result(args):
         raise Failure(EXIT_OBSERVATION, "build result is not available")
     try:
         result = json.loads(value)
-    except ValueError:
+    except (ValueError, RecursionError):
         raise Failure(EXIT_OBSERVATION, "build result is not valid JSON")
     if not isinstance(result, dict) or result.get("buildId") != args.build_id:
         raise Failure(EXIT_OBSERVATION, "build result ID does not match")
@@ -503,7 +1061,7 @@ def cmd_result(args):
 
 
 def cmd_log(args):
-    slot = parse_slot(args.slot, allow_all=True)
+    slot = args.slot
     if slot is None and not args.markers:
         raise Failure(EXIT_USAGE, "`log all` needs --markers (each slot's log is read on its own)")
     if args.markers:
@@ -574,10 +1132,10 @@ class SlotWatch:
 
 
 def cmd_wait_marker(args):
-    target = parse_slot(args.slot, allow_all=True)
+    target = args.slot
     check_pattern(args.regex)
     clients = load_clients()
-    cursor = parse_cursor(args.after) if args.after else {int(k): v for k, v in take_cursor(clients)["slots"].items()}
+    cursor = args.after if args.after is not None else {int(k): v for k, v in take_cursor(clients)["slots"].items()}
     if target is None:
         slots = sorted(s for s, v in cursor.items() if v.get("running") is True)
         if not slots:
@@ -617,9 +1175,9 @@ def cmd_wait_marker(args):
 
 def cmd_wait_same_instance(args):
     clients = load_clients()
-    cursor = parse_cursor(args.after) if args.after else None
+    cursor = args.after
     if args.slots:
-        slots = [parse_slot(s.strip(), allow_all=False) for s in args.slots.split(",") if s.strip()]
+        slots = args.slots
     else:
         slots = sorted(c["slot"] for c in clients["clients"] if c.get("running") is True)
     if not slots:
@@ -680,7 +1238,8 @@ class Parser(argparse.ArgumentParser):
 
 
 def main(argv):
-    parser = Parser(prog="vrcrt.sh", description="Read the VRC Remote Test Bridge's per-client observation over HTTPS.")
+    parser = Parser(prog="vrcrt.sh", description="Read the VRC Remote Test Bridge's per-client observation, "
+                                                 "and look after the Bridge, over HTTPS.")
     sub = parser.add_subparsers(dest="command", parser_class=Parser)
     sub.required = True
 
@@ -692,14 +1251,18 @@ def main(argv):
     p.add_argument("build_id")
     p.set_defaults(run=cmd_result)
 
+    # User arguments are checked here, by their argparse types: a wrong one is exit 2 before the
+    # command runs. Whatever fails later comes from the Bridge's answers.
+    slot_or_all = argument(lambda value: parse_slot(value, allow_all=True))
+
     p = sub.add_parser("log", help="a slot's log, or the marker lines")
-    p.add_argument("slot", help="0-3, or all with --markers")
+    p.add_argument("slot", type=slot_or_all, help="0-3, or all with --markers")
     p.add_argument("--markers", action="store_true")
     p.add_argument("--lines", type=int)
     p.set_defaults(run=cmd_log)
 
     p = sub.add_parser("export-log", help="save verified full log snapshots for one or all running clients")
-    p.add_argument("slot", help="0-3, or all running clients")
+    p.add_argument("slot", type=slot_or_all, help="0-3, or all running clients")
     p.add_argument("output_directory", help="existing local directory for the .log files")
     p.set_defaults(run=cmd_export_log)
 
@@ -707,27 +1270,57 @@ def main(argv):
     p.set_defaults(run=cmd_cursor)
 
     p = sub.add_parser("wait-marker", help="wait for a new marker line that matches a regex")
-    p.add_argument("slot", help="0-3, or all: every slot running when the cursor was taken")
+    p.add_argument("slot", type=slot_or_all, help="0-3, or all: every slot running when the cursor was taken")
     p.add_argument("regex")
     p.add_argument("seconds", type=seconds)
-    p.add_argument("--after")
+    p.add_argument("--after", type=argument(parse_cursor))
     p.add_argument("--any-generation", action="store_true", help="also accept a new client in the slot")
     p.set_defaults(run=cmd_wait_marker)
 
     p = sub.add_parser("wait-same-instance", help="wait until the slots are joined in one instance")
     p.add_argument("seconds", type=seconds)
-    p.add_argument("--slots")
-    p.add_argument("--after")
+    p.add_argument("--slots", type=argument(slot_list))
+    p.add_argument("--after", type=argument(parse_cursor))
     p.set_defaults(run=cmd_wait_same_instance)
+
+    p = sub.add_parser("doctor", help="the Bridge's version, configuration, profiles, logins and log tail (v0.8.0+)")
+    p.set_defaults(run=cmd_doctor)
+
+    p = sub.add_parser("profiles", help="the account each VRChat profile last logged in to (v0.8.0+)")
+    p.set_defaults(run=cmd_profiles)
+
+    p = sub.add_parser("config", help="read or change the Bridge's editable settings (v0.8.0+)")
+    config_sub = p.add_subparsers(dest="config_command", parser_class=Parser)
+    config_sub.required = True
+    c = config_sub.add_parser("get", help="the editable settings and their values, as JSON")
+    c.set_defaults(run=cmd_config_get)
+    c = config_sub.add_parser("set", help="change settings, then wait for the Bridge to restart and report")
+    c.add_argument("assignments", nargs="+", metavar="KEY=VALUE",
+                   help="VALUE is JSON when it parses (true, 3, [0,1]), else a string; KEY=null removes the key")
+    c.set_defaults(run=cmd_config_set)
+
+    p = sub.add_parser("restart", help="restart the Bridge host and wait for it (v0.8.0+)")
+    p.set_defaults(run=cmd_restart)
+
+    p = sub.add_parser("close-clients", help="close the VRChat clients the Bridge launched (v0.8.0+)")
+    p.set_defaults(run=cmd_close_clients)
 
     args = parser.parse_args(argv)
     try:
         return args.run(args)
     except Failure as failure:
-        print("vrcrt.sh: " + safe(str(failure)), file=sys.stderr)
+        print("vrcrt.sh: " + clip(failure), file=sys.stderr)
         return failure.code
     except KeyboardInterrupt:
         return 130
+    except (TypeError, ValueError, KeyError, AttributeError, IndexError, OverflowError, RecursionError) as error:
+        # An answer whose JSON is valid but not the shape the Bridge sends (a string where a
+        # number belongs, say) and that no check above caught: an invalid answer, not a crash.
+        # User arguments never get here: their argparse types reject them before run(), and
+        # the checks run() makes itself (regex, KEY=VALUE, build ID) raise Failure(EXIT_USAGE).
+        print("vrcrt.sh: the Bridge's answer is not in the expected shape (%s: %s)"
+              % (type(error).__name__, clip(error, MAX_CELL_CHARS)), file=sys.stderr)
+        return EXIT_OBSERVATION
 
 
 sys.exit(main(sys.argv[1:]))

@@ -384,7 +384,10 @@ public class BridgeOptionsValidatorTests : IDisposable
         var target = Path.Combine(_tempDir, "real-state");
         Directory.CreateDirectory(target);
         var link = Path.Combine(_tempDir, "linked-state");
-        Directory.CreateSymbolicLink(link, target);
+        if (!SymbolicLinks.TryCreateDirectory(link, target))
+        {
+            return;
+        }
 
         var options = ValidBaseOptions();
         options.StateDirectory = link;

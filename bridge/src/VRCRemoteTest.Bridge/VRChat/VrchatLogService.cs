@@ -67,10 +67,14 @@ public sealed class VrchatLogService : BackgroundService
         VrchatClientObserver observer,
         VrchatLogNotice notice,
         ILogger<VrchatLogService> logger,
-        LogSourceRegistry logSources)
+        LogSourceRegistry logSources,
+        IHostApplicationLifetime lifetime)
         : this(options, logReader, observer, notice, logger, DefaultPollInterval, logSources)
     {
+        _lifetime = lifetime;
     }
+
+    private readonly IHostApplicationLifetime? _lifetime;
 
     /// <summary>Test-only seam: a short poll interval keeps unit tests fast without a full clock abstraction.</summary>
     internal VrchatLogService(
@@ -99,6 +103,16 @@ public sealed class VrchatLogService : BackgroundService
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
+        // A host that fails to start must not replace the published logs (BridgeHost).
+        try
+        {
+            await Runtime.HostReady.WaitAsync(_lifetime, stoppingToken);
+        }
+        catch (OperationCanceledException)
+        {
+            return;
+        }
+
         while (!stoppingToken.IsCancellationRequested)
         {
             try
@@ -138,14 +152,21 @@ public sealed class VrchatLogService : BackgroundService
             return;
         }
 
-        var read = _logReader.Read();
+        // Both the reader (the roster) and the observer (epochs) save state; a host whose stop
+        // was requested meanwhile saves nothing more.
+        var read = _logReader.Read(cancellationToken);
         if (_notice.Message is { } message)
         {
             PublishNotice(message);
             return;
         }
 
+        cancellationToken.ThrowIfCancellationRequested();
         var observation = _observer.Observe(read, cancellationToken);
+
+        // Reading can outlast the host's stop timeout; a host being replaced must not publish
+        // over the next host's files.
+        cancellationToken.ThrowIfCancellationRequested();
         _logSources?.Publish(read, observation.Clients);
 
         if (read.Latest.IsAvailable)

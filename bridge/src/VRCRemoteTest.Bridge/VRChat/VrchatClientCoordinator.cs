@@ -48,15 +48,20 @@ public sealed class VrchatClientCoordinator : IVrchatClientCoordinator
 
     /// <summary>
     /// Last client mix reported by <see cref="ReportClientMix"/>. Only StagingWatcher's
-    /// sequential loop calls this service, so no synchronization is needed.
+    /// sequential loop calls this service, inside the operation gate (BridgeOperationGate),
+    /// so no synchronization is needed.
     /// </summary>
     private ClientMix? _lastReportedMix;
+
+    /// <summary>Where launched clients are recorded so the LAN API can close them later; null in unit tests that do not need it.</summary>
+    private readonly IManagedClientStore? _reloadRecord;
 
     public VrchatClientCoordinator(
         IOptions<BridgeOptions> options,
         IVrchatProcessMonitor processMonitor,
         IVrchatLauncher launcher,
-        ILogger<VrchatClientCoordinator> logger)
+        ILogger<VrchatClientCoordinator> logger,
+        ReloadClientStore reloadClients)
         : this(
             options,
             processMonitor,
@@ -67,7 +72,8 @@ public sealed class VrchatClientCoordinator : IVrchatClientCoordinator
             Task.Delay,
             () => VrchatLaunchPacer.ListLogFiles(options.Value),
             () => DateTime.UtcNow,
-            TimeZoneInfo.Local)
+            TimeZoneInfo.Local,
+            reloadClients.Store)
     {
     }
 
@@ -87,12 +93,14 @@ public sealed class VrchatClientCoordinator : IVrchatClientCoordinator
         Func<TimeSpan, CancellationToken, Task> launchDelay,
         Func<IReadOnlyList<VrchatLogMatcher.Candidate>?> listLogFiles,
         Func<DateTime> utcNow,
-        TimeZoneInfo timeZone)
+        TimeZoneInfo timeZone,
+        IManagedClientStore? reloadRecord = null)
     {
         _options = options.Value;
         _processMonitor = processMonitor;
         _launcher = launcher;
         _logger = logger;
+        _reloadRecord = reloadRecord;
         _startupSettleDelay = startupSettleDelay;
         _pollInterval = pollInterval;
         _utcNow = utcNow;
@@ -157,6 +165,10 @@ public sealed class VrchatClientCoordinator : IVrchatClientCoordinator
         var batch = _pacer.StartBatch(count);
         var previousLaunchUtc = DateTime.MinValue;
 
+        // A cold start means no VRChat runs, so whatever the record lists has exited.
+        var recorded = new List<ManagedClient>();
+        TrySaveReloadRecord(recorded);
+
         for (var i = 0; i < count; i++)
         {
             if (i > 0)
@@ -187,16 +199,45 @@ public sealed class VrchatClientCoordinator : IVrchatClientCoordinator
                 var message =
                     $"Launched {i} of {count} VRChat client(s); client {i + 1} failed to start: {result.ErrorMessage}";
                 _logger.LogError(message);
-                return VrchatLaunchOutcome.Failure(message);
+                return VrchatLaunchOutcome.Failure(message, requested: count, started: i);
             }
 
             _logger.LogInformation(
                 "Launched VRChat client {Index}/{Count} (PID {ProcessId}, created {CreationTimeUtc:O}, roomId {RoomId}).",
                 i + 1, count, result.ProcessId, result.CreationTimeUtc, roomId);
+
+            if (result is { ProcessId: { } processId, CreationTimeUtc: { } created, SessionId: { } session })
+            {
+                recorded.Add(new ManagedClient(processId, created, session, Profile: 0, LaunchOrder: i));
+                TrySaveReloadRecord(recorded);
+            }
         }
 
         cancellationToken.ThrowIfCancellationRequested();
-        return VrchatLaunchOutcome.Success();
+        return VrchatLaunchOutcome.Success(count);
+    }
+
+    /// <summary>
+    /// Reload mode never depends on this record (it reuses any --watch-worlds client), so a
+    /// write that fails only means the LAN API cannot close that client later.
+    /// </summary>
+    private void TrySaveReloadRecord(IReadOnlyList<ManagedClient> clients)
+    {
+        if (_reloadRecord is null)
+        {
+            return;
+        }
+
+        try
+        {
+            _reloadRecord.Save(clients);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            _logger.LogWarning(
+                ex, "Could not record the launched VRChat clients in {Path}; they cannot be closed through the LAN API.",
+                _reloadRecord.FilePath);
+        }
     }
 
     /// <summary>

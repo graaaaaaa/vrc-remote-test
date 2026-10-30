@@ -53,6 +53,12 @@ Windows Bridge の実行体（`VRCRemoteTest.Bridge.exe`）は、[Releases](http
 | `scripts/vrcrt.sh cursor` | 今の位置（台ごとの世代・observationEpoch・seq）を JSON で出す。読み終えていない台があれば失敗する |
 | `scripts/vrcrt.sh wait-marker <slot\|all> <正規表現> <秒> [--after <cursor>] [--any-generation]` | カーソルより後の、同じ世代・同じ epoch のマーカー行が正規表現に一致するまで待つ。`all` はカーソルの時点で動いていた全台での一致を待つ |
 | `scripts/vrcrt.sh wait-same-instance <秒> [--slots 0,1] [--after <cursor>]` | 指定した台がすべて joined で同じインスタンスにいるまで待つ。`--after` なら、カーソルより後に入り直したことも求める |
+| `scripts/vrcrt.sh doctor` | Bridge 0.8.0 以降: 版と実行体の SHA-256、いま効いている設定、注意、最後の設定の変更の結果、profile ごとのアカウント、台ごとのログイン状態、Bridge のログの末尾 |
+| `scripts/vrcrt.sh config get` | 変えられる設定の今の値と、`VrchatExecutable` の候補 |
+| `scripts/vrcrt.sh config set KEY=VALUE…` | 設定を変え、Bridge が起動し直して効いたかを待つ（最大90秒）。`KEY=null` で項目を消す |
+| `scripts/vrcrt.sh restart` | Bridge を起動し直し、新しい host が立つのを待つ |
+| `scripts/vrcrt.sh close-clients` | Bridge が起動した VRChat を閉じる。閉じたと確かめられない台が残れば終了コード 1 |
+| `scripts/vrcrt.sh profiles` | profile ごとに、最後にログインしたアカウント |
 
 待つ前に `cursor` で位置を取り、操作のあとに `--after` で渡すと、操作より前の行を新しい出来事と取り違えません。
 
@@ -64,7 +70,7 @@ cursor="$(scripts/vrcrt.sh cursor)"
 scripts/vrcrt.sh wait-marker 1 'PLAYER_RESTORED' 60 --after "$cursor"
 ```
 
-終了コードは 0 が成功、1 が時間切れ、2 が使い方の誤り（正規表現の誤りと、2秒を超えた正規表現を含む）、3 が観測では答えられないとき（Bridgeの観測情報が無いか古い、Bridge の再起動などで読み直した、Logging が Full でない、マーカーが上限で捨てられた）。`wait-marker` の正規表現は、Bridge がエスケープしたあとの行に当てます。同じインスタンスでも同じビルドとは限りません。動作の確認は `bash scripts/test-vrcrt.sh`。
+終了コードは 0 が成功、1 が時間切れ（管理のコマンドでは、Bridge が断った、設定の変更が戻された・失敗した、も含む）、2 が使い方の誤り（正規表現の誤りと、2秒を超えた正規表現を含む）、3 が観測では答えられないとき（Bridgeの観測情報が無いか古い、Bridge の再起動などで読み直した、Logging が Full でない、マーカーが上限で捨てられた、管理のコマンドでは Bridge に届かないか 0.8.0 より古い）。管理のコマンドの詳しい使い方は `docs/setup-windows.md` の4。`wait-marker` の正規表現は、Bridge がエスケープしたあとの行に当てます。同じインスタンスでも同じビルドとは限りません。動作の確認は `bash scripts/test-vrcrt.sh`。
 
 ビルドから結果・全文ログまで一度に保存する場合は、対話用 Unity Editor で対象プロジェクトを閉じ、保存済みシーンを指定して実行します。保存先は新しいディレクトリにしてください。ペアリングトークンは Keychain から読みます。`-quit` は付けず、ビルド完了後に拡張が Unity を終了します。
 

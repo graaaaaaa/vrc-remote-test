@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Text.RegularExpressions;
 using System.Threading.Tasks;
@@ -198,6 +199,144 @@ namespace VRCRemoteTest.Tests
 
             blockingBuild.SetResult(_validArtifactPath);
             firstRunTask.GetAwaiter().GetResult();
+        }
+
+        [Test]
+        public void An_artifact_over_the_Bridge_limit_fails_before_uploading()
+        {
+            var sdkAdapter = new FakeVrcSdkBuildAdapter { ReturnedPath = _validArtifactPath };
+            var size = new FileInfo(_validArtifactPath).Length;
+            var transport = new FakeRemoteTransport
+            {
+                MaxArtifactSizeBytes = size - 1,
+                ResultFactory = DeployedResult,
+            };
+            var coordinator = new RemoteBuildCoordinator(sdkAdapter, transport);
+
+            LogAssert.Expect(LogType.Error, new Regex(@"^\[VRC Remote Test\] SIZE_EXCEEDED: .*MaxArtifactSizeBytes"));
+            var outcome = coordinator.ExecuteRemoteBuildAsync().GetAwaiter().GetResult();
+
+            Assert.IsFalse(outcome.Succeeded);
+            Assert.AreEqual(ErrorCode.SizeExceeded, outcome.ErrorCode);
+            StringAssert.Contains(size + " bytes", outcome.ErrorMessage);
+            StringAssert.Contains((size - 1) + " bytes", outcome.ErrorMessage);
+            Assert.IsFalse(transport.UploadCalled);
+            Assert.IsNotNull(coordinator.LastArtifact, "a world too large now can be deployed after the limit is raised");
+        }
+
+        [Test]
+        public void An_artifact_at_the_Bridge_limit_is_uploaded()
+        {
+            var sdkAdapter = new FakeVrcSdkBuildAdapter { ReturnedPath = _validArtifactPath };
+            var transport = new FakeRemoteTransport
+            {
+                MaxArtifactSizeBytes = new FileInfo(_validArtifactPath).Length,
+                ResultFactory = DeployedResult,
+            };
+            var coordinator = new RemoteBuildCoordinator(sdkAdapter, transport);
+
+            var outcome = coordinator.ExecuteRemoteBuildAsync().GetAwaiter().GetResult();
+
+            Assert.IsTrue(outcome.Succeeded);
+            Assert.IsTrue(transport.UploadCalled);
+        }
+
+        [Test]
+        public void DescribeOversize_is_null_when_the_limit_is_unknown_or_met()
+        {
+            Assert.IsNull(RemoteBuildCoordinator.DescribeOversize(100, null));
+            Assert.IsNull(RemoteBuildCoordinator.DescribeOversize(100, 100));
+            Assert.IsNull(RemoteBuildCoordinator.DescribeOversize(100, 0));
+            StringAssert.Contains("MaxArtifactSizeBytes", RemoteBuildCoordinator.DescribeOversize(101, 100));
+        }
+
+        [Test]
+        public void A_deploy_with_AutoLaunchVrchat_off_says_no_VRChat_was_launched()
+        {
+            var sdkAdapter = new FakeVrcSdkBuildAdapter { ReturnedPath = _validArtifactPath };
+            var transport = new FakeRemoteTransport
+            {
+                ResultFactory = buildId =>
+                {
+                    var result = DeployedResult(buildId);
+                    result.Launch = new LaunchReport { Attempted = false, Outcome = LaunchReport.Disabled };
+                    result.Warnings = new List<string> { "Profiles 0 and 1\tshare an account." };
+                    return result;
+                },
+            };
+            var coordinator = new RemoteBuildCoordinator(sdkAdapter, transport);
+            var progress = new RecordingProgress();
+
+            LogAssert.Expect(LogType.Warning, "[VRC Remote Test] " + RemoteBuildCoordinator.AutoLaunchOffNote);
+            LogAssert.Expect(LogType.Warning, "[VRC Remote Test] Bridge warning: Profiles 0 and 1 share an account.");
+            var outcome = coordinator.ExecuteRemoteBuildAsync(progress).GetAwaiter().GetResult();
+
+            Assert.IsTrue(outcome.Succeeded);
+            var last = progress.Reports[progress.Reports.Count - 1];
+            Assert.AreEqual(RemoteBuildStatus.Succeeded, last.Status);
+            StringAssert.Contains(RemoteBuildCoordinator.AutoLaunchOffNote, last.Message);
+            CollectionAssert.AreEqual(
+                new[] { RemoteBuildCoordinator.AutoLaunchOffNote, "Bridge warning: Profiles 0 and 1 share an account." },
+                RemoteBuildCoordinator.ResultNotes(outcome.Result));
+        }
+
+        [Test]
+        public void A_failed_result_keeps_its_warnings()
+        {
+            var sdkAdapter = new FakeVrcSdkBuildAdapter { ReturnedPath = _validArtifactPath };
+            var transport = new FakeRemoteTransport
+            {
+                ResultFactory = buildId => new BuildResult
+                {
+                    ProtocolVersion = ProtocolConstants.CurrentProtocolVersion,
+                    BuildId = buildId,
+                    Status = "failed",
+                    ErrorCode = ErrorCode.VrchatStartFailed,
+                    ErrorMessage = "No client started.",
+                    Launch = new LaunchReport { Attempted = true, Outcome = "failed", Requested = 2, Started = 0 },
+                    Warnings = new List<string> { "slot 1 has no profile" },
+                    UpdatedAtUtc = DateTimeOffset.UtcNow,
+                },
+            };
+            var coordinator = new RemoteBuildCoordinator(sdkAdapter, transport);
+
+            LogAssert.Expect(LogType.Warning, "[VRC Remote Test] Bridge warning: slot 1 has no profile");
+            LogAssert.Expect(LogType.Error, new Regex(@"^\[VRC Remote Test\] Bridge error: VRCHAT_START_FAILED"));
+            var outcome = coordinator.ExecuteRemoteBuildAsync().GetAwaiter().GetResult();
+
+            Assert.IsFalse(outcome.Succeeded);
+            Assert.IsNotNull(outcome.Result);
+            CollectionAssert.AreEqual(new[] { "Bridge warning: slot 1 has no profile" },
+                RemoteBuildCoordinator.ResultNotes(outcome.Result));
+        }
+
+        [Test]
+        public void ResultNotes_are_empty_for_a_result_from_an_older_Bridge()
+        {
+            Assert.IsEmpty(RemoteBuildCoordinator.ResultNotes(null));
+            Assert.IsEmpty(RemoteBuildCoordinator.ResultNotes(new BuildResult { Status = "deployed" }));
+            Assert.IsEmpty(RemoteBuildCoordinator.ResultNotes(new BuildResult
+            {
+                Status = "deployed",
+                Launch = new LaunchReport { Attempted = true, Outcome = "launched", Requested = 2, Started = 2 },
+            }));
+        }
+
+        private static BuildResult DeployedResult(string buildId) => new BuildResult
+        {
+            ProtocolVersion = ProtocolConstants.CurrentProtocolVersion,
+            BuildId = buildId,
+            Status = "deployed",
+            DeployedFileName = $"vrc-remote-{buildId}.vrcw",
+            UpdatedAtUtc = DateTimeOffset.UtcNow,
+        };
+
+        /// <summary>Records synchronously: Progress&lt;T&gt; would post to a synchronization context.</summary>
+        private sealed class RecordingProgress : IProgress<RemoteBuildProgress>
+        {
+            public List<RemoteBuildProgress> Reports { get; } = new List<RemoteBuildProgress>();
+
+            public void Report(RemoteBuildProgress value) => Reports.Add(value);
         }
 
         [Test]
