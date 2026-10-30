@@ -9,6 +9,14 @@ public interface IVrchatLogReader
     /// open by several VRChat clients, and which client the compatible copy follows.
     /// </summary>
     VrchatLogReadResult Read();
+
+    /// <summary>
+    /// <see cref="Read()"/>, stopping with OperationCanceledException before anything is
+    /// saved when <paramref name="cancellationToken"/> fired while the clients were listed:
+    /// listing can outlast a host's stop timeout, and a host being replaced must not save
+    /// its roster over the next host's.
+    /// </summary>
+    VrchatLogReadResult Read(CancellationToken cancellationToken) => Read();
 }
 
 public enum SlotLogStatus

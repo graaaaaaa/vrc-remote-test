@@ -297,7 +297,18 @@ public sealed class BridgeRuntime
                 return null;
             }
 
-            return JsonSerializer.Deserialize<ConfigApplyReport>(File.ReadAllText(path));
+            // Masked again: a report kept by an earlier version may name paths.
+            var stored = JsonSerializer.Deserialize<ConfigApplyReport>(File.ReadAllText(path));
+            return stored is null
+                ? null
+                : new ConfigApplyReport
+                {
+                    OperationId = stored.OperationId,
+                    RequestedEtag = stored.RequestedEtag,
+                    Outcome = stored.Outcome,
+                    Problems = (stored.Problems ?? []).Select(LogRedactor.Redact).ToList(),
+                    AtUtc = stored.AtUtc,
+                };
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException)
         {

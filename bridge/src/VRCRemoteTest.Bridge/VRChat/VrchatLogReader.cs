@@ -154,9 +154,12 @@ public sealed class VrchatLogReader : IVrchatLogReader
     /// <summary>vrchat-latest.log's content alone: what this reader published before slots.</summary>
     internal LogSnapshotResult ReadSnapshot() => Read().Latest;
 
-    public VrchatLogReadResult Read()
+    public VrchatLogReadResult Read() => Read(CancellationToken.None);
+
+    public VrchatLogReadResult Read(CancellationToken cancellationToken)
     {
         var snapshot = _processMonitor.GetClients();
+        cancellationToken.ThrowIfCancellationRequested();
         var records = _options.IsRelaunchMode && _managedClients is not null ? _managedClients.Known : [];
         var roster = _roster.Update(snapshot, records);
 

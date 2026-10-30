@@ -669,11 +669,14 @@ public sealed class StagingWatcher : BackgroundService, IBridgeWatcher
             return;
         }
 
+        // The build is installed: whatever fails next, running --watch-worlds clients load it.
+        var launch = LaunchBeforeInstall(preparation);
+        progress.Launch = launch;
         try
         {
             _resultWriter.WriteSuccess(
                 manifest.BuildId, deployedFileName, manifest.Sha256, ResultsDir,
-                new BuildResultExtras(LaunchBeforeInstall(preparation), AccountWarnings()));
+                new BuildResultExtras(launch, AccountWarnings()));
             TryArchiveProcessed(claimedManifestPath, artifactPath, manifest.BuildId);
             _cleanupService.Cleanup(_options.VrchatWorldsDirectory, _options.RetainBuilds, deployedFileName);
             _logger.LogInformation("Build {BuildId} deployed as {DeployedFileName}.", manifest.BuildId, deployedFileName);
@@ -682,7 +685,8 @@ public sealed class StagingWatcher : BackgroundService, IBridgeWatcher
         {
             _logger.LogError(ex, "Deploy failed for build {BuildId}.", manifest.BuildId);
             MoveToFailed(claimedManifestPath, artifactPath);
-            _resultWriter.WriteFailure(manifest.BuildId, ErrorCode.DeployFailed, ex.Message, ResultsDir);
+            _resultWriter.WriteFailure(
+                manifest.BuildId, ErrorCode.DeployFailed, ex.Message, ResultsDir, new BuildResultExtras(launch));
         }
     }
 

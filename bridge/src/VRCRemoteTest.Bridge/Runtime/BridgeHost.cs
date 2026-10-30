@@ -272,7 +272,15 @@ public static class BridgeHost
             {
                 await DisposeQuietlyAsync(app).ConfigureAwait(false);
                 Log.Warning("The Bridge's address is still in use; trying again in {Seconds} s.", delay.TotalSeconds);
-                await Task.Delay(delay, cancellationToken).ConfigureAwait(false);
+                try
+                {
+                    await Task.Delay(delay, cancellationToken).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException)
+                {
+                    return new StartResult(null, null, "Stopped while starting.");
+                }
+
                 delay = TimeSpan.FromSeconds(Math.Min(delay.TotalSeconds * 2, 5));
             }
             catch (Exception ex)

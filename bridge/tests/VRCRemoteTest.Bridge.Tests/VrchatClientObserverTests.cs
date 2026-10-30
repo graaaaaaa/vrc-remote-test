@@ -116,6 +116,24 @@ public class VrchatClientObserverTests : IDisposable
         observation.Clients.Clients.Single(c => c.Slot == slot);
 
     [Fact]
+    public void A_read_whose_host_is_stopping_saves_no_roster()
+    {
+        _monitor.AddClient(100, T0);
+        var rosterPath = Path.Combine(_stateDir, "stopping-" + VrchatClientRoster.FileName);
+        var roster = new VrchatClientRoster(rosterPath);
+        var reader = new VrchatLogReader(
+            Microsoft.Extensions.Options.Options.Create(Options), _monitor, NullLogger<VrchatLogReader>.Instance,
+            CreationTimeFromName, queryOwners: null, managedClients: null, roster);
+        using var stopped = new CancellationTokenSource();
+        stopped.Cancel();
+
+        var act = () => reader.Read(stopped.Token);
+
+        act.Should().Throw<OperationCanceledException>();
+        File.Exists(rosterPath).Should().BeFalse();
+    }
+
+    [Fact]
     public void Each_client_shows_its_account_as_a_digest_and_the_id_is_never_published()
     {
         _monitor.AddClient(100, T0);

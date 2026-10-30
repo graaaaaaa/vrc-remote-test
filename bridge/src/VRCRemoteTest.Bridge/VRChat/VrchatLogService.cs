@@ -152,13 +152,16 @@ public sealed class VrchatLogService : BackgroundService
             return;
         }
 
-        var read = _logReader.Read();
+        // Both the reader (the roster) and the observer (epochs) save state; a host whose stop
+        // was requested meanwhile saves nothing more.
+        var read = _logReader.Read(cancellationToken);
         if (_notice.Message is { } message)
         {
             PublishNotice(message);
             return;
         }
 
+        cancellationToken.ThrowIfCancellationRequested();
         var observation = _observer.Observe(read, cancellationToken);
 
         // Reading can outlast the host's stop timeout; a host being replaced must not publish
