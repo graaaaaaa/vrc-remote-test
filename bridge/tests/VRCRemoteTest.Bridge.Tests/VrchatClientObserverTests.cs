@@ -115,6 +115,32 @@ public class VrchatClientObserverTests : IDisposable
     private static VrchatClientEntry Entry(VrchatObservation observation, int slot) =>
         observation.Clients.Clients.Single(c => c.Slot == slot);
 
+    [Fact]
+    public void Each_client_shows_its_account_as_a_digest_and_the_id_is_never_published()
+    {
+        _monitor.AddClient(100, T0);
+        _monitor.AddClient(200, T0.AddSeconds(3));
+        File.WriteAllText(LogPath(T0), JoinLines("Alice", "usr_aaaaaaaa-0000"));
+        File.WriteAllText(LogPath(T0.AddSeconds(3)), JoinLines("Bob", "usr_bbbbbbbb-0000"));
+        var digest = AccountDigest.ForKey(new byte[32]);
+        var roster = new VrchatClientRoster(Path.Combine(_stateDir, VrchatClientRoster.FileName));
+        var reader = new VrchatLogReader(
+            Microsoft.Extensions.Options.Options.Create(Options), _monitor, NullLogger<VrchatLogReader>.Instance,
+            CreationTimeFromName, queryOwners: null, managedClients: null, roster);
+        var observer = new VrchatClientObserver(
+            Options, roster, null, CreationTimeFromName, () => _now, accountDigest: digest.Of);
+
+        var observation = observer.Observe(reader.Read(), CancellationToken.None);
+
+        var alice = Entry(observation, 0);
+        alice.LoginState.Should().Be("authenticated");
+        alice.Account!.DisplayName.Should().Be("Alice");
+        alice.Account.IdDigest.Should().Be(digest.Of("usr_aaaaaaaa-0000"));
+        Entry(observation, 1).Account!.IdDigest.Should().NotBe(alice.Account.IdDigest);
+        var published = JsonSerializer.Serialize(observation.Clients);
+        published.Should().NotContain("usr_aaaaaaaa").And.NotContain("usr_bbbbbbbb");
+    }
+
     private static (JsonElement Header, string[] Records) Markers(string content)
     {
         var lines = content.Split('\n', StringSplitOptions.RemoveEmptyEntries);

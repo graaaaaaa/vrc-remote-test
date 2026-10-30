@@ -81,6 +81,7 @@ public sealed class BridgeLanApiLargeArtifactTests : IAsyncLifetime
         var response = await _client!.PutAsync("builds/buildTooLarge/artifact", new ByteArrayContent(bytes));
 
         Assert.Equal(HttpStatusCode.RequestEntityTooLarge, response.StatusCode);
+        Assert.Contains("\"limitBytes\":" + (KestrelDefaultLimit + 4 * 1024 * 1024), await response.Content.ReadAsStringAsync());
 
         Assert.False(File.Exists(Path.Combine(_root, "state", "incoming", "buildTooLarge.vrcw")));
     }

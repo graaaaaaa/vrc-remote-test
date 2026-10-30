@@ -1,5 +1,34 @@
 # Changelog
 
+## [0.8.0] - 2026-10-31
+
+Day-to-day Bridge management from the Mac, so nobody has to work on the Windows PC once the Bridge is installed and paired. **Update both the Windows Bridge** (`docs/setup-windows.md`, step 1) **and the Unity package**. An existing `config.json` and pairing keep working; either side also works with the other still on 0.7.x, without the new features.
+
+### Added (Bridge)
+
+- `GET /api/v1/bridge`: version, executable SHA-256, host generation, listen URL, certificate fingerprint, the active configuration (paths with the Windows user name masked) and its etag, the etag of `config.json` on disk, the last configuration change, and notes such as "AutoLaunchVrchat is false".
+- `GET /api/v1/logs/bridge`: the tail of the Bridge's own log, masked.
+- `GET`/`PUT /api/v1/config`: change `AutoLaunchVrchat`, `VrchatClientMode`, `VrchatProfiles`, `VrchatClientCount`, `VrchatMode`, the startup timeouts, `RetainBuilds`, `MaxArtifactSizeBytes` and `LogMarkerPrefixes` within fixed ranges, and pick `VrchatExecutable` from the VRChat.exe found in the user's Steam libraries. `If-Match` with the file's SHA-256, a JSON Merge Patch body, validation through the production options binding, the exact previous file kept as `config.json.bak-<time>` (newest five), and an in-process restart that rolls back to the previous file when the new host cannot start. The listen address and port, the state and Worlds directories and the pairing cannot be changed remotely.
+- `POST /api/v1/bridge/restart`: rebuilds the host in the same process (at most once every 10 s); the instance lock and pairing are kept. Hosted services start their work only once Kestrel listens.
+- `POST /api/v1/clients/close`: closes the VRChat clients the Bridge launched. Reload launches are recorded too now (`state\reload-clients.json`); changing `VrchatClientMode` closes the Bridge's clients first and refuses when any other VRChat runs.
+- `/clients` entries gain `loginState` and `account` (display name, `idDigest`: an HMAC of the usr_ ID under a key that never leaves the PC, and the login time). `GET /api/v1/profiles` keeps the account each Relaunch profile last logged in to and warns when two profiles share one; the warning is added to build results too.
+- Build results gain an optional `launch` report (`disabled`, `reusedRunning`, `launched`, `relaunched`, `partial`, `failed`, `notReached`, with counts) and `warnings`. Every 413 answer carries `{error, limitBytes, declaredBytes}`.
+- One operation gate: deploys, configuration changes, closing clients and restarts run one at a time; a management request that finds it taken gets 409 `busy`.
+
+### Added (Unity and CLI)
+
+- `scripts/vrcrt.sh`: `doctor`, `config get`, `config set KEY=VALUE…`, `restart`, `close-clients`, `profiles`.
+- The Remote Test window shows the Bridge version, its notes and each client's login state and account, and warns when the Bridge and package versions differ.
+- Remote Build fails before uploading a world larger than the Bridge accepts, and shows the limit from a 413 answer. A result whose `launch` is `disabled` says that no VRChat was launched.
+
+### Not included
+
+- The Bridge does not update itself: replacing the executable stays a step on Windows.
+
+### Tests
+
+- Symbolic-link tests end early on Windows when the user cannot create links (Developer Mode off), instead of failing.
+
 ## [0.7.1] - 2026-10-30
 
 Fixes the Windows Bridge refusing worlds over 30 MB. The fix is in the Bridge only and the Unity package has no functional changes, so **update the Windows Bridge** (`docs/setup-windows.md`, step 1). An existing `config.json` and pairing keep working.

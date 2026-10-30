@@ -2,9 +2,25 @@
 
 Bridge と Unity パッケージは同じ版へ更新してください。旧共有への接続経路はありません。Bridge は Windows の通常ユーザーの対話セッションで動かし、設定と受信ファイルは `%LOCALAPPDATA%\VRCRemoteTest` に保存します。
 
+## Windows で人が行うこと
+
+v0.8.0 からは、日々の確認と設定の変更を Mac から行えます（4 を参照）。次のことだけは Windows の前で人が行います。
+
+- 最初のインストールと、Bridge の版の入れ替え（1）。Bridge は自分の実行体を入れ替えません。
+- ファイアウォールの規則（1、管理者の権限が要る）。
+- ペアリング（2）。トークンを Windows の画面から読み取ります。
+- VRChat の profile ごとの初めてのログインと、ログイン切れのときのログイン（パスワードと二段階認証）。Mac からは `vrcrt.sh doctor` で、ログインしていない profile が分かります。
+- VRChat の Settings > Debug > Logging を Full にすること。
+- PowerShell 7 のインストール。
+- 電源を入れただけで Bridge を動かしたいときの、Windows の自動サインイン。Bridge のタスクはログオンのときに始まります。
+
 ## 1. Bridge を配置する
 
-リリースの `VRCRemoteTest.Bridge.exe` を Windows 上で入手し、公開された SHA-256 と照合してください。PowerShell 7 で `scripts/install-bridge.ps1 -ExpectedSha256 <SHA-256> -SourcePath <ダウンロードしたexe> -StartNow` を実行します。既存 Bridge は停止してから更新します。このスクリプトは実行体を `%LOCALAPPDATA%\Programs\VRCRemoteTest\Bridge` に置き、ログオン時のタスクを登録します。
+リリースの `VRCRemoteTest.Bridge.exe` を Windows 上で入手し、公開された SHA-256 と照合してください。PowerShell 7 で `scripts/install-bridge.ps1 -ExpectedSha256 <SHA-256> -SourcePath <ダウンロードしたexe> -StartNow` を実行します。動いている Bridge は、先に `Stop-ScheduledTask -TaskName VRCRemoteTestBridge` で止めてください（スクリプトは動いている Bridge を入れ替えません）。このスクリプトは実行体を `%LOCALAPPDATA%\Programs\VRCRemoteTest\Bridge` に置き、ログオン時のタスクを登録します。
+
+- winget で入れた PowerShell 7 はストア版になり、`%LOCALAPPDATA%\Microsoft\WindowsApps\pwsh.exe` にあります。
+- Windows PowerShell 5.1 は、BOM の無い UTF-8 の日本語を読み違えます。5.1 で動かすスクリプトは ASCII にするか、BOM 付きで保存してください。
+- Claude デスクトップアプリのシェルから `%LOCALAPPDATA%` や `LocalLow` に書いたファイルは、アプリ専用の領域に仮想化され、タスクスケジューラーの Bridge からは見えません。`config.json` は、自分で開いた PowerShell 7 で書いてください。`pair` も自分のターミナルで実行してください。
 
 `%LOCALAPPDATA%\VRCRemoteTest\config.json` に次の `Bridge` セクションを用意します。`LanBindAddress` は Windows の開発用 LAN インターフェースの固定 IP です。`VrchatWorldsDirectory` は実在するローカル Worlds ディレクトリを指定します。その他の VRChat 設定は `bridge/README.md` を参照してください。
 
@@ -19,11 +35,15 @@ Bridge と Unity パッケージは同じ版へ更新してください。旧共
 }
 ```
 
-この例の IP とユーザー名は置き換えてください。Bridge は指定 IP の HTTPS だけで待ち受けます。ファイアウォールでは TCP `LanPort` の接続元を開発機の IP に限定してください。例（管理者 PowerShell、両 IP は実値に置換）:
+この例の IP とユーザー名は置き換えてください。Bridge は指定 IP の HTTPS だけで待ち受けます。`LanBindAddress` が変わると、設定、ファイアウォール、ペアリングを全部やり直すことになります。ルーターで Windows の IP を DHCP の予約にしておいてください。
+
+ファイアウォールでは TCP `LanPort` の接続元を開発機の IP に限定してください。例（管理者 PowerShell、両 IP は実値に置換）:
 
 ```powershell
 New-NetFirewallRule -DisplayName 'VRC Remote Test LAN Direct' -Direction Inbound -Action Allow -Protocol TCP -LocalAddress 192.0.2.20 -LocalPort 38443 -RemoteAddress 192.0.2.10 -Profile Private
 ```
+
+Windows がこの LAN を Public（パブリック）として扱っていると、`-Profile Private` の規則は効きません。`Get-NetConnectionProfile` で確かめ、ネットワークを Private にするか、規則を `-Profile Any` にしてください。接続元の IP とポートで絞っているので、Any でも開くのは開発機からの `LanPort` だけです。
 
 Windows が初回起動時に Bridge 実行体向けの受信許可を自動生成した場合、その規則に接続元やポートの制限がないことがあります。限定規則の追加後に `Get-NetFirewallRule -DisplayName vrcremotetest.bridge.exe` で確認し、自動生成された広い許可が有効なら管理者 PowerShell で `Disable-NetFirewallRule -DisplayName vrcremotetest.bridge.exe` を実行してください。限定規則は無効にせず、開発機からの接続を再確認します。
 
@@ -38,3 +58,24 @@ Windows の Bridge 実行体を `pair` 引数付きで起動すると、接続 U
 Unity の Preflight が `Windows Bridge: Connected` になり、`Remote Build & Test` の結果、台別状態、ログ、`Save Full Log`、`vrcrt.sh status` を確認します。Bridge のプライベート `state` 内に `incoming`、`results`、`status`、`logs` が作られます。
 
 新接続を確認した後、旧 `VRCRemoteTest` 共有、SMB 専用アカウント、SMB 向けファイアウォール規則、Mac の自動マウントを管理者が手動で撤去します。旧共有内のビルドやログで保管が必要なものは、撤去前に別の保管先へ移してください。旧設定の `StagingDirectory` は削除します。以前の実機記録は `docs/validation` に履歴として残します。
+
+## 4. Mac から管理する（v0.8.0）
+
+ペアリングが済めば、次のことは Mac の `scripts/vrcrt.sh` から行えます。どれも同じ証明書とトークンで動きます。
+
+| コマンド | すること |
+|---|---|
+| `vrcrt.sh doctor` | Bridge の版と実行体の SHA-256、いま効いている設定、注意（例: `AutoLaunchVrchat is false`）、最後の設定の変更の結果、profile ごとのアカウント、台ごとのログイン状態、Bridge 自身のログの末尾 |
+| `vrcrt.sh config get` | 変えられる設定の今の値と、`VrchatExecutable` の候補 |
+| `vrcrt.sh config set KEY=VALUE…` | 設定を変えて Bridge を起動し直し、効いたかを確かめる |
+| `vrcrt.sh restart` | Bridge を起動し直す |
+| `vrcrt.sh close-clients` | Bridge が起動した VRChat を閉じる |
+| `vrcrt.sh profiles` | profile ごとに、最後にログインしたアカウント |
+
+変えられる設定は `AutoLaunchVrchat`、`VrchatClientMode`、`VrchatProfiles`、`VrchatClientCount`、`VrchatMode`、`VrchatStartupTimeoutSeconds`（30〜600）、`VrchatStartupSettleDelaySeconds`（1〜300）、`RetainBuilds`（1〜100）、`MaxArtifactSizeBytes`（1 MiB〜2 GiB）、`LogMarkerPrefixes` です。`VrchatExecutable` は、Bridge が Steam のライブラリで見つけた `VRChat.exe` の候補から選びます（`VrchatExecutableCandidate=steam-0` のように指定）。`LanBindAddress`、`LanPort`、`VrchatWorldsDirectory` とペアリングは、Mac からは変えられません。
+
+- 設定を変えると、Bridge は前の `config.json` を `config.json.bak-<時刻>` として残し（新しい5個まで）、プロセスの中で起動し直します。新しい設定で起動できなければ、前の設定に戻して起動し直し、`doctor` に `rolledBack` と理由が出ます。
+- `config.json` を書き直すとき、コメントは消えます。元の内容はバックアップに残ります。
+- `VrchatClientMode` を変えるときは、Bridge が起動した VRChat を先に閉じます。Bridge が起動していない VRChat が動いていれば、何も閉じず、設定も変えません。v0.7.1 までに Reload で起動した VRChat には記録が無いので、Windows で閉じてください。
+- 配備や別の操作の最中は、409 busy で断ります。少し待ってからやり直してください。
+- `AutoLaunchVrchat` を直したあとに VRChat を起動するには、Unity の Redeploy で前のワールドを配り直します。

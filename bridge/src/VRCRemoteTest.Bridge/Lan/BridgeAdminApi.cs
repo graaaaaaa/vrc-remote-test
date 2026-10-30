@@ -58,9 +58,12 @@ internal static class BridgeAdminApi
         api.MapGet("/logs/bridge", (int? lines) => BridgeLog(runtime, lines));
         api.MapGet("/profiles", (HttpContext context) => Profiles(context));
         api.MapGet("/config", (HttpContext context) => GetConfig(context, runtime));
-        api.MapPut("/config", (HttpContext context) => PutConfig(context, runtime));
+
+        // Typed as Func so the result is written: a lambda that only takes HttpContext and
+        // returns a Task would bind to RequestDelegate, which drops the IResult (200, empty).
+        api.MapPut("/config", (Func<HttpContext, Task<IResult>>)(context => PutConfig(context, runtime)));
         api.MapPost("/bridge/restart", () => Restart(runtime));
-        api.MapPost("/clients/close", (HttpContext context) => Close(context, runtime));
+        api.MapPost("/clients/close", (Func<HttpContext, Task<IResult>>)(context => Close(context, runtime)));
     }
 
     private static IResult Info(HttpContext context, BridgeRuntime runtime)
@@ -94,22 +97,23 @@ internal static class BridgeAdminApi
         });
     }
 
-    internal static object ActiveConfig(BridgeOptions o) => new
+    /// <summary>Keyed by the names config.json and PUT /config use, so they are not camel-cased like the rest.</summary>
+    internal static Dictionary<string, object?> ActiveConfig(BridgeOptions o) => new()
     {
-        o.LanBindAddress,
-        o.LanPort,
-        VrchatWorldsDirectory = Display(o.VrchatWorldsDirectory),
-        o.MaxArtifactSizeBytes,
-        o.RetainBuilds,
-        VrchatExecutable = Display(o.VrchatExecutable),
-        o.VrchatMode,
-        o.AutoLaunchVrchat,
-        o.VrchatClientCount,
-        o.VrchatClientMode,
-        o.VrchatProfiles,
-        o.VrchatStartupTimeoutSeconds,
-        o.VrchatStartupSettleDelaySeconds,
-        LogMarkerPrefixes = o.ResolvedLogMarkerPrefixes,
+        [nameof(o.LanBindAddress)] = o.LanBindAddress,
+        [nameof(o.LanPort)] = o.LanPort,
+        [nameof(o.VrchatWorldsDirectory)] = Display(o.VrchatWorldsDirectory),
+        [nameof(o.MaxArtifactSizeBytes)] = o.MaxArtifactSizeBytes,
+        [nameof(o.RetainBuilds)] = o.RetainBuilds,
+        [nameof(o.VrchatExecutable)] = Display(o.VrchatExecutable),
+        [nameof(o.VrchatMode)] = o.VrchatMode,
+        [nameof(o.AutoLaunchVrchat)] = o.AutoLaunchVrchat,
+        [nameof(o.VrchatClientCount)] = o.VrchatClientCount,
+        [nameof(o.VrchatClientMode)] = o.VrchatClientMode,
+        [nameof(o.VrchatProfiles)] = o.VrchatProfiles,
+        [nameof(o.VrchatStartupTimeoutSeconds)] = o.VrchatStartupTimeoutSeconds,
+        [nameof(o.VrchatStartupSettleDelaySeconds)] = o.VrchatStartupSettleDelaySeconds,
+        [nameof(o.LogMarkerPrefixes)] = o.ResolvedLogMarkerPrefixes,
     };
 
     private static List<string> Notes(BridgeOptions o, ProfileAccountStore profiles, BridgeRuntime runtime, string? savedEtag)

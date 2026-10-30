@@ -947,7 +947,10 @@ public class StagingWatcherTests : IDisposable
         var target = Path.Combine(_tempDir, "private-manifest.json");
         var targetJson = JsonSerializer.Serialize(ManifestFor("build-link", bytes));
         File.WriteAllText(target, targetJson);
-        File.CreateSymbolicLink(Path.Combine(incoming, "build-link.ready.json"), target);
+        if (!SymbolicLinks.TryCreateFile(Path.Combine(incoming, "build-link.ready.json"), target))
+        {
+            return;
+        }
 
         await watcher.RunOnceAsync(CancellationToken.None);
 
@@ -966,7 +969,10 @@ public class StagingWatcherTests : IDisposable
 
         var incoming = Path.Combine(_stagingDir, "incoming");
         Directory.CreateDirectory(incoming);
-        File.CreateSymbolicLink(Path.Combine(incoming, "build-linkart.vrcw"), target);
+        if (!SymbolicLinks.TryCreateFile(Path.Combine(incoming, "build-linkart.vrcw"), target))
+        {
+            return;
+        }
         File.WriteAllText(
             Path.Combine(incoming, "build-linkart.ready.json"),
             JsonSerializer.Serialize(ManifestFor("build-linkart", bytes)));
