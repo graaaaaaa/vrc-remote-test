@@ -4,6 +4,7 @@ using System.Text.Json;
 using System.Text.Json.Serialization;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
+using Microsoft.AspNetCore.Http.Features;
 using Microsoft.AspNetCore.Routing;
 using VRCRemoteTest.Bridge.Configuration;
 using VRCRemoteTest.Bridge.Deployment;
@@ -80,6 +81,15 @@ public static class BridgeLanApi
         if (size > options.MaxArtifactSizeBytes)
         {
             return Results.StatusCode(StatusCodes.Status413PayloadTooLarge);
+        }
+
+        // Kestrel stops every request body at 30,000,000 bytes by default (413) before MaxArtifactSizeBytes is checked,
+        // and a world is often larger. This route enforces MaxArtifactSizeBytes itself below, so the server's limit
+        // follows it here; every other route keeps the default.
+        var bodyLimit = context.Features.Get<IHttpMaxRequestBodySizeFeature>();
+        if (bodyLimit is { IsReadOnly: false })
+        {
+            bodyLimit.MaxRequestBodySize = options.MaxArtifactSizeBytes;
         }
 
         await Ingress.WaitAsync(context.RequestAborted);
