@@ -1,7 +1,7 @@
 {
   "name": "com.github.graaaaaaa.vrc-remote-test",
   "displayName": "VRC Remote Test",
-  "version": "0.8.0",
+  "version": "0.8.1",
   "unity": "2022.3",
   "description": "Remote VRChat world testing from macOS Unity to a Windows VRChat client.",
   "license": "MIT",
