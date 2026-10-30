@@ -264,6 +264,33 @@ public sealed class AccountTests : IDisposable
         tracker.Account.Value.LocalTime.Should().Be(new DateTime(2026, 10, 30, 22, 9, 44));
     }
 
+    [Theory]
+    [InlineData("[Authentication - ÎÎÍÏÎÏÌÎÏÎÍÌÌÏÌÌÍÎÌÏÏÏÎ] Preforming post login checks for graaaaa ({0})")]
+    [InlineData("[Authentication - abc] Performing post login checks for graaaaa ({0})")]
+    public void The_post_login_line_of_current_vrchat_builds_is_a_login(string message)
+    {
+        var tracker = new VrchatClientStateTracker(id => "digest-of-" + id);
+        tracker.OnLine(Line(1, "2026.10.30 22:16:17 Debug      -  " + string.Format(message, UserId)));
+
+        tracker.Authenticated.Should().BeTrue();
+        tracker.Account!.Value.Name.Should().Be("graaaaa");
+        tracker.Account.Value.IdDigest.Should().Be("digest-of-" + UserId);
+    }
+
+    [Theory]
+    [InlineData("[Behaviour] Preforming post login checks for graaaaa ({0})")]
+    [InlineData("[Authentication] Transitioning auth state: x -> y")]
+    [InlineData("[Authentication - a] b] Preforming post login checks for graaaaa ({0})")]
+    [InlineData("[Authentication - x] Preforming post login checks for graaaaa")]
+    public void Lines_that_only_look_like_a_login_are_not_one(string message)
+    {
+        var tracker = new VrchatClientStateTracker(id => "digest");
+        tracker.OnLine(Line(1, "2026.10.30 22:16:17 Debug      -  " + string.Format(message, UserId)));
+
+        tracker.Authenticated.Should().BeFalse();
+        tracker.Account.Should().BeNull();
+    }
+
     private static VrchatLogPhysicalLine Line(long seq, string text) => new(seq, text, Truncated: false);
 
     private static ProfileAccount Account(int profile, string digest, int minute) => new()

@@ -115,7 +115,10 @@ internal sealed partial class VrchatClientStateTracker
 
     public long ObservedThroughSeq { get; private set; }
 
-    /// <summary>True once "User Authenticated: &lt;name&gt; (usr_…)" was seen; never false, since its absence proves nothing.</summary>
+    /// <summary>
+    /// True once a login line was seen ("User Authenticated: &lt;name&gt; (usr_…)", or the
+    /// post-login line of current builds); never false, since its absence proves nothing.
+    /// </summary>
     public bool Authenticated { get; private set; }
 
     public bool SawDebug { get; private set; }
@@ -204,8 +207,9 @@ internal sealed partial class VrchatClientStateTracker
 
     private void OnDebugMessage(string body, long seq, DateTime time)
     {
-        if (body.StartsWith(UserAuthenticatedPrefix, StringComparison.Ordinal)
-            && TrySplitUser(body[UserAuthenticatedPrefix.Length..], out var accountName, out var accountId))
+        if ((body.StartsWith(UserAuthenticatedPrefix, StringComparison.Ordinal)
+                && TrySplitUser(body[UserAuthenticatedPrefix.Length..], out var accountName, out var accountId))
+            || (TryPostLoginUser(body, out var postLogin) && TrySplitUser(postLogin, out accountName, out accountId)))
         {
             Authenticated = true;
             if (_accountDigest is not null)
@@ -328,6 +332,45 @@ internal sealed partial class VrchatClientStateTracker
     private const string PlayerJoinedPrefix = "OnPlayerJoined ";
     private const string PlayerLeftPrefix = "OnPlayerLeft ";
     private const string UserAuthenticatedPrefix = "User Authenticated: ";
+
+    /// <summary>
+    /// The login line of current VRChat builds (seen 2026-10-30), replacing "User
+    /// Authenticated": "[Authentication - &lt;tag&gt;] Preforming post login checks for
+    /// &lt;name&gt; (usr_…)". The tag is a run of random letters that changes every session,
+    /// and "Preforming" is VRChat's own spelling ("Performing" is accepted too).
+    /// </summary>
+    private const string AuthenticationTagPrefix = "[Authentication - ";
+    private const int MaxAuthenticationTagLength = 64;
+    private static readonly string[] PostLoginMarkers =
+    [
+        "] Preforming post login checks for ",
+        "] Performing post login checks for ",
+    ];
+
+    /// <summary>The "&lt;name&gt; (usr_…)" part of a post-login line, or false.</summary>
+    private static bool TryPostLoginUser(string body, out string user)
+    {
+        user = string.Empty;
+        if (!body.StartsWith(AuthenticationTagPrefix, StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        foreach (var marker in PostLoginMarkers)
+        {
+            var at = body.IndexOf(marker, AuthenticationTagPrefix.Length, StringComparison.Ordinal);
+            if (at < 0 || at - AuthenticationTagPrefix.Length > MaxAuthenticationTagLength
+                || body.AsSpan(AuthenticationTagPrefix.Length, at - AuthenticationTagPrefix.Length).Contains(']'))
+            {
+                continue;
+            }
+
+            user = body[(at + marker.Length)..];
+            return true;
+        }
+
+        return false;
+    }
     private const string UserIdOpen = " (usr_";
 
     private void OnJoining(string value, long seq, DateTime time)

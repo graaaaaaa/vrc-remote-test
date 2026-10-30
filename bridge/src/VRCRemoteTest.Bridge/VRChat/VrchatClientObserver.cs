@@ -489,7 +489,7 @@ public sealed class VrchatClientObserver
         {
             var profile = record is not null ? $"profile {record.Profile}" : "this client's profile";
             var notice =
-                $"No \"User Authenticated\" line {StartupGrace.TotalSeconds:0} s after this client started: the login of " +
+                $"No login line (\"post login checks for\" or \"User Authenticated\") {StartupGrace.TotalSeconds:0} s after this client started: the login of " +
                 $"{profile} may have expired. Start VRChat with that profile on Windows and log in again.";
             warnings.Add(notice);
             notices.Add(notice);

@@ -21,6 +21,10 @@ Day-to-day Bridge management from the Mac, so nobody has to work on the Windows 
 - The Remote Test window shows the Bridge version, its notes and each client's login state and account, and warns when the Bridge and package versions differ.
 - Remote Build fails before uploading a world larger than the Bridge accepts, and shows the limit from a 413 answer. A result whose `launch` is `disabled` says that no VRChat was launched.
 
+### Fixed (Bridge)
+
+- Current VRChat builds no longer log "User Authenticated: <name> (usr_…)"; they log "[Authentication - <tag>] Preforming post login checks for <name> (usr_…)". The Bridge now reads that line too, so a logged-in client is no longer reported as "the login of profile N may have expired" (seen on v0.7.1, 2026-10-30), and its account is shown.
+
 ### Not included
 
 - The Bridge does not update itself: replacing the executable stays a step on Windows.
