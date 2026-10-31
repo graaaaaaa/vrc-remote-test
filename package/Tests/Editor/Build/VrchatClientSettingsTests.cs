@@ -14,25 +14,6 @@ namespace VRCRemoteTest.Tests
     /// </summary>
     public class VrchatClientSettingsTests
     {
-        private TimeSpan _originalTimeout;
-        private TimeSpan _originalInterval;
-
-        [SetUp]
-        public void SetUp()
-        {
-            _originalTimeout = RemoteBuildCoordinator.ClientSettingsApplyTimeout;
-            _originalInterval = RemoteBuildCoordinator.ClientSettingsPollInterval;
-            RemoteBuildCoordinator.ClientSettingsApplyTimeout = TimeSpan.FromSeconds(10);
-            RemoteBuildCoordinator.ClientSettingsPollInterval = TimeSpan.FromSeconds(1);
-        }
-
-        [TearDown]
-        public void TearDown()
-        {
-            RemoteBuildCoordinator.ClientSettingsApplyTimeout = _originalTimeout;
-            RemoteBuildCoordinator.ClientSettingsPollInterval = _originalInterval;
-        }
-
         // --- parsing and the patch ---
 
         [Test]
@@ -128,6 +109,8 @@ namespace VRCRemoteTest.Tests
 
         // --- applying through the coordinator ---
 
+        private const string Op = "0123456789abcdef0123456789abcdef";
+
         private static string Info(long generation, string operationId = null, string outcome = null, string problems = "[]") =>
             "{\"hostGeneration\":" + generation
             + ",\"activeConfig\":{\"VrchatClientMode\":\"Relaunch\",\"VrchatProfiles\":[0,1]}"
@@ -141,36 +124,41 @@ namespace VRCRemoteTest.Tests
         {
             var transport = new FakeRemoteTransport
             {
-                ConfigResponse = FakeRemoteTransport.Json(200, "{\"etag\":\"abc123\",\"values\":{}}"),
+                ConfigResponse = FakeRemoteTransport.Json(200,
+                    "{\"etag\":\"abc123\",\"values\":{},\"active\":{\"VrchatClientMode\":\"Relaunch\",\"VrchatProfiles\":[0,1]}}"),
                 PutConfigResponse = FakeRemoteTransport.Json(202,
-                    "{\"operationId\":\"0123456789abcdef0123456789abcdef\",\"requestedEtag\":\"def\",\"restart\":\"scheduled\"}"),
+                    "{\"operationId\":\"" + Op + "\",\"requestedEtag\":\"def\",\"restart\":\"scheduled\"}"),
             };
             var delays = new List<TimeSpan>();
             var coordinator = new RemoteBuildCoordinator(new FakeVrcSdkBuildAdapter(), transport)
             {
-                Delay = (delay, _) =>
+                // Short real deadlines; a poll only yields, so a test that never sees its
+                // outcome ends after ClientSettingsApplyTimeout.
+                ClientSettingsReadTimeout = TimeSpan.FromMilliseconds(200),
+                ClientSettingsWriteTimeout = TimeSpan.FromMilliseconds(200),
+                ClientSettingsApplyTimeout = TimeSpan.FromMilliseconds(300),
+                ClientSettingsPollRequestTimeout = TimeSpan.FromMilliseconds(50),
+                Delay = async (delay, token) =>
                 {
                     delays.Add(delay);
-                    return Task.CompletedTask;
+                    await Task.Delay(5, token).ConfigureAwait(false);
                 },
             };
             return (coordinator, transport, delays);
         }
 
         [Test]
-        public void Applying_writes_the_patch_with_the_etag_and_waits_for_the_restarted_host()
+        public void Applying_writes_the_patch_with_the_etag_and_waits_for_the_outcome()
         {
             var (coordinator, transport, delays) = Bridge();
-            const string op = "0123456789abcdef0123456789abcdef";
-            transport.BridgeInfoResponses.Enqueue(FakeRemoteTransport.Json(200, Info(5)));
             transport.BridgeInfoResponses.Enqueue(BridgeAdminResponse.Unreachable("restarting"));
             transport.BridgeInfoResponses.Enqueue(FakeRemoteTransport.Json(200, Info(5)));
-            transport.BridgeInfoResponses.Enqueue(FakeRemoteTransport.Json(200, Info(6, op, "pending")));
-            transport.BridgeInfoResponses.Enqueue(FakeRemoteTransport.Json(200, Info(6, op, "applied")));
+            transport.BridgeInfoResponses.Enqueue(FakeRemoteTransport.Json(200, Info(6, Op, "pending")));
+            transport.BridgeInfoResponses.Enqueue(FakeRemoteTransport.Json(200, Info(6, Op, "applied")));
             var settings = VrchatClientSettings.Relaunch(new[] { 0, 1, 2, 3 });
             var steps = new List<string>();
 
-            var outcome = coordinator.ApplyVrchatClientSettingsAsync(settings, new ImmediateProgress(steps))
+            var outcome = coordinator.ApplyVrchatClientSettingsAsync(settings, "Relaunch", new ImmediateProgress(steps))
                 .GetAwaiter().GetResult();
 
             Assert.IsTrue(outcome.Applied, outcome.Message);
@@ -184,27 +172,39 @@ namespace VRCRemoteTest.Tests
         }
 
         [Test]
-        public void A_rolled_back_change_reports_the_Bridge_problems()
+        public void The_outcome_is_taken_from_a_new_process_whose_host_generation_started_again()
         {
             var (coordinator, transport, _) = Bridge();
-            const string op = "0123456789abcdef0123456789abcdef";
-            transport.BridgeInfoResponses.Enqueue(FakeRemoteTransport.Json(200, Info(1)));
+            transport.BridgeInfoResponses.Enqueue(FakeRemoteTransport.Json(200, Info(1, Op, "applied")));
+
+            var outcome = coordinator.ApplyVrchatClientSettingsAsync(VrchatClientSettings.Reload(1))
+                .GetAwaiter().GetResult();
+
+            Assert.IsTrue(outcome.Applied, outcome.Message);
+        }
+
+        [TestCase("rolledBack", "restored its previous config.json")]
+        [TestCase("failed", "reported that the change failed")]
+        [TestCase("somethingNew", "does not know (somethingNew)")]
+        public void An_outcome_other_than_applied_says_what_the_Bridge_reported(string result, string expected)
+        {
+            var (coordinator, transport, _) = Bridge();
             transport.BridgeInfoResponses.Enqueue(FakeRemoteTransport.Json(200,
-                Info(2, op, "rolledBack", "[\"The new host could not start\\u001b[31m\"]")));
+                Info(2, Op, result, "[\"The new host could not start\\u001b[31m\"]")));
 
             var outcome = coordinator.ApplyVrchatClientSettingsAsync(VrchatClientSettings.Reload(2))
                 .GetAwaiter().GetResult();
 
             Assert.IsFalse(outcome.Applied);
-            StringAssert.Contains("rolledBack", outcome.Message);
+            StringAssert.Contains(expected, outcome.Message);
+            StringAssert.DoesNotContain("previous settings", outcome.Message);
             CollectionAssert.AreEqual(new[] { "The new host could not start [31m" }, outcome.Details, "sanitized");
         }
 
         [Test]
         public void An_answer_for_another_operation_is_not_taken_as_this_one()
         {
-            var (coordinator, transport, delays) = Bridge();
-            transport.BridgeInfoResponses.Enqueue(FakeRemoteTransport.Json(200, Info(1)));
+            var (coordinator, transport, _) = Bridge();
             transport.BridgeInfoResponses.Enqueue(FakeRemoteTransport.Json(200,
                 Info(2, "ffffffffffffffffffffffffffffffff", "applied")));
 
@@ -212,8 +212,70 @@ namespace VRCRemoteTest.Tests
                 .GetAwaiter().GetResult();
 
             Assert.IsFalse(outcome.Applied);
-            StringAssert.Contains("did not report the change within 10 s", outcome.Message);
-            Assert.AreEqual(10, delays.Count);
+            StringAssert.Contains("did not report the change within", outcome.Message);
+            StringAssert.Contains("may still be applied", outcome.Message);
+        }
+
+        [Test]
+        public void A_Bridge_that_stops_answering_ends_the_wait_at_the_deadline_and_frees_the_lock()
+        {
+            var (coordinator, transport, _) = Bridge();
+            transport.BridgeInfoHandler = FakeRemoteTransport.NeverAnswers;
+            var clock = System.Diagnostics.Stopwatch.StartNew();
+
+            var outcome = coordinator.ApplyVrchatClientSettingsAsync(VrchatClientSettings.Reload(1))
+                .GetAwaiter().GetResult();
+
+            Assert.IsFalse(outcome.Applied);
+            StringAssert.Contains("did not report the change", outcome.Message);
+            Assert.Less(clock.Elapsed.TotalSeconds, 5, "the 0.3 s wait, not the transport's 2 minutes per call");
+            Assert.IsFalse(coordinator.IsRunning);
+            Assert.Greater(transport.BridgeInfoCalls, 1, "a poll that times out is tried again");
+        }
+
+        [Test]
+        public void A_change_sent_without_an_answer_may_have_been_applied()
+        {
+            var (coordinator, transport, delays) = Bridge();
+            transport.PutConfigHandler = FakeRemoteTransport.NeverAnswers;
+
+            var outcome = coordinator.ApplyVrchatClientSettingsAsync(VrchatClientSettings.Reload(1))
+                .GetAwaiter().GetResult();
+
+            Assert.IsFalse(outcome.Applied);
+            StringAssert.Contains("did not answer within", outcome.Message);
+            StringAssert.Contains("may have been applied", outcome.Message);
+            Assert.AreEqual(0, delays.Count);
+        }
+
+        [Test]
+        public void Stopping_the_wait_frees_the_lock_and_says_the_change_may_still_be_applied()
+        {
+            var (coordinator, transport, _) = Bridge();
+            coordinator.ClientSettingsApplyTimeout = TimeSpan.FromMinutes(5);
+            transport.BridgeInfoHandler = FakeRemoteTransport.NeverAnswers;
+            using (var stop = new CancellationTokenSource(TimeSpan.FromMilliseconds(100)))
+            {
+                var outcome = coordinator.ApplyVrchatClientSettingsAsync(VrchatClientSettings.Reload(1), null, null, stop.Token)
+                    .GetAwaiter().GetResult();
+
+                Assert.IsFalse(outcome.Applied);
+                StringAssert.Contains("Stopped waiting", outcome.Message);
+                Assert.IsFalse(coordinator.IsRunning);
+            }
+        }
+
+        [Test]
+        public void Nothing_is_written_when_the_Bridge_mode_is_no_longer_the_confirmed_one()
+        {
+            var (coordinator, transport, _) = Bridge();
+
+            var outcome = coordinator.ApplyVrchatClientSettingsAsync(VrchatClientSettings.Reload(2), "Reload")
+                .GetAwaiter().GetResult();
+
+            Assert.IsFalse(outcome.Applied);
+            StringAssert.Contains("mode is now Relaunch, not Reload", outcome.Message);
+            Assert.AreEqual(0, transport.PutConfigCalls);
         }
 
         [TestCase(409, "{\"error\":\"vrchatRunning\",\"problems\":[\"VrchatClientMode was not changed: 1 other VRChat\"],\"closed\":0}",
@@ -226,10 +288,9 @@ namespace VRCRemoteTest.Tests
         public void A_refused_change_says_why_and_waits_for_nothing(int status, string body, string expected)
         {
             var (coordinator, transport, delays) = Bridge();
-            transport.BridgeInfoResponses.Enqueue(FakeRemoteTransport.Json(200, Info(1)));
             transport.PutConfigResponse = FakeRemoteTransport.Json(status, body);
 
-            var outcome = coordinator.ApplyVrchatClientSettingsAsync(VrchatClientSettings.Relaunch(new[] { 0, 1, 2, 3 }))
+            var outcome = coordinator.ApplyVrchatClientSettingsAsync(VrchatClientSettings.Relaunch(new[] { 0, 1, 2, 3 }), "Relaunch")
                 .GetAwaiter().GetResult();
 
             Assert.IsFalse(outcome.Applied);
@@ -259,7 +320,6 @@ namespace VRCRemoteTest.Tests
         public void An_etag_with_unsafe_characters_is_not_sent_back()
         {
             var (coordinator, transport, _) = Bridge();
-            transport.BridgeInfoResponses.Enqueue(FakeRemoteTransport.Json(200, Info(1)));
             transport.ConfigResponse = FakeRemoteTransport.Json(200, "{\"etag\":\"abc\\r\\nX-Evil: 1\"}");
 
             var outcome = coordinator.ApplyVrchatClientSettingsAsync(VrchatClientSettings.Reload(1))
@@ -294,6 +354,21 @@ namespace VRCRemoteTest.Tests
 
             Assert.IsFalse(outcome.Applied);
             StringAssert.Contains("did not confirm closing", outcome.Message);
+        }
+
+        [Test]
+        public void A_problem_reported_with_a_successful_close_is_shown()
+        {
+            var (coordinator, transport, _) = Bridge();
+            transport.CloseResponse = FakeRemoteTransport.Json(200,
+                "{\"closed\":2,\"notConfirmed\":0,\"othersRunning\":0,"
+                + "\"problem\":\"The Bridge could not update its record of the clients it launched.\"}");
+
+            var outcome = coordinator.CloseVrchatClientsAsync().GetAwaiter().GetResult();
+
+            Assert.IsTrue(outcome.Applied, outcome.Message);
+            CollectionAssert.AreEqual(
+                new[] { "The Bridge could not update its record of the clients it launched." }, outcome.Details);
         }
 
         [Test]

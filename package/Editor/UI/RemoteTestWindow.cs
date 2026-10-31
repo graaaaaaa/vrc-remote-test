@@ -88,7 +88,9 @@ namespace VRCRemoteTest
 
         // The "VRChat Clients" part of the Bridge section. The fields are edited freely; what
         // decides which controls are drawn (the mode, the parsed profiles, the status of an
-        // apply, the profile accounts) is taken over at a Layout event only.
+        // apply, the profile accounts) is taken over at a Layout event only. A script reload
+        // keeps the edited fields but not the state of an operation, whose await does not
+        // survive it: those fields are [NonSerialized] (Unity restores private fields).
         private const double ProfilesRefreshSeconds = 15.0;
         private bool _clientFieldsEdited;
         private int _clientModeIndex;
@@ -97,17 +99,18 @@ namespace VRCRemoteTest
         private string _clientProfilesText = string.Empty;
         private VrchatClientSettings _activeClientSettings;
         private VrchatClientSettings _desiredClientSettings;
-        private string _clientFieldsProblem;
-        private bool _clientOperationRunning;
-        private string _clientOperationStatus;
+        [NonSerialized] private string _clientFieldsProblem;
+        [NonSerialized] private bool _clientOperationRunning;
+        [NonSerialized] private string _clientOperationStatus;
+        [NonSerialized] private CancellationTokenSource _clientOperationCts;
         private VrchatClientSettingsOutcome _clientOutcome;
         private BridgeProfiles _profiles;
         private BridgeProfiles _loadedProfiles;
-        private bool _profilesLoading;
-        private double _lastProfilesRead = double.NegativeInfinity;
-        private string _shownClientStatus;
+        [NonSerialized] private bool _profilesLoading;
+        [NonSerialized] private double _lastProfilesRead = double.NegativeInfinity;
+        [NonSerialized] private string _shownClientStatus;
         private VrchatClientSettingsOutcome _shownClientOutcome;
-        private bool _shownClientOperationRunning;
+        [NonSerialized] private bool _shownClientOperationRunning;
         private VrchatClientSettings _awaitingAppliedSettings;
 
         private bool _bridgeConfigured;
@@ -160,6 +163,9 @@ namespace VRCRemoteTest
             _cts?.Cancel();
             _cts?.Dispose();
             _cts = null;
+
+            // Stops waiting for a settings change, so the build lock is not held for a closed window.
+            _clientOperationCts?.Cancel();
         }
 
         /// <summary>
@@ -421,6 +427,14 @@ namespace VRCRemoteTest
             if (_shownClientOperationRunning)
             {
                 EditorGUILayout.HelpBox(_shownClientStatus ?? "Working...", MessageType.Info);
+                using (new EditorGUI.DisabledScope(_clientOperationCts == null || _clientOperationCts.IsCancellationRequested))
+                {
+                    if (GUILayout.Button(new GUIContent("Stop waiting",
+                            "Stops waiting and frees Remote Build. A change the Bridge already accepted is still applied.")))
+                    {
+                        _clientOperationCts?.Cancel();
+                    }
+                }
             }
             else if (_shownClientOutcome != null)
             {
@@ -521,27 +535,32 @@ namespace VRCRemoteTest
             }
         }
 
+        /// <summary>
+        /// Asked on every apply, not only when the cached mode differs: the Bridge may have been
+        /// changed meanwhile, and the coordinator refuses to write when its mode is no longer the
+        /// one confirmed here.
+        /// </summary>
         private void ConfirmAndApplyClientSettings(VrchatClientSettings active, VrchatClientSettings desired)
         {
-            if (VrchatClientsView.ClosesClients(active, desired)
-                && !EditorUtility.DisplayDialog(
-                    "Change VRChat client mode",
-                    $"Changing to {desired.Mode} mode closes the VRChat clients the Bridge launched, then restarts the Bridge. "
-                    + "The Bridge refuses if any other VRChat is running on Windows. The next deploy launches "
-                    + desired.Describe() + ".",
-                    "Apply", "Cancel"))
+            var message = VrchatClientsView.ClosesClients(active, desired)
+                ? $"Apply {desired.Describe()} and restart the Bridge? Changing from {active.Mode} to {desired.Mode} mode "
+                  + "first closes the VRChat clients the Bridge launched; the Bridge refuses while another VRChat runs on Windows."
+                : $"Apply {desired.Describe()} and restart the Bridge? The next deploy launches these clients.";
+            if (!EditorUtility.DisplayDialog("Apply VRChat client settings", message, "Apply", "Cancel"))
             {
                 return;
             }
 
-            StartApplyClientSettings(desired);
+            StartApplyClientSettings(desired, active.Mode);
         }
 
-        private async void StartApplyClientSettings(VrchatClientSettings desired)
+        private async void StartApplyClientSettings(VrchatClientSettings desired, string confirmedActiveMode)
         {
             _clientOperationRunning = true;
             _clientOperationStatus = "Applying " + desired.Describe() + "...";
             _clientOutcome = null;
+            _clientOperationCts?.Dispose();
+            _clientOperationCts = new CancellationTokenSource();
             var progress = new Progress<string>(message =>
             {
                 _clientOperationStatus = message;
@@ -551,7 +570,8 @@ namespace VRCRemoteTest
             VrchatClientSettingsOutcome outcome;
             try
             {
-                outcome = await RemoteBuildCommand.GetCoordinator().ApplyVrchatClientSettingsAsync(desired, progress);
+                outcome = await RemoteBuildCommand.GetCoordinator().ApplyVrchatClientSettingsAsync(
+                    desired, confirmedActiveMode, progress, _clientOperationCts.Token);
             }
             catch (Exception ex)
             {
@@ -600,6 +620,8 @@ namespace VRCRemoteTest
         {
             _clientOperationRunning = false;
             _clientOutcome = outcome;
+            _clientOperationCts?.Dispose();
+            _clientOperationCts = null;
 
             // The section reads the Bridge again at the next Layout, so a restarted host's
             // settings and notes show at once.

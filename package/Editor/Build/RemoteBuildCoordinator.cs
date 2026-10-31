@@ -78,10 +78,23 @@ namespace VRCRemoteTest
 
         // === VRChat clients: the Bridge's management API (v0.8.0 and later) ===
 
-        /// <summary>How long a settings change waits for the restarted host to report it (as scripts/vrcrt.sh).</summary>
-        internal static TimeSpan ClientSettingsApplyTimeout = TimeSpan.FromSeconds(90);
+        // Deadlines of a settings change, each for one step, so the build lock is held for at
+        // most about 2.5 minutes even when the Bridge stops answering (each management call
+        // would otherwise wait up to LanRemoteTransport's 2 minutes). The tests shorten them.
 
-        internal static TimeSpan ClientSettingsPollInterval = TimeSpan.FromSeconds(2);
+        /// <summary>GET /config before the change.</summary>
+        internal TimeSpan ClientSettingsReadTimeout { get; set; } = TimeSpan.FromSeconds(10);
+
+        /// <summary>PUT /config: closing the clients the Bridge launched, when the mode changes, takes up to 20 s.</summary>
+        internal TimeSpan ClientSettingsWriteTimeout { get; set; } = TimeSpan.FromSeconds(45);
+
+        /// <summary>From the accepted change until the restarted host reports it (as scripts/vrcrt.sh).</summary>
+        internal TimeSpan ClientSettingsApplyTimeout { get; set; } = TimeSpan.FromSeconds(90);
+
+        internal TimeSpan ClientSettingsPollInterval { get; set; } = TimeSpan.FromSeconds(2);
+
+        /// <summary>One GET /bridge while waiting; a slow answer is retried at the next poll.</summary>
+        internal TimeSpan ClientSettingsPollRequestTimeout { get; set; } = TimeSpan.FromSeconds(5);
 
         /// <summary>Replaced by the tests so that waiting for a restart takes no time.</summary>
         internal Func<TimeSpan, CancellationToken, Task> Delay { get; set; } = Task.Delay;
@@ -97,12 +110,15 @@ namespace VRCRemoteTest
         /// Writes <paramref name="settings"/> into the Bridge's config.json (PUT /config with the
         /// etag just read) and waits for the restarted host to report it applied, rolled back or
         /// failed. The Bridge validates the change against its own rules, closes the clients it
-        /// launched first when the mode changes, and refuses when any other VRChat runs. Holds
-        /// the same lock as a build, so neither can start while the other runs; nothing here
-        /// reads EditorPrefs.
+        /// launched first when the mode changes, and refuses when any other VRChat runs. When
+        /// <paramref name="expectedActiveMode"/> is given (the mode the user saw when confirming),
+        /// nothing is written unless the running host still has that mode, which narrows the
+        /// race with another change; only the Bridge could close it completely. Holds the same
+        /// lock as a build, so neither can start while the other runs; nothing here reads
+        /// EditorPrefs. Cancelling stops the wait, not a change the Bridge already accepted.
         /// </summary>
         public async Task<VrchatClientSettingsOutcome> ApplyVrchatClientSettingsAsync(
-            VrchatClientSettings settings, IProgress<string> progress = null,
+            VrchatClientSettings settings, string expectedActiveMode = null, IProgress<string> progress = null,
             CancellationToken cancellationToken = default)
         {
             if (settings == null)
@@ -117,12 +133,14 @@ namespace VRCRemoteTest
 
             try
             {
-                return await ApplyVrchatClientSettingsCoreAsync(settings, progress, cancellationToken).ConfigureAwait(false);
+                return await ApplyVrchatClientSettingsCoreAsync(settings, expectedActiveMode, progress, cancellationToken)
+                    .ConfigureAwait(false);
             }
             catch (OperationCanceledException)
             {
                 return VrchatClientSettingsOutcome.Failure(
-                    "Stopped waiting. A change the Bridge already accepted may still be applied; see the Bridge section.");
+                    "Stopped waiting. A change the Bridge already accepted may still be applied, and VRChat clients "
+                    + "may have closed; see the Bridge section before applying again.");
             }
             finally
             {
@@ -131,25 +149,41 @@ namespace VRCRemoteTest
         }
 
         private async Task<VrchatClientSettingsOutcome> ApplyVrchatClientSettingsCoreAsync(
-            VrchatClientSettings settings, IProgress<string> progress, CancellationToken cancellationToken)
+            VrchatClientSettings settings, string expectedActiveMode, IProgress<string> progress,
+            CancellationToken cancellationToken)
         {
             progress?.Report("Reading the Bridge's settings...");
-            var infoResponse = await _transport.GetBridgeInfoAsync(cancellationToken).ConfigureAwait(false);
-            var info = infoResponse.IsSuccess ? infoResponse.As<BridgeInfo>() : null;
-            if (info == null)
-            {
-                return VrchatClientSettingsOutcome.Failure(AdminFailure("read the Bridge's state", infoResponse));
-            }
-
-            var configResponse = await _transport.GetConfigAsync(cancellationToken).ConfigureAwait(false);
+            var configResponse = await CallWithin(_transport.GetConfigAsync, ClientSettingsReadTimeout, cancellationToken)
+                .ConfigureAwait(false);
             var etag = configResponse.IsSuccess ? StringMember(configResponse.Body, "etag") : null;
             if (etag == null)
             {
                 return VrchatClientSettingsOutcome.Failure(AdminFailure("read config.json", configResponse));
             }
 
+            // "active" is what the running host was started with, read with the etag just used.
+            if (expectedActiveMode != null)
+            {
+                var active = VrchatClientSettings.FromActiveConfig(ParseObjectOrNull(configResponse.Body)?["active"] as JObject);
+                if (active == null || active.Mode != expectedActiveMode)
+                {
+                    return VrchatClientSettingsOutcome.Failure(
+                        "The Bridge's mode is now " + (active?.Mode ?? "unknown") + ", not " + expectedActiveMode
+                        + " as when you confirmed, so nothing was written. Check its settings and apply again.");
+                }
+            }
+
             progress?.Report("Writing " + settings.Describe() + "...");
-            var put = await _transport.PutConfigAsync(etag, settings.ToMergePatch(), cancellationToken).ConfigureAwait(false);
+            var put = await CallWithin(token => _transport.PutConfigAsync(etag, settings.ToMergePatch(), token),
+                ClientSettingsWriteTimeout, cancellationToken).ConfigureAwait(false);
+            if (put.Supported && put.StatusCode == 0)
+            {
+                // Sent, but no answer: the Bridge may have closed clients and written the change.
+                return VrchatClientSettingsOutcome.Failure(
+                    "The Bridge did not answer the change: " + BridgeMessages.Sanitize(put.Message, 200)
+                    + " It may have been applied, and VRChat clients may have closed; see the Bridge section before applying again.");
+            }
+
             var operationId = put.StatusCode == 202 ? StringMember(put.Body, "operationId") : null;
             if (operationId == null)
             {
@@ -157,37 +191,87 @@ namespace VRCRemoteTest
             }
 
             progress?.Report("config.json written; waiting for the Bridge to restart...");
-            var polls = Math.Max(1, (int)Math.Ceiling(ClientSettingsApplyTimeout.TotalSeconds
-                                                      / Math.Max(0.001, ClientSettingsPollInterval.TotalSeconds)));
-            for (var i = 0; i < polls; i++)
+            using (var applyDeadline = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken))
             {
-                await Delay(ClientSettingsPollInterval, cancellationToken).ConfigureAwait(false);
-
-                // No answer while the host restarts is expected.
-                var response = await _transport.GetBridgeInfoAsync(cancellationToken).ConfigureAwait(false);
-                var now = response.IsSuccess ? response.As<BridgeInfo>() : null;
-                var last = now?.LastConfigApply;
-                if (now == null || now.HostGeneration <= info.HostGeneration
-                    || last == null || last.OperationId != operationId || last.Outcome == "pending")
+                applyDeadline.CancelAfter(ClientSettingsApplyTimeout);
+                try
                 {
-                    continue;
+                    while (true)
+                    {
+                        await Delay(ClientSettingsPollInterval, applyDeadline.Token).ConfigureAwait(false);
+
+                        // No answer while the host restarts is expected. The outcome is kept by the
+                        // Bridge across restarts and written only once a host has started (or none
+                        // could), so our operation id with a final outcome is the answer; the host
+                        // generation is not compared, as it starts again at 1 in a new process.
+                        var response = await CallWithin(_transport.GetBridgeInfoAsync, ClientSettingsPollRequestTimeout,
+                            applyDeadline.Token).ConfigureAwait(false);
+                        var now = response.IsSuccess ? response.As<BridgeInfo>() : null;
+                        var last = now?.LastConfigApply;
+                        if (last == null || last.OperationId != operationId
+                            || string.IsNullOrEmpty(last.Outcome) || last.Outcome == "pending")
+                        {
+                            continue;
+                        }
+
+                        return ApplyOutcome(settings, last, now.ConfigNotes);
+                    }
                 }
-
-                if (last.Outcome == "applied")
+                catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
                 {
+                    return VrchatClientSettingsOutcome.Failure(
+                        "The Bridge did not report the change within " + ClientSettingsApplyTimeout.TotalSeconds
+                        + " s. It may still be applied; see the Bridge section, or run scripts/vrcrt.sh doctor.");
+                }
+            }
+        }
+
+        /// <summary>What the Bridge's final lastConfigApply means for the user; its problems go into the details.</summary>
+        internal static VrchatClientSettingsOutcome ApplyOutcome(VrchatClientSettings settings, BridgeConfigApply last,
+            IEnumerable<string> notes)
+        {
+            switch (last.Outcome)
+            {
+                case "applied":
                     return VrchatClientSettingsOutcome.Success(
                         "Applied: " + settings.Describe() + ". The next Remote Build & Test or Deploy Last Build uses it.",
-                        now.ConfigNotes);
-                }
-
-                return VrchatClientSettingsOutcome.Failure(
-                    "The Bridge did not apply the change (" + BridgeMessages.Sanitize(last.Outcome, 40)
-                    + ") and runs with its previous settings.", last.Problems);
+                        notes);
+                case "rolledBack":
+                    return VrchatClientSettingsOutcome.Failure(
+                        "The Bridge could not start with the change and restored its previous config.json. "
+                        + "Check its current settings.", last.Problems);
+                case "failed":
+                    return VrchatClientSettingsOutcome.Failure(
+                        "The Bridge reported that the change failed. Check its current settings and the details below.",
+                        last.Problems);
+                default:
+                    return VrchatClientSettingsOutcome.Failure(
+                        "The Bridge reported an outcome this package does not know (" + BridgeMessages.Sanitize(last.Outcome, 40)
+                        + "). Check its current settings.", last.Problems);
             }
+        }
 
-            return VrchatClientSettingsOutcome.Failure(
-                "The Bridge did not report the change within " + ClientSettingsApplyTimeout.TotalSeconds
-                + " s. See the Bridge section, or run scripts/vrcrt.sh doctor.");
+        /// <summary>
+        /// One management call with its own deadline. A deadline that passes is an answer like
+        /// any unreachable Bridge (status 0); cancellation of <paramref name="cancellationToken"/>
+        /// is thrown.
+        /// </summary>
+        private static async Task<BridgeAdminResponse> CallWithin(
+            Func<CancellationToken, Task<BridgeAdminResponse>> call, TimeSpan timeout, CancellationToken cancellationToken)
+        {
+            using (var deadline = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken))
+            {
+                deadline.CancelAfter(timeout);
+                try
+                {
+                    return await call(deadline.Token).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+                {
+                    return BridgeAdminResponse.Unreachable(
+                        "The Windows Bridge did not answer within " + timeout.TotalSeconds + " s.");
+                }
+            }
         }
 
         /// <summary>
@@ -206,11 +290,13 @@ namespace VRCRemoteTest
                 var response = await _transport.CloseClientsAsync(cancellationToken).ConfigureAwait(false);
                 var body = response.Supported && response.StatusCode != 0 ? ParseObjectOrNull(response.Body) : null;
                 var closed = BridgeMessages.ByteCount(body?["closed"]);
+
+                // Also on success: the clients closed, but the Bridge may not have updated its record of them.
+                var problem = body?["problem"]?.Type == JTokenType.String ? (string)body["problem"] : null;
+                var details = string.IsNullOrWhiteSpace(problem) ? null : new[] { problem };
                 if (!response.IsSuccess || closed == null)
                 {
-                    var problem = body?["problem"]?.Type == JTokenType.String ? (string)body["problem"] : null;
-                    return VrchatClientSettingsOutcome.Failure(AdminFailure("close the VRChat clients", response),
-                        problem == null ? null : new[] { problem });
+                    return VrchatClientSettingsOutcome.Failure(AdminFailure("close the VRChat clients", response), details);
                 }
 
                 var notConfirmed = BridgeMessages.ByteCount(body["notConfirmed"]) ?? 0;
@@ -227,8 +313,8 @@ namespace VRCRemoteTest
                 }
 
                 return notConfirmed > 0
-                    ? VrchatClientSettingsOutcome.Failure(message)
-                    : VrchatClientSettingsOutcome.Success(message, null);
+                    ? VrchatClientSettingsOutcome.Failure(message, details)
+                    : VrchatClientSettingsOutcome.Success(message, details);
             }
             catch (OperationCanceledException)
             {

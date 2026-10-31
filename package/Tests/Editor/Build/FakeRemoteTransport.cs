@@ -108,11 +108,29 @@ namespace VRCRemoteTest.Tests
 
         public string LastPutPatch { get; private set; }
 
+        /// <summary>When set, answers GET /bridge instead of <see cref="BridgeInfoResponses"/>, e.g. never until cancelled.</summary>
+        public Func<CancellationToken, Task<BridgeAdminResponse>> BridgeInfoHandler { get; set; }
+
+        /// <summary>When set, answers PUT /config instead of <see cref="PutConfigResponse"/>.</summary>
+        public Func<CancellationToken, Task<BridgeAdminResponse>> PutConfigHandler { get; set; }
+
+        /// <summary>An answer that comes only when the call is cancelled, like a Bridge that stopped answering.</summary>
+        public static async Task<BridgeAdminResponse> NeverAnswers(CancellationToken cancellationToken)
+        {
+            await Task.Delay(Timeout.Infinite, cancellationToken).ConfigureAwait(false);
+            throw new InvalidOperationException("unreachable");
+        }
+
         private BridgeAdminResponse _lastBridgeInfo;
 
         public Task<BridgeAdminResponse> GetBridgeInfoAsync(CancellationToken cancellationToken = default)
         {
             BridgeInfoCalls++;
+            if (BridgeInfoHandler != null)
+            {
+                return BridgeInfoHandler(cancellationToken);
+            }
+
             if (BridgeInfoResponses.Count > 0)
             {
                 _lastBridgeInfo = BridgeInfoResponses.Dequeue();
@@ -131,7 +149,7 @@ namespace VRCRemoteTest.Tests
             PutConfigCalls++;
             LastPutEtag = etag;
             LastPutPatch = mergePatchJson;
-            return Answer(PutConfigResponse);
+            return PutConfigHandler != null ? PutConfigHandler(cancellationToken) : Answer(PutConfigResponse);
         }
 
         public Task<BridgeAdminResponse> RestartBridgeAsync(CancellationToken cancellationToken = default) => NotSupported();
