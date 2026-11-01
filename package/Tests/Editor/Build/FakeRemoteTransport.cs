@@ -79,21 +79,81 @@ namespace VRCRemoteTest.Tests
 
         public BridgeInfo PollBridgeInfo() => BridgeInfoToReturn;
 
-        // No management API: the answer every transport without it gives.
+        // Management API answers. Left unset, a call gets the answer every transport without
+        // the API gives.
         private static Task<BridgeAdminResponse> NotSupported() =>
             Task.FromResult(BridgeAdminResponse.NotSupported(nameof(FakeRemoteTransport)));
 
-        public Task<BridgeAdminResponse> GetBridgeInfoAsync(CancellationToken cancellationToken = default) => NotSupported();
+        private static Task<BridgeAdminResponse> Answer(BridgeAdminResponse response) =>
+            response == null ? NotSupported() : Task.FromResult(response);
 
-        public Task<BridgeAdminResponse> GetProfilesAsync(CancellationToken cancellationToken = default) => NotSupported();
+        public static BridgeAdminResponse Json(int status, string body) => new BridgeAdminResponse(true, status, body, null);
 
-        public Task<BridgeAdminResponse> GetConfigAsync(CancellationToken cancellationToken = default) => NotSupported();
+        /// <summary>Answers to successive GET /bridge calls; the last one repeats.</summary>
+        public Queue<BridgeAdminResponse> BridgeInfoResponses { get; } = new Queue<BridgeAdminResponse>();
+
+        public int BridgeInfoCalls { get; private set; }
+
+        public BridgeAdminResponse ProfilesResponse { get; set; }
+
+        public BridgeAdminResponse ConfigResponse { get; set; }
+
+        public BridgeAdminResponse PutConfigResponse { get; set; }
+
+        public BridgeAdminResponse CloseResponse { get; set; }
+
+        public int PutConfigCalls { get; private set; }
+
+        public string LastPutEtag { get; private set; }
+
+        public string LastPutPatch { get; private set; }
+
+        /// <summary>When set, answers GET /bridge instead of <see cref="BridgeInfoResponses"/>, e.g. never until cancelled.</summary>
+        public Func<CancellationToken, Task<BridgeAdminResponse>> BridgeInfoHandler { get; set; }
+
+        /// <summary>When set, answers PUT /config instead of <see cref="PutConfigResponse"/>.</summary>
+        public Func<CancellationToken, Task<BridgeAdminResponse>> PutConfigHandler { get; set; }
+
+        /// <summary>An answer that comes only when the call is cancelled, like a Bridge that stopped answering.</summary>
+        public static async Task<BridgeAdminResponse> NeverAnswers(CancellationToken cancellationToken)
+        {
+            await Task.Delay(Timeout.Infinite, cancellationToken).ConfigureAwait(false);
+            throw new InvalidOperationException("unreachable");
+        }
+
+        private BridgeAdminResponse _lastBridgeInfo;
+
+        public Task<BridgeAdminResponse> GetBridgeInfoAsync(CancellationToken cancellationToken = default)
+        {
+            BridgeInfoCalls++;
+            if (BridgeInfoHandler != null)
+            {
+                return BridgeInfoHandler(cancellationToken);
+            }
+
+            if (BridgeInfoResponses.Count > 0)
+            {
+                _lastBridgeInfo = BridgeInfoResponses.Dequeue();
+            }
+
+            return Answer(_lastBridgeInfo);
+        }
+
+        public Task<BridgeAdminResponse> GetProfilesAsync(CancellationToken cancellationToken = default) => Answer(ProfilesResponse);
+
+        public Task<BridgeAdminResponse> GetConfigAsync(CancellationToken cancellationToken = default) => Answer(ConfigResponse);
 
         public Task<BridgeAdminResponse> PutConfigAsync(string etag, string mergePatchJson,
-            CancellationToken cancellationToken = default) => NotSupported();
+            CancellationToken cancellationToken = default)
+        {
+            PutConfigCalls++;
+            LastPutEtag = etag;
+            LastPutPatch = mergePatchJson;
+            return PutConfigHandler != null ? PutConfigHandler(cancellationToken) : Answer(PutConfigResponse);
+        }
 
         public Task<BridgeAdminResponse> RestartBridgeAsync(CancellationToken cancellationToken = default) => NotSupported();
 
-        public Task<BridgeAdminResponse> CloseClientsAsync(CancellationToken cancellationToken = default) => NotSupported();
+        public Task<BridgeAdminResponse> CloseClientsAsync(CancellationToken cancellationToken = default) => Answer(CloseResponse);
     }
 }

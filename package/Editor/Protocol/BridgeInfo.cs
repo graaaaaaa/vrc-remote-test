@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using Newtonsoft.Json;
+using Newtonsoft.Json.Linq;
 
 namespace VRCRemoteTest
 {
@@ -30,6 +31,13 @@ namespace VRCRemoteTest
 
         [JsonProperty("savedConfigEtag")]
         public string SavedConfigEtag { get; set; }
+
+        /// <summary>
+        /// The settings the running host was started with, keyed by their config.json names
+        /// (VrchatClientMode, VrchatProfiles, ...). Read through VrchatClientSettings.FromActiveConfig.
+        /// </summary>
+        [JsonProperty("activeConfig")]
+        public JObject ActiveConfig { get; set; }
 
         /// <summary>The last configuration change made through the LAN API, or null.</summary>
         [JsonProperty("lastConfigApply")]
@@ -65,5 +73,43 @@ namespace VRCRemoteTest
 
         [JsonProperty("atUtc")]
         public DateTimeOffset? AtUtc { get; set; }
+    }
+
+    /// <summary>
+    /// Wire format for GET /api/v1/profiles (Bridge v0.8.0 and later): the account each VRChat
+    /// profile's client last logged in to, as the Bridge saw it in the client's log. A profile
+    /// whose client has not run under the Bridge is not listed.
+    /// </summary>
+    [Serializable]
+    public sealed class BridgeProfiles
+    {
+        /// <summary>VrchatProfiles of the running host; null in Reload mode.</summary>
+        [JsonProperty("configuredProfiles")]
+        public List<int> ConfiguredProfiles { get; set; }
+
+        [JsonProperty("profiles")]
+        public List<BridgeProfileAccount> Profiles { get; set; }
+
+        /// <summary>For example two configured profiles logged in to one account; untrusted text.</summary>
+        [JsonProperty("warnings")]
+        public List<string> Warnings { get; set; }
+    }
+
+    [Serializable]
+    public sealed class BridgeProfileAccount
+    {
+        [JsonProperty("profile")]
+        public int Profile { get; set; }
+
+        /// <summary>Untrusted: the name in the log, masked by the Bridge.</summary>
+        [JsonProperty("displayName")]
+        public string DisplayName { get; set; }
+
+        /// <summary>Equal values mean the same account on this Bridge.</summary>
+        [JsonProperty("idDigest")]
+        public string IdDigest { get; set; }
+
+        [JsonProperty("authenticatedAtUtc")]
+        public DateTimeOffset? AuthenticatedAtUtc { get; set; }
     }
 }

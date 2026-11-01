@@ -35,6 +35,7 @@ Windows Bridge の実行体（`VRCRemoteTest.Bridge.exe`）は、[Releases](http
 - **Deploy Last Build**: 直前のビルドを再配置（コード変更なしでVRChat側だけ再テストしたい場合）
 - **Preflight**: Bridge接続・SDK・VRChatの状態を常時表示
 - **VRChat Log**: WindowsのVRChatログをリアルタイム表示・カテゴリフィルタ。台ごとのログと、ワールドが出すマーカー行（`[VRCRT]` などで始まる行）を台を切り替えて表示
+- **VRChat Clients**（Bridge 0.8.0 以降）: Bridge が起動する VRChat の台数とアカウントを選び、`Apply to Bridge` で Windows の config.json に書く。Reload（同じアカウントで1〜4台）か、Relaunch（profile ごとに別のアカウント、例 `0, 1, 2, 3` で4台）を選ぶ。profile ごとに最後にログインしたアカウントも表示する。Bridge は起動し直して設定を確かめ、次の配置から新しい台で起動する。モードを変えると Bridge が起動した台を閉じる（手で起動した VRChat があれば断る）。`Close Bridge's VRChat` で Bridge が起動した台を閉じられる
 - **Moonlight連携**: リモートデスクトップでWindows画面を見ている場合、ボタン一つでMoonlightを前面表示
 
 詳しい機能一覧は [`package/README.md`](./package/README.md) を参照してください。

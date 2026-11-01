@@ -1,5 +1,16 @@
 # Changelog
 
+## [Unreleased]
+
+Choosing the VRChat clients from the Unity window. **Update the Unity package only**: it uses the management API of the Bridge v0.8.0 and later, which is unchanged.
+
+### Added (Unity)
+
+- The Remote Test window's Bridge section gains "VRChat Clients": the Bridge's current client settings, a mode (Reload: one account, 1 to 4 clients; Relaunch: one client per VRChat profile, e.g. `0, 1, 2, 3` for four accounts), and `Apply to Bridge`, which writes `VrchatClientMode`, `VrchatClientCount` and `VrchatProfiles` through `PUT /api/v1/config` with the etag just read, then waits up to 90 s for the restarted Bridge host to report the change applied, rolled back or failed, and shows its problems or notes. Every apply asks first and says when the Bridge will close the clients it launched (a mode change; it refuses while any other VRChat runs); nothing is written when the running Bridge's mode is no longer the one confirmed. Each step has its own deadline (reading 10 s, writing 45 s, the restart 90 s), so the window is never held longer than about 2.5 minutes by a Bridge that stops answering, and `Stop waiting` ends the wait at once; either way the result says that a change the Bridge accepted may still be applied. The mode is a pair of buttons, not a popup (the editor once crashed inside the popup's native menu on the Mac), and the Bridge section is repainted every 2.5 s, so its rows no longer change only when the next click redraws the window and move the control under the pointer; the Slot rows stay up to 60 s after the clients list stops updating, instead of 15 s. A profile the Bridge has not launched yet reads "account not seen yet", since a login made by hand is seen only once the Bridge launches it.
+- For Relaunch, each listed profile shows the account it last logged in to (`GET /api/v1/profiles`), or how to log it in on Windows once, plus the Bridge's warning when two profiles share an account. Three or more clients with a Result Timeout under 180 s get a warning.
+- `Close Bridge's VRChat` closes the clients the Bridge launched (`POST /api/v1/clients/close`), e.g. so that a new Reload count is launched by the next deploy.
+- `RemoteBuildCoordinator.ApplyVrchatClientSettingsAsync` and `CloseVrchatClientsAsync` hold the same lock as a build, so a build and a settings change never overlap; `GetVrchatProfilesAsync` only reads.
+
 ## [0.8.1] - 2026-10-31
 
 Fixes replacing the Windows Bridge with `scripts/install-bridge.ps1`, which stopped twice during the 0.7.1 → 0.8.0 update on 2026-10-31. The Bridge and the Unity package have no functional changes, but the Remote Test window warns while their versions differ, so **update both the Windows Bridge** (`docs/setup-windows.md`, step 1, "版を入れ替える", with the fixed script) **and the Unity package**. An existing `config.json` and pairing keep working.

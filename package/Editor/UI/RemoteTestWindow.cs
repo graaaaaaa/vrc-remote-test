@@ -84,7 +84,39 @@ namespace VRCRemoteTest
         private BridgeInfo _bridgeInfo;
         private VrchatClients _bridgeClients;
         private double _lastBridgeSectionRead = double.NegativeInfinity;
+        [NonSerialized] private double _lastBridgeRepaintTime = double.NegativeInfinity;
         private static string _packageVersion;
+
+        // Longer than ClientLogView.StaleAfter: the Slot rows come and go with the list, and
+        // every change moves the controls below them, so a list a few reads late still shows.
+        private static readonly TimeSpan BridgeClientRowsStaleAfter = TimeSpan.FromSeconds(60);
+
+        // The "VRChat Clients" part of the Bridge section. The fields are edited freely; what
+        // decides which controls are drawn (the mode, the parsed profiles, the status of an
+        // apply, the profile accounts) is taken over at a Layout event only. A script reload
+        // keeps the edited fields but not the state of an operation, whose await does not
+        // survive it: those fields are [NonSerialized] (Unity restores private fields).
+        private const double ProfilesRefreshSeconds = 15.0;
+        private bool _clientFieldsEdited;
+        private int _clientModeIndex;
+        private int _requestedClientModeIndex;
+        private int _clientCount = 1;
+        private string _clientProfilesText = string.Empty;
+        private VrchatClientSettings _activeClientSettings;
+        private VrchatClientSettings _desiredClientSettings;
+        [NonSerialized] private string _clientFieldsProblem;
+        [NonSerialized] private bool _clientOperationRunning;
+        [NonSerialized] private string _clientOperationStatus;
+        [NonSerialized] private CancellationTokenSource _clientOperationCts;
+        private VrchatClientSettingsOutcome _clientOutcome;
+        private BridgeProfiles _profiles;
+        private BridgeProfiles _loadedProfiles;
+        [NonSerialized] private bool _profilesLoading;
+        [NonSerialized] private double _lastProfilesRead = double.NegativeInfinity;
+        [NonSerialized] private string _shownClientStatus;
+        private VrchatClientSettingsOutcome _shownClientOutcome;
+        [NonSerialized] private bool _shownClientOperationRunning;
+        private VrchatClientSettings _awaitingAppliedSettings;
 
         private bool _bridgeConfigured;
         private bool _bridgeReachable;
@@ -136,6 +168,9 @@ namespace VRCRemoteTest
             _cts?.Cancel();
             _cts?.Dispose();
             _cts = null;
+
+            // Stops waiting for a settings change, so the build lock is not held for a closed window.
+            _clientOperationCts?.Cancel();
         }
 
         /// <summary>
@@ -145,9 +180,20 @@ namespace VRCRemoteTest
         /// viewer a developer is actively watching needs a refresh even while
         /// the window isn't receiving input events (Codex plan review Phase
         /// 5, Round 2, confidence 0.90).
+        ///
+        /// The Bridge section is repainted on its own tick too. The Bridge's answers arrive in
+        /// the background, so without it the section changed only when the next input event
+        /// redrew the window — often the click itself, moving the control under the pointer.
         /// </summary>
         private void OnEditorUpdate()
         {
+            var now = EditorApplication.timeSinceStartup;
+            if (_showBridgeSection && now - _lastBridgeRepaintTime >= PreflightCheckIntervalSeconds)
+            {
+                _lastBridgeRepaintTime = now;
+                Repaint();
+            }
+
             if (!_logFoldout || !RemoteTestSettings.LogAutoRefresh)
             {
                 return;
@@ -240,9 +286,10 @@ namespace VRCRemoteTest
         }
 
         /// <summary>
-        /// Read-only: the Bridge's version (warned about when it differs from this
-        /// package's), its notes on the active configuration, and which account each running
-        /// client is logged in to. Changing the Bridge stays with scripts/vrcrt.sh.
+        /// The Bridge's version (warned about when it differs from this package's), its notes
+        /// on the active configuration, which account each running client is logged in to,
+        /// and the VRChat clients it launches (<see cref="DrawVrchatClientsSection"/>). Every
+        /// other Bridge setting stays with scripts/vrcrt.sh.
         /// </summary>
         private void DrawBridgeSection()
         {
@@ -267,32 +314,369 @@ namespace VRCRemoteTest
                 }
             }
 
-            if (_bridgeClients?.Clients == null)
+            if (_bridgeClients?.Clients != null)
             {
-                return;
+                foreach (var client in _bridgeClients.Clients
+                             .Where(c => c != null && c.Running != false
+                                 && c.Slot >= 0 && c.Slot < LanRemoteTransport.SlotCount)
+                             .OrderBy(c => c.Slot))
+                {
+                    var login = ClientLogView.DescribeLogin(client);
+                    if (login != null)
+                    {
+                        EditorGUILayout.LabelField($"Slot {client.Slot}", login);
+                    }
+                }
             }
 
-            foreach (var client in _bridgeClients.Clients
-                         .Where(c => c != null && c.Running != false
-                             && c.Slot >= 0 && c.Slot < LanRemoteTransport.SlotCount)
-                         .OrderBy(c => c.Slot))
+            if (_activeClientSettings != null)
             {
-                var login = ClientLogView.DescribeLogin(client);
-                if (login != null)
+                DrawVrchatClientsSection();
+            }
+        }
+
+        /// <summary>
+        /// Mode, client count or profiles, written into the Bridge's config.json through its
+        /// management API (v0.8.0 and later). The Bridge checks the change again, closes the
+        /// clients it launched when the mode changes (refusing while another VRChat runs), and
+        /// restarts its host; the next deploy launches the new clients. Shown only while the
+        /// Bridge reports settings this package can read.
+        /// </summary>
+        private void DrawVrchatClientsSection()
+        {
+            EditorGUILayout.Space();
+            EditorGUILayout.LabelField("VRChat Clients", EditorStyles.boldLabel);
+            EditorGUILayout.LabelField("Current", _activeClientSettings.Describe());
+
+            var busy = _clientOperationRunning || RemoteBuildCommand.GetCoordinator().IsRunning;
+            using (new EditorGUI.DisabledScope(busy))
+            {
+                // A toolbar, not a popup: on the Mac a popup opens a native menu, and the editor
+                // crashed inside it (ShowDelayedContextMenu) in the first hands-on check.
+                int mode;
+                using (new EditorGUILayout.HorizontalScope())
                 {
-                    EditorGUILayout.LabelField($"Slot {client.Slot}", login);
+                    EditorGUILayout.PrefixLabel(new GUIContent("Mode",
+                        "Reload: every client on one account, reloaded by --watch-worlds on each deploy. "
+                        + "Relaunch: one account per profile, all relaunched on each deploy."));
+                    mode = GUILayout.Toolbar(_clientModeIndex, VrchatClientsView.ModeLabels);
+                }
+
+                if (mode != _clientModeIndex)
+                {
+                    _requestedClientModeIndex = mode;
+                    MarkClientFieldsEdited();
+                    if (mode == 1 && string.IsNullOrWhiteSpace(_clientProfilesText))
+                    {
+                        _clientProfilesText = "0, 1";
+                    }
+                }
+
+                if (_clientModeIndex == 0)
+                {
+                    var count = EditorGUILayout.IntSlider("Clients", _clientCount, 1, VrchatClientSettings.MaxClients);
+                    if (count != _clientCount)
+                    {
+                        _clientCount = count;
+                        MarkClientFieldsEdited();
+                    }
+
+                    EditorGUILayout.HelpBox(
+                        "Every client is logged in to the same account (profile 0). They reload the world on each deploy.",
+                        MessageType.None);
+                }
+                else
+                {
+                    var text = EditorGUILayout.TextField(
+                        new GUIContent("Profiles", "VRChat profile numbers, in launch order, e.g. 0, 1, 2, 3"),
+                        _clientProfilesText);
+                    if (text != _clientProfilesText)
+                    {
+                        _clientProfilesText = text;
+                        MarkClientFieldsEdited();
+                    }
+
+                    DrawProfileAccounts();
+                }
+            }
+
+            if (_clientFieldsProblem != null)
+            {
+                EditorGUILayout.HelpBox(_clientFieldsProblem, MessageType.Error);
+            }
+
+            var clientsRunning = _bridgeClients?.Clients == null
+                ? (bool?)null
+                : _bridgeClients.Clients.Any(c => c != null && c.Running != false);
+            var reloadNote = VrchatClientsView.ReloadCountNote(_activeClientSettings, _desiredClientSettings, clientsRunning);
+            if (reloadNote != null)
+            {
+                EditorGUILayout.HelpBox(reloadNote, MessageType.Info);
+            }
+
+            if (VrchatClientsView.NeedsLongerTimeout(_desiredClientSettings, RemoteTestSettings.ResultTimeoutSeconds))
+            {
+                EditorGUILayout.HelpBox(
+                    $"Raise Result Timeout in Settings to {VrchatClientsView.RecommendedTimeoutSeconds} s or more: "
+                    + "3 or more clients take longer to close and start.",
+                    MessageType.Warning);
+            }
+
+            using (new EditorGUILayout.HorizontalScope())
+            {
+                var changed = _desiredClientSettings != null && !_desiredClientSettings.SameAs(_activeClientSettings);
+                using (new EditorGUI.DisabledScope(busy || !changed))
+                {
+                    if (GUILayout.Button("Apply to Bridge"))
+                    {
+                        ConfirmAndApplyClientSettings(_activeClientSettings, _desiredClientSettings);
+                    }
+                }
+
+                using (new EditorGUI.DisabledScope(busy || !_clientFieldsEdited))
+                {
+                    if (GUILayout.Button("Revert"))
+                    {
+                        _clientFieldsEdited = false;
+                        _awaitingAppliedSettings = null;
+                        _lastBridgeSectionRead = double.NegativeInfinity;
+                    }
+                }
+
+                using (new EditorGUI.DisabledScope(busy))
+                {
+                    if (GUILayout.Button(new GUIContent("Close Bridge's VRChat",
+                            "Closes the VRChat clients the Bridge launched; any other VRChat is left running.")))
+                    {
+                        StartCloseVrchatClients();
+                    }
+                }
+            }
+
+            if (_shownClientOperationRunning)
+            {
+                EditorGUILayout.HelpBox(_shownClientStatus ?? "Working...", MessageType.Info);
+                using (new EditorGUI.DisabledScope(_clientOperationCts == null || _clientOperationCts.IsCancellationRequested))
+                {
+                    if (GUILayout.Button(new GUIContent("Stop waiting",
+                            "Stops waiting and frees Remote Build. A change the Bridge already accepted is still applied.")))
+                    {
+                        _clientOperationCts?.Cancel();
+                    }
+                }
+            }
+            else if (_shownClientOutcome != null)
+            {
+                EditorGUILayout.HelpBox(_shownClientOutcome.Message,
+                    _shownClientOutcome.Applied ? MessageType.Info : MessageType.Error);
+                foreach (var detail in _shownClientOutcome.Details)
+                {
+                    EditorGUILayout.HelpBox(detail, _shownClientOutcome.Applied ? MessageType.None : MessageType.Warning);
                 }
             }
         }
 
-        private void RefreshBridgeSection()
+        private void DrawProfileAccounts()
         {
-            var now = EditorApplication.timeSinceStartup;
-            if (Event.current.type != EventType.Layout || now - _lastBridgeSectionRead < PreflightCheckIntervalSeconds)
+            if (_desiredClientSettings == null || !_desiredClientSettings.IsRelaunch)
             {
                 return;
             }
 
+            foreach (var profile in _desiredClientSettings.Profiles)
+            {
+                EditorGUILayout.LabelField($"  Profile {profile}", VrchatClientsView.DescribeProfile(profile, _profiles));
+            }
+
+            if (_profiles?.Warnings != null)
+            {
+                foreach (var warning in _profiles.Warnings.Where(w => !string.IsNullOrWhiteSpace(w)).Take(5))
+                {
+                    EditorGUILayout.HelpBox(BridgeMessages.Sanitize(warning, 300), MessageType.Warning);
+                }
+            }
+        }
+
+        /// <summary>At a Layout event: the Bridge's current settings, the fields when not edited, and what they describe.</summary>
+        private void RefreshVrchatClientsSection(double now)
+        {
+            _activeClientSettings = VrchatClientSettings.FromActiveConfig(_bridgeInfo?.ActiveConfig);
+            if (!_clientFieldsEdited && _activeClientSettings != null)
+            {
+                _requestedClientModeIndex = VrchatClientsView.ModeIndex(_activeClientSettings);
+                _clientCount = _activeClientSettings.IsRelaunch ? _clientCount : _activeClientSettings.Count;
+                if (_activeClientSettings.IsRelaunch)
+                {
+                    _clientProfilesText = VrchatClientSettings.FormatProfiles(_activeClientSettings.Profiles);
+                }
+            }
+
+            _clientModeIndex = _requestedClientModeIndex;
+            _desiredClientSettings = VrchatClientsView.Desired(_clientModeIndex, _clientCount, _clientProfilesText,
+                out _clientFieldsProblem);
+            if (_awaitingAppliedSettings != null && _awaitingAppliedSettings.SameAs(_activeClientSettings))
+            {
+                _awaitingAppliedSettings = null;
+                _clientFieldsEdited = false;
+            }
+
+            if (_activeClientSettings != null && _clientModeIndex == 1 && !_profilesLoading
+                && now - _lastProfilesRead >= ProfilesRefreshSeconds)
+            {
+                _lastProfilesRead = now;
+                StartLoadProfiles();
+            }
+        }
+
+        private void MarkClientFieldsEdited()
+        {
+            _clientFieldsEdited = true;
+            _awaitingAppliedSettings = null;
+        }
+
+        private void TakeOverClientOperation()
+        {
+            _shownClientOperationRunning = _clientOperationRunning;
+            _shownClientStatus = _clientOperationStatus;
+            _shownClientOutcome = _clientOutcome;
+            _profiles = _loadedProfiles;
+        }
+
+        private async void StartLoadProfiles()
+        {
+            _profilesLoading = true;
+            try
+            {
+                var profiles = await RemoteBuildCommand.GetCoordinator().GetVrchatProfilesAsync();
+                if (profiles != null)
+                {
+                    _loadedProfiles = profiles;
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.LogWarning("[VRC Remote Test] Could not read the Bridge's VRChat profiles: " + ex.Message);
+            }
+            finally
+            {
+                _profilesLoading = false;
+                Repaint();
+            }
+        }
+
+        /// <summary>
+        /// Asked on every apply, not only when the cached mode differs: the Bridge may have been
+        /// changed meanwhile, and the coordinator refuses to write when its mode is no longer the
+        /// one confirmed here.
+        /// </summary>
+        private void ConfirmAndApplyClientSettings(VrchatClientSettings active, VrchatClientSettings desired)
+        {
+            var message = VrchatClientsView.ClosesClients(active, desired)
+                ? $"Apply {desired.Describe()} and restart the Bridge? Changing from {active.Mode} to {desired.Mode} mode "
+                  + "first closes the VRChat clients the Bridge launched; the Bridge refuses while another VRChat runs on Windows."
+                : $"Apply {desired.Describe()} and restart the Bridge? The next deploy launches these clients.";
+            if (!EditorUtility.DisplayDialog("Apply VRChat client settings", message, "Apply", "Cancel"))
+            {
+                return;
+            }
+
+            StartApplyClientSettings(desired, active.Mode);
+        }
+
+        private async void StartApplyClientSettings(VrchatClientSettings desired, string confirmedActiveMode)
+        {
+            _clientOperationRunning = true;
+            _clientOperationStatus = "Applying " + desired.Describe() + "...";
+            _clientOutcome = null;
+            _clientOperationCts?.Dispose();
+            _clientOperationCts = new CancellationTokenSource();
+            var progress = new Progress<string>(message =>
+            {
+                _clientOperationStatus = message;
+                Repaint();
+            });
+
+            VrchatClientSettingsOutcome outcome;
+            try
+            {
+                outcome = await RemoteBuildCommand.GetCoordinator().ApplyVrchatClientSettingsAsync(
+                    desired, confirmedActiveMode, progress, _clientOperationCts.Token);
+            }
+            catch (Exception ex)
+            {
+                outcome = VrchatClientSettingsOutcome.Failure("Could not apply the settings: " + ex.Message);
+            }
+
+            // The fields keep what was applied until the Bridge's own report (refreshed every
+            // few seconds) shows it, so they never jump back to the old settings meanwhile.
+            FinishClientOperation(outcome);
+            if (outcome.Applied)
+            {
+                _awaitingAppliedSettings = desired;
+                _lastProfilesRead = double.NegativeInfinity;
+            }
+
+            if (outcome.Applied)
+            {
+                Debug.Log("[VRC Remote Test] " + outcome.Message);
+            }
+            else
+            {
+                Debug.LogWarning("[VRC Remote Test] " + outcome.Message);
+            }
+        }
+
+        private async void StartCloseVrchatClients()
+        {
+            _clientOperationRunning = true;
+            _clientOperationStatus = "Closing the VRChat clients the Bridge launched...";
+            _clientOutcome = null;
+
+            VrchatClientSettingsOutcome outcome;
+            try
+            {
+                outcome = await RemoteBuildCommand.GetCoordinator().CloseVrchatClientsAsync();
+            }
+            catch (Exception ex)
+            {
+                outcome = VrchatClientSettingsOutcome.Failure("Could not close the VRChat clients: " + ex.Message);
+            }
+
+            FinishClientOperation(outcome);
+        }
+
+        private void FinishClientOperation(VrchatClientSettingsOutcome outcome)
+        {
+            _clientOperationRunning = false;
+            _clientOutcome = outcome;
+            _clientOperationCts?.Dispose();
+            _clientOperationCts = null;
+
+            // The section reads the Bridge again at the next Layout, so a restarted host's
+            // settings and notes show at once.
+            _lastBridgeSectionRead = double.NegativeInfinity;
+            Repaint();
+        }
+
+        private void RefreshBridgeSection()
+        {
+            if (Event.current.type != EventType.Layout)
+            {
+                return;
+            }
+
+            var now = EditorApplication.timeSinceStartup;
+            if (now - _lastBridgeSectionRead >= PreflightCheckIntervalSeconds)
+            {
+                ReadBridgeSection(now);
+            }
+
+            RefreshVrchatClientsSection(now);
+            TakeOverClientOperation();
+        }
+
+        private void ReadBridgeSection(double now)
+        {
             _lastBridgeSectionRead = now;
             _showBridgeSection = _bridgeConfigured;
             _bridgeInfo = null;
@@ -309,7 +693,9 @@ namespace VRCRemoteTest
 
                 // An old list may name accounts that have since changed; the Log Viewer warns about it.
                 var clients = coordinator.VrchatClients;
-                _bridgeClients = ClientLogView.IsStale(clients, DateTimeOffset.UtcNow) ? null : clients;
+                _bridgeClients = clients == null || DateTimeOffset.UtcNow - clients.UpdatedAtUtc > BridgeClientRowsStaleAfter
+                    ? null
+                    : clients;
             }
             catch (RemoteBuildException)
             {
