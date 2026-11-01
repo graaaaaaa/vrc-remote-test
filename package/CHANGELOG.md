@@ -1,8 +1,8 @@
 # Changelog
 
-## [Unreleased]
+## [0.9.0] - 2026-11-01
 
-Choosing the VRChat clients from the Unity window. **Update the Unity package only**: it uses the management API of the Bridge v0.8.0 and later, which is unchanged.
+Choosing the VRChat clients from the Unity window. The new section uses the management API of the Bridge v0.8.0 and later, and the Bridge has no functional changes, but the Remote Test window warns while their versions differ, so **update both the Unity package and the Windows Bridge** (`docs/setup-windows.md`, step 1, "版を入れ替える"). An existing `config.json` and pairing keep working. Checked on 2026-11-01 with four clients on separate accounts (Relaunch `0, 1, 2, 3`, all in one instance) and with a switch to two Reload clients and back.
 
 ### Added (Unity)
 
