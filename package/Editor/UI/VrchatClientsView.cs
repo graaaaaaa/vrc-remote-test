@@ -77,8 +77,11 @@ namespace VRCRemoteTest
         /// A Reload Bridge does not add or remove clients while some run; null when that does
         /// not matter for this change.
         /// </summary>
-        internal static string ReloadCountNote(VrchatClientSettings active, VrchatClientSettings desired) =>
+        /// <param name="clientsRunning">Whether the Bridge's clients list shows a running client; null when unknown.</param>
+        internal static string ReloadCountNote(VrchatClientSettings active, VrchatClientSettings desired,
+            bool? clientsRunning = null) =>
             active != null && desired != null && !active.IsRelaunch && !desired.IsRelaunch && active.Count != desired.Count
+            && clientsRunning != false
                 ? "Running Reload clients are kept as they are. Close them (button below) so that the next deploy launches "
                   + desired.Count + "."
                 : null;

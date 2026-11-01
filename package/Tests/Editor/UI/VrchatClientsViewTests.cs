@@ -86,6 +86,10 @@ namespace VRCRemoteTest.Tests
             Assert.IsNull(VrchatClientsView.ReloadCountNote(
                 VrchatClientSettings.Relaunch(new[] { 0, 1 }), VrchatClientSettings.Reload(4)),
                 "a mode change closes them anyway");
+            Assert.IsNull(VrchatClientsView.ReloadCountNote(VrchatClientSettings.Reload(2), VrchatClientSettings.Reload(4), false),
+                "nothing to close once the clients are gone");
+            StringAssert.Contains("launches 4",
+                VrchatClientsView.ReloadCountNote(VrchatClientSettings.Reload(2), VrchatClientSettings.Reload(4), true));
         }
     }
 }

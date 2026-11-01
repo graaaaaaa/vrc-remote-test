@@ -405,7 +405,10 @@ namespace VRCRemoteTest
                 EditorGUILayout.HelpBox(_clientFieldsProblem, MessageType.Error);
             }
 
-            var reloadNote = VrchatClientsView.ReloadCountNote(_activeClientSettings, _desiredClientSettings);
+            var clientsRunning = _bridgeClients?.Clients == null
+                ? (bool?)null
+                : _bridgeClients.Clients.Any(c => c != null && c.Running != false);
+            var reloadNote = VrchatClientsView.ReloadCountNote(_activeClientSettings, _desiredClientSettings, clientsRunning);
             if (reloadNote != null)
             {
                 EditorGUILayout.HelpBox(reloadNote, MessageType.Info);
