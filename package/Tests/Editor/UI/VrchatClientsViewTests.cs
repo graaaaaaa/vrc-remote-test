@@ -52,6 +52,8 @@ namespace VRCRemoteTest.Tests
         public void A_profile_never_seen_says_how_to_log_it_in()
         {
             StringAssert.Contains("start-vrchat-dev.ps1 -Profiles 3", VrchatClientsView.DescribeProfile(3, Profiles));
+            StringAssert.Contains("once the Bridge launches this profile", VrchatClientsView.DescribeProfile(3, Profiles),
+                "a login made by hand is not seen until the Bridge launches the profile");
             Assert.AreEqual("account unknown", VrchatClientsView.DescribeProfile(3, null));
         }
 

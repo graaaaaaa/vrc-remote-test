@@ -91,7 +91,7 @@ Unity の Preflight が `Windows Bridge: Connected` になり、`Remote Build & 
 
 台数とアカウント（`VrchatClientMode`、`VrchatClientCount`、`VrchatProfiles`）は、Unity の VRC Remote Test ウィンドウの「VRChat Clients」でも変えられます（0.8.1 より新しいパッケージ。Bridge は 0.8.0 以降のままでよい）。中で呼んでいるのは同じ `PUT /api/v1/config` です。
 
-- Relaunch で profile を足すとき（例: `0, 1` から `0, 1, 2, 3` の4台にする）は、その profile に Windows で一度ログインしておきます。`start-vrchat-dev.ps1 -Profiles 2` のように1台だけ起動して、手でログインします。パスワードはスクリプトにも設定ファイルにも書きません。ウィンドウは、profile ごとに最後にログインしたアカウントを表示し、まだ見ていない profile にはそう出します。
+- Relaunch で profile を足すとき（例: `0, 1` から `0, 1, 2, 3` の4台にする）は、その profile に Windows で一度ログインしておきます。`start-vrchat-dev.ps1 -Profiles 2` のように1台だけ起動して、手でログインします。パスワードはスクリプトにも設定ファイルにも書きません。ウィンドウは、profile ごとに最後にログインしたアカウントを表示します。Bridge がアカウントを知るのは、自分で起動した台のログからだけです。そのため、`start-vrchat-dev.ps1` でログインしただけの profile は「account not seen yet」と出て、最初の配布でその profile が起動したあとにアカウントが出ます。
 - 3台以上にするときは、ウィンドウの Settings で Result Timeout を 180 秒以上にします。閉じて起動する時間がかかるためです。
 - Reload で台数だけを変えたときは、動いている台はそのまま残ります。`Close Bridge's VRChat` で閉じると、次の配置で新しい台数が起動します。
 

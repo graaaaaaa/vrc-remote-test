@@ -13,8 +13,8 @@ namespace VRCRemoteTest
         /// <summary>Order matches <see cref="ModeOf"/>.</summary>
         internal static readonly string[] ModeLabels =
         {
-            "Reload – one account (--watch-worlds)",
-            "Relaunch – one account per profile",
+            "Reload (one account)",
+            "Relaunch (one per profile)",
         };
 
         /// <summary>Several clients take longer to close and start than the 60 s default (multi-client spike: about 21 s for 4 to enter).</summary>
@@ -42,7 +42,11 @@ namespace VRCRemoteTest
                 : null;
         }
 
-        /// <summary>"Tester (01234567) · seen 2026-11-01 10:02", or how to get the profile logged in.</summary>
+        /// <summary>
+        /// "Tester (01234567) · seen 2026-11-01 10:02", or that the Bridge has not seen the account:
+        /// it learns it only from clients it launched, so a login made with start-vrchat-dev.ps1
+        /// shows after the first deploy that launches the profile.
+        /// </summary>
         internal static string DescribeProfile(int profile, BridgeProfiles profiles, TimeZoneInfo zone = null)
         {
             var account = profiles?.Profiles?.FirstOrDefault(p => p != null && p.Profile == profile);
@@ -50,8 +54,8 @@ namespace VRCRemoteTest
             {
                 return profiles == null
                     ? "account unknown"
-                    : "no login seen yet: log in to this profile on Windows once (start-vrchat-dev.ps1 -Profiles "
-                      + profile.ToString(CultureInfo.InvariantCulture) + ")";
+                    : "account not seen yet: shown once the Bridge launches this profile. Log in to it on Windows "
+                      + "once first (start-vrchat-dev.ps1 -Profiles " + profile.ToString(CultureInfo.InvariantCulture) + ")";
             }
 
             var name = string.IsNullOrWhiteSpace(account.DisplayName) ? "unknown name" : BridgeMessages.Sanitize(account.DisplayName, 64);

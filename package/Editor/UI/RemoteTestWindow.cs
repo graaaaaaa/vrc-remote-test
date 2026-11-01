@@ -84,7 +84,12 @@ namespace VRCRemoteTest
         private BridgeInfo _bridgeInfo;
         private VrchatClients _bridgeClients;
         private double _lastBridgeSectionRead = double.NegativeInfinity;
+        [NonSerialized] private double _lastBridgeRepaintTime = double.NegativeInfinity;
         private static string _packageVersion;
+
+        // Longer than ClientLogView.StaleAfter: the Slot rows come and go with the list, and
+        // every change moves the controls below them, so a list a few reads late still shows.
+        private static readonly TimeSpan BridgeClientRowsStaleAfter = TimeSpan.FromSeconds(60);
 
         // The "VRChat Clients" part of the Bridge section. The fields are edited freely; what
         // decides which controls are drawn (the mode, the parsed profiles, the status of an
@@ -175,9 +180,20 @@ namespace VRCRemoteTest
         /// viewer a developer is actively watching needs a refresh even while
         /// the window isn't receiving input events (Codex plan review Phase
         /// 5, Round 2, confidence 0.90).
+        ///
+        /// The Bridge section is repainted on its own tick too. The Bridge's answers arrive in
+        /// the background, so without it the section changed only when the next input event
+        /// redrew the window — often the click itself, moving the control under the pointer.
         /// </summary>
         private void OnEditorUpdate()
         {
+            var now = EditorApplication.timeSinceStartup;
+            if (_showBridgeSection && now - _lastBridgeRepaintTime >= PreflightCheckIntervalSeconds)
+            {
+                _lastBridgeRepaintTime = now;
+                Repaint();
+            }
+
             if (!_logFoldout || !RemoteTestSettings.LogAutoRefresh)
             {
                 return;
@@ -335,7 +351,17 @@ namespace VRCRemoteTest
             var busy = _clientOperationRunning || RemoteBuildCommand.GetCoordinator().IsRunning;
             using (new EditorGUI.DisabledScope(busy))
             {
-                var mode = EditorGUILayout.Popup("Mode", _clientModeIndex, VrchatClientsView.ModeLabels);
+                // A toolbar, not a popup: on the Mac a popup opens a native menu, and the editor
+                // crashed inside it (ShowDelayedContextMenu) in the first hands-on check.
+                int mode;
+                using (new EditorGUILayout.HorizontalScope())
+                {
+                    EditorGUILayout.PrefixLabel(new GUIContent("Mode",
+                        "Reload: every client on one account, reloaded by --watch-worlds on each deploy. "
+                        + "Relaunch: one account per profile, all relaunched on each deploy."));
+                    mode = GUILayout.Toolbar(_clientModeIndex, VrchatClientsView.ModeLabels);
+                }
+
                 if (mode != _clientModeIndex)
                 {
                     _requestedClientModeIndex = mode;
@@ -664,7 +690,9 @@ namespace VRCRemoteTest
 
                 // An old list may name accounts that have since changed; the Log Viewer warns about it.
                 var clients = coordinator.VrchatClients;
-                _bridgeClients = ClientLogView.IsStale(clients, DateTimeOffset.UtcNow) ? null : clients;
+                _bridgeClients = clients == null || DateTimeOffset.UtcNow - clients.UpdatedAtUtc > BridgeClientRowsStaleAfter
+                    ? null
+                    : clients;
             }
             catch (RemoteBuildException)
             {
