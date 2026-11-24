@@ -34,6 +34,7 @@
 #   vrcrt.sh launch-client <slot>         start that client again with the arguments the Bridge
 #                                         used for it in the last deploy (same profile, world and
 #                                         instance); waits up to 90 s for the Bridge's answer
+#                                         (close-client up to 45 s), then says the outcome is unknown
 #
 # Set VRCRT_BRIDGE_URL and VRCRT_CERT_SHA256. The token comes from macOS Keychain,
 # or VRCRT_TOKEN in CI. <cursor> is the JSON that
@@ -110,6 +111,8 @@ MAX_APPLY_POLLS = 45
 POLL_REQUEST_TIMEOUT = 10.0
 # launch-client: the Bridge may wait up to about 60 s for the previous client's log before it starts one.
 LAUNCH_TIMEOUT_SECONDS = test_setting("VRCRT_TEST_LAUNCH_TIMEOUT", "90", 0.1, 90.0)
+# close-client: the Bridge confirms the exit for up to 20 s, after listing the processes and before saving its record.
+CLOSE_TIMEOUT_SECONDS = test_setting("VRCRT_TEST_CLOSE_TIMEOUT", "45", 0.1, 45.0)
 MAX_GENERATION = (1 << 53) - 1
 BRIDGE_LOG_LINES = 30
 # What one answer may print: a 1 MiB answer must not become megabytes of terminal output.
@@ -748,7 +751,13 @@ def single_client_refused(what, slot, status, text):
 
 
 def cmd_close_client(args):
-    status, text = bridge_request("POST", "/api/v1/clients/%d/close" % args.slot)
+    # The whole request ends by the deadline, however slowly the answer trickles in.
+    try:
+        status, text = bridge_request("POST", "/api/v1/clients/%d/close" % args.slot, timeout=CLOSE_TIMEOUT_SECONDS,
+                                      deadline=time.monotonic() + CLOSE_TIMEOUT_SECONDS)
+    except Unreachable as error:
+        raise Failure(EXIT_OBSERVATION, "%s; whether slot %d was closed is unknown: check `vrcrt.sh status`"
+                      % (error, args.slot))
     body = json_of(text)
     if status in (200, 409) and isinstance(body, dict) and "closed" in body:
         closed, not_confirmed = body.get("closed"), body.get("notConfirmed")
@@ -773,7 +782,9 @@ def cmd_close_client(args):
 
 def cmd_launch_client(args):
     try:
-        status, text = bridge_request("POST", "/api/v1/clients/%d/launch" % args.slot, timeout=LAUNCH_TIMEOUT_SECONDS)
+        # The whole request ends by the deadline, however slowly the answer trickles in.
+        status, text = bridge_request("POST", "/api/v1/clients/%d/launch" % args.slot, timeout=LAUNCH_TIMEOUT_SECONDS,
+                                      deadline=time.monotonic() + LAUNCH_TIMEOUT_SECONDS)
     except Unreachable as error:
         # Never retried: the Bridge may have started the client before the answer was lost.
         raise Failure(EXIT_OBSERVATION, "%s; whether slot %d was started is unknown: check `vrcrt.sh status --json` "

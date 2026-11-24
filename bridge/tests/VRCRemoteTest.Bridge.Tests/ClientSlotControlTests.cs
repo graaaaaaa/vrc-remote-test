@@ -423,6 +423,9 @@ public class ClientSlotControlTests
         result.Refusal.Should().Be(SlotRefusal.OthersRunning);
         _launcher.LaunchCalled.Should().BeFalse();
         _now.Should().BeOnOrAfter(T0.AddSeconds(2), "the launch interval was waited before the check");
+        _store.Clients.Should().BeEquivalentTo(
+            new[] { new ManagedClient(100, Created0, 1, 0, 0), new ManagedClient(101, Created1, 1, 1, 1) },
+            "the record lists the same clients as before");
     }
 
     [Fact]
@@ -473,7 +476,7 @@ public class ClientSlotControlTests
         failed.Refusal.Should().Be(SlotRefusal.LaunchFailed);
         threw.Refusal.Should().Be(SlotRefusal.LaunchFailed);
         threw.Problems.Single().Should().Contain("is missing");
-        _store.Clients.Should().ContainSingle().Which.LaunchOrder.Should().Be(1);
+        _store.Clients.Should().HaveCount(2, "a refused launch leaves the slot's old entry in the record");
         _context.IsLaunching.Should().BeFalse();
         _context.LastLaunch.Should().BeNull();
     }
@@ -492,7 +495,7 @@ public class ClientSlotControlTests
         result.Done.Should().BeFalse();
         result.ProcessId.Should().Be(_launcher.Launched.Single().ProcessId);
         result.Problems.Single().Should().Contain("close it on Windows");
-        _store.Clients.Should().ContainSingle().Which.LaunchOrder.Should().Be(1);
+        _store.Clients.Should().HaveCount(2, "nothing was recorded for the new client");
         _context.LastLaunch.Should().NotBeNull("the next launch is still spaced from this one");
         _context.IsLaunching.Should().BeFalse();
     }
@@ -526,6 +529,7 @@ public class ClientSlotControlTests
         await act.Should().ThrowAsync<OperationCanceledException>();
         _launcher.LaunchCalled.Should().BeFalse();
         _context.IsLaunching.Should().BeFalse();
+        _store.Clients.Should().HaveCount(2);
     }
 
     [Fact]

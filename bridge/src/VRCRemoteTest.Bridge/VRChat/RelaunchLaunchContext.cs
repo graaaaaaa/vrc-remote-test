@@ -22,7 +22,9 @@ public sealed record LastLaunch(DateTime Utc, IReadOnlyList<string>? FilesBefore
 /// <see cref="IsLaunching"/>, set from just before Process.Start until the client is
 /// recorded, while which the roster leaves unrecorded newcomers unplaced; and the clients
 /// started on their own (<see cref="IsSingleLaunch"/>), whose log is matched only by the file
-/// Restart Manager shows they have open, never by the times in the names. Neither is ever a
+/// Restart Manager shows they have open, never by the times in the names. That list lasts as long
+/// as the host: a new host matches such a client like any other, which is safe while Restart
+/// Manager answers (its owner is found before any name). Neither is ever a
 /// reason to close or launch a process. Thread-safe: the deploy flow and the LAN API write
 /// it inside the operation gate, and the observation loop reads it.
 /// </summary>
@@ -47,13 +49,17 @@ public sealed class RelaunchLaunchContext
         get { lock (_gate) return _lastLaunch; }
     }
 
-    /// <summary>A new deploy: nothing of the previous batch may be launched again.</summary>
+    /// <summary>
+    /// A new deploy: nothing of the previous batch may be launched again. The clients started on
+    /// their own stay listed: one may still run (the deploy can be refused before anything is
+    /// closed), and an entry names one process by its PID and creation time, so it never applies
+    /// to another one.
+    /// </summary>
     public void Clear()
     {
         lock (_gate)
         {
             _slots.Clear();
-            _singleLaunches.Clear();
             _worldPath = null;
             _roomId = null;
         }
@@ -65,7 +71,6 @@ public sealed class RelaunchLaunchContext
         lock (_gate)
         {
             _slots.Clear();
-            _singleLaunches.Clear();
             _worldPath = worldPath;
             _roomId = roomId;
         }

@@ -12,12 +12,12 @@ Closing one VRChat client and starting it again from the Mac, for tests where on
 
 ### Changed (Bridge, observation)
 
-- A client started on its own is matched to its log only by the file Restart Manager shows it alone has open, never by the times in the file names, so it cannot be shown the closed client's late log or another client's.
+- A client started on its own is matched to its log only by the file Restart Manager shows it alone has open, never by the times in the file names, so it cannot be shown the closed client's late log or another client's. This lasts for the Bridge host's lifetime (a refused deploy keeps it); after a restart such a client is matched like any other.
 - While a client is between its start and its record, the roster gives unrecorded newcomers no slot, and a recorded client waits for its launch order's slot while that slot cannot be checked instead of taking another one: a relaunched client gets one new generation and observation epoch in its own slot.
 
 ### Added (scripts)
 
-- `vrcrt.sh close-client <slot>` and `vrcrt.sh launch-client <slot>` (exit 0 done, 1 refused or not done, 3 no or invalid answer or a Bridge older than v0.10.0). `launch-client` waits up to 90 s for the answer and never retries: with no answer, whether the client started is unknown until `status --json` shows it.
+- `vrcrt.sh close-client <slot>` and `vrcrt.sh launch-client <slot>` (exit 0 done, 1 refused or not done, 3 no or invalid answer or a Bridge older than v0.10.0). `launch-client` waits up to 90 s and `close-client` up to 45 s for the whole answer, and neither retries: with no answer, whether the client started or closed is unknown until `status --json` shows it.
 
 ## [0.9.0] - 2026-11-01
 

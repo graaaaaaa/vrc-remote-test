@@ -768,6 +768,7 @@ public class VrchatRelaunchCoordinatorTests
         preparation.ErrorCode.Should().Be(ErrorCode.VrchatUnmanagedRunning);
         _launchContext.PlanFor(0).Should().BeNull();
         _launchContext.PlanFor(1).Should().BeNull();
-        _launchContext.IsSingleLaunch(9000, T0).Should().BeFalse();
+        _launchContext.IsSingleLaunch(9000, T0).Should().BeTrue(
+            "a client started on its own may still run after a refused deploy, and keeps matching its log by owner only");
     }
 }

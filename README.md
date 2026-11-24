@@ -59,7 +59,7 @@ Windows Bridge の実行体（`VRCRemoteTest.Bridge.exe`）は、[Releases](http
 | `scripts/vrcrt.sh config set KEY=VALUE…` | 設定を変え、Bridge が起動し直して効いたかを待つ（最大90秒）。`KEY=null` で項目を消す |
 | `scripts/vrcrt.sh restart` | Bridge を起動し直し、新しい host が立つのを待つ |
 | `scripts/vrcrt.sh close-clients` | Bridge が起動した VRChat を閉じる。閉じたと確かめられない台が残れば終了コード 1 |
-| `scripts/vrcrt.sh close-client <slot>` | Bridge 0.10.0 以降、Relaunch: その slot の台だけを閉じる。ほかの台はそのまま。閉じたと確かめられないか記録を直せなければ終了コード 1 |
+| `scripts/vrcrt.sh close-client <slot>` | Bridge 0.10.0 以降、Relaunch: その slot の台だけを閉じる。ほかの台はそのまま。閉じたと確かめられないか記録を直せなければ終了コード 1。答えを最大45秒待ち、答えが無ければ終了コード 3 |
 | `scripts/vrcrt.sh launch-client <slot>` | Bridge 0.10.0 以降、Relaunch: その slot の台を、最後の配置と同じ profile・ワールド・インスタンスで起動し直す。動いていれば断る。Bridge の答えを最大90秒待ち、答えが無ければ終了コード 3（起動したかは `status --json` で確かめる） |
 | `scripts/vrcrt.sh profiles` | profile ごとに、最後にログインしたアカウント |
 

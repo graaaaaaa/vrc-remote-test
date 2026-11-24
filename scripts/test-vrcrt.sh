@@ -323,6 +323,9 @@ http POST_api_v1_clients_0_close '{"slot":0,"processId":true,"closed":1,"notConf
 expect "close-client with a PID that is not a number is an invalid answer" 3 "not a close report" "$vrcrt" close-client 0
 http POST_api_v1_clients_0_close 409 '{"slot":0,"processId":100,"closed":1,"notConfirmed":0,"recordUpdated":true,"problems":[]}'
 expect "close-client with a 409 that says done is an invalid answer" 3 "not a close report" "$vrcrt" close-client 0
+http POST_api_v1_clients_0_close DOWN
+expect "close-client without an answer says the outcome is unknown" 3 "whether slot 0 was closed is unknown" \
+    "$vrcrt" close-client 0
 rm "$share/http/POST_api_v1_clients_0_close"
 expect "close-client on a Bridge older than v0.10.0" 3 "older than v0.10.0" "$vrcrt" close-client 0
 http POST_api_v1_clients_0_close 401 ''
@@ -421,7 +424,7 @@ def handle(raw):
             answer(conn, 200, {})
         elif key == "GET /api/v1/bridge" and n == 1:
             answer(conn, 200, {"version": "0.8.0", "hostGeneration": 1})
-        elif key == "GET /api/v1/bridge":
+        elif key in ("GET /api/v1/bridge", "POST /api/v1/clients/0/launch", "POST /api/v1/clients/0/close"):
             trickle(conn)
         elif key == "POST /api/v1/bridge/restart":
             answer(conn, 202, {"restart": "scheduled", "hostGeneration": 1})
@@ -465,6 +468,17 @@ if command -v openssl >/dev/null 2>&1 \
         else
             fail "the deadline holds against a trickling server (${elapsed} ms for a 1 s wait)"
         fi
+        for command in launch-client close-client; do
+            started=$(now_ms)
+            expect "$command against a trickling header says the outcome is unknown" 3 "is unknown" \
+                real env VRCRT_TEST_LAUNCH_TIMEOUT=1 VRCRT_TEST_CLOSE_TIMEOUT=1 "$vrcrt" "$command" 0
+            elapsed=$(( $(now_ms) - started ))
+            if [ "$elapsed" -le 2500 ]; then
+                pass "$command's deadline holds against a trickling server (${elapsed} ms for a 1 s wait)"
+            else
+                fail "$command's deadline holds against a trickling server (${elapsed} ms for a 1 s wait)"
+            fi
+        done
     else
         fail "the local HTTPS server did not start"
     fi

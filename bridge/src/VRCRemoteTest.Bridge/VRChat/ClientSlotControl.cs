@@ -176,9 +176,11 @@ public sealed class ClientSlotControl
         }
         else
         {
-            problems.Add(
-                $"Could not confirm that the client (PID {handle.ProcessId}) exited within " +
-                $"{VrchatClientTerminator.ExitDeadline.TotalSeconds:0} s; its record was kept. Check `vrcrt.sh status`.");
+            problems.Add(result.Canceled
+                ? $"The request ended before the client (PID {handle.ProcessId}) was confirmed to exit; its record was " +
+                  "kept. Check `vrcrt.sh status`."
+                : $"Could not confirm that the client (PID {handle.ProcessId}) exited within " +
+                  $"{VrchatClientTerminator.ExitDeadline.TotalSeconds:0} s; its record was kept. Check `vrcrt.sh status`.");
         }
 
         _logger.LogInformation(
@@ -222,10 +224,11 @@ public sealed class ClientSlotControl
             return RefuseLaunch(slot, running.Reason, running.Problem);
         }
 
-        // The slot's old entry names a client that has exited. Writing that down first also
-        // proves the record can be written, so the client launched next can be recorded.
+        // Writing the record as it is proves it can be written, so the client launched next can be
+        // recorded, without changing which clients it lists: a refusal below leaves it as it was.
+        // The slot's old entry (a client that has exited) is replaced only once the new one starts.
         var kept = load.Clients.Where(c => c.LaunchOrder != slot).ToList();
-        if (!TrySave(kept))
+        if (!TrySave(load.Clients))
         {
             return RefuseLaunch(slot, SlotRefusal.RecordUnwritable,
                 "The Bridge could not write its record of the clients it launched, so nothing was started.");
@@ -234,7 +237,7 @@ public sealed class ClientSlotControl
         await _pacer.WaitBeforeSingleLaunchAsync(_context.LastLaunch, cancellationToken).ConfigureAwait(false);
 
         // Again after the wait: a VRChat started meanwhile stops the launch. No await from here to Process.Start.
-        if (CheckRunning(slot, kept) is { } changed)
+        if (CheckRunning(slot, load.Clients) is { } changed)
         {
             return RefuseLaunch(slot, changed.Reason, changed.Problem);
         }
