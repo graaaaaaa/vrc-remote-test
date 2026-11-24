@@ -28,6 +28,7 @@ public class VrchatRelaunchCoordinatorTests
     private readonly FakeManagedClientStore _store = new();
     private readonly CapturingLogger<VrchatRelaunchCoordinator> _logger = new();
     private readonly VrchatLogNotice _logNotice = new();
+    private readonly RelaunchLaunchContext _launchContext = new();
     private DateTime _now = T0;
 
     private VrchatRelaunchCoordinator CreateCoordinator(
@@ -59,7 +60,8 @@ public class VrchatRelaunchCoordinatorTests
             }),
             () => null,
             () => _now,
-            TimeZoneInfo.Utc);
+            TimeZoneInfo.Utc,
+            _launchContext);
     }
 
     private FakeVrchatProcess Running(int processId, DateTime creationTimeUtc, int sessionId = 1, string name = "VRChat")
@@ -697,5 +699,76 @@ public class VrchatRelaunchCoordinatorTests
         await act.Should().ThrowAsync<OperationCanceledException>();
         _launcher.LaunchCalled.Should().BeFalse();
         _logNotice.Message.Should().BeNull();
+    }
+
+    // ---- RelaunchLaunchContext: what a single relaunch may repeat ----
+
+    [Fact]
+    public async Task Each_recorded_client_leaves_its_slots_arguments_for_a_single_relaunch()
+    {
+        var outcome = await CreateCoordinator(profiles: [3, 0], mode: "VR").LaunchClientsAsync(WorldPath, CancellationToken.None);
+
+        outcome.Succeeded.Should().BeTrue();
+        var roomId = _launcher.Requests[0].RoomId;
+        _launchContext.PlanFor(0).Should().Be(new SlotLaunchPlan(0, WorldPath, roomId, 3, NoVr: false));
+        _launchContext.PlanFor(1).Should().Be(new SlotLaunchPlan(1, WorldPath, roomId, 0, NoVr: true));
+        _launchContext.PlanFor(2).Should().BeNull();
+        _launchContext.LastLaunch!.Utc.Should().Be(_launcher.Launched[1].CreationTimeUtc);
+        _launchContext.IsLaunching.Should().BeFalse();
+    }
+
+    [Fact]
+    public async Task The_launching_mark_covers_each_client_until_it_is_recorded()
+    {
+        var marks = new List<(bool Launching, int Saves)>();
+        _launcher.OnLaunch = pid =>
+        {
+            marks.Add((_launchContext.IsLaunching, _store.SaveCalls));
+            Running(pid, _launcher.Launched[^1].CreationTimeUtc);
+        };
+
+        await CreateCoordinator(profiles: [0, 1]).LaunchClientsAsync(WorldPath, CancellationToken.None);
+
+        marks.Should().Equal((true, 0), (true, 1));
+        _launchContext.IsLaunching.Should().BeFalse();
+    }
+
+    [Fact]
+    public async Task A_slot_the_batch_did_not_start_or_record_cannot_be_relaunched()
+    {
+        _launcher.FailingLaunchIndexes = [1];
+        await CreateCoordinator(profiles: [0, 1, 2]).LaunchClientsAsync(WorldPath, CancellationToken.None);
+
+        _launchContext.PlanFor(0).Should().NotBeNull();
+        _launchContext.PlanFor(1).Should().BeNull();
+        _launchContext.PlanFor(2).Should().BeNull();
+        _launchContext.IsLaunching.Should().BeFalse();
+
+        // The next batch, as PrepareAsync leaves it: nothing running.
+        _monitor.Processes.ForEach(p => p.Exit());
+        _launcher.FailingLaunchIndexes = null;
+        _store.FailingSaves = [_store.SaveCalls + 1];
+        var outcome = await CreateCoordinator(profiles: [0, 1]).LaunchClientsAsync(WorldPath, CancellationToken.None);
+
+        outcome.ErrorMessage.Should().Contain("could not be recorded");
+        _launchContext.PlanFor(0).Should().NotBeNull();
+        _launchContext.PlanFor(1).Should().BeNull("its client started but could not be recorded");
+        _launchContext.IsLaunching.Should().BeFalse();
+    }
+
+    [Fact]
+    public async Task Every_deploy_forgets_the_previous_batch_whatever_its_outcome()
+    {
+        await CreateCoordinator(profiles: [0, 1]).LaunchClientsAsync(WorldPath, CancellationToken.None);
+        _launchContext.MarkSingleLaunch(9000, T0);
+        Running(4004, Earlier);
+
+        var preparation = await CreateCoordinator(profiles: [0, 1]).PrepareAsync(CancellationToken.None);
+
+        preparation.ErrorCode.Should().Be(ErrorCode.VrchatUnmanagedRunning);
+        _launchContext.PlanFor(0).Should().BeNull();
+        _launchContext.PlanFor(1).Should().BeNull();
+        _launchContext.IsSingleLaunch(9000, T0).Should().BeTrue(
+            "a client started on its own may still run after a refused deploy, and keeps matching its log by owner only");
     }
 }

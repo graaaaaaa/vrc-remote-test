@@ -1,5 +1,24 @@
 # Changelog
 
+## [Unreleased]
+
+Closing one VRChat client and starting it again from the Mac, for tests where one player leaves and rejoins the same instance while the others stay (Relaunch mode). **Update the Windows Bridge**; the Unity package has no functional changes.
+
+### Added (Bridge, LAN API)
+
+- `POST /api/v1/clients/{slot}/close` closes only the client the Bridge launched in that slot (its launch order), through the handle it was matched with on PID, creation time, session and name, and removes only its entry from `managed-clients.json`; the other clients and entries are left as they are. It refuses (`slotMismatch`) while the observed slot shows another client.
+- `POST /api/v1/clients/{slot}/launch` starts that slot again with the arguments the Bridge used for it in the last deploy (world, room id, profile, VR flag). They are kept in memory only, so a configuration change or a restart forgets them until the next deploy (`noLaunchPlan`). The launch is spaced like a batch's, refuses while any VRChat the Bridge did not launch runs, writes the record before starting, and records a client that started even when the request is dropped; one it cannot record is reported with its PID (500 `launchedNotRecorded`).
+- Refusals change nothing and answer `{error, problems}`: 400 `unknownSlot`, otherwise 409 (`notRelaunchMode`, `recordCorrupt`, `alreadyRunning`, `othersRunning`, ...). Both routes take the operation gate like the other management routes.
+
+### Changed (Bridge, observation)
+
+- A client started on its own is matched to its log only by the file Restart Manager shows it alone has open, never by the times in the file names, so it cannot be shown the closed client's late log or another client's. This lasts for the Bridge host's lifetime (a refused deploy keeps it); after a restart such a client is matched like any other.
+- While a client is between its start and its record, the roster gives unrecorded newcomers no slot, and a recorded client waits for its launch order's slot while that slot cannot be checked instead of taking another one: a relaunched client gets one new generation and observation epoch in its own slot.
+
+### Added (scripts)
+
+- `vrcrt.sh close-client <slot>` and `vrcrt.sh launch-client <slot>` (exit 0 done, 1 refused or not done, 3 no or invalid answer or a Bridge older than v0.10.0). `launch-client` waits up to 90 s and `close-client` up to 45 s for the whole answer, and neither retries: with no answer, whether the client started or closed is unknown until `status --json` shows it.
+
 ## [0.9.0] - 2026-11-01
 
 Choosing the VRChat clients from the Unity window. The new section uses the management API of the Bridge v0.8.0 and later, and the Bridge has no functional changes, but the Remote Test window warns while their versions differ, so **update both the Unity package and the Windows Bridge** (`docs/setup-windows.md`, step 1, "版を入れ替える"). An existing `config.json` and pairing keep working. Checked on 2026-11-01 with four clients on separate accounts (Relaunch `0, 1, 2, 3`, all in one instance) and with a switch to two Reload clients and back.

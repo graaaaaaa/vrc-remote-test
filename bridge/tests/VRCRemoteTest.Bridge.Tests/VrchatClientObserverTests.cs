@@ -589,4 +589,88 @@ public class VrchatClientObserverTests : IDisposable
         Entry(after, 0).ObservationEpoch.Should().BeGreaterThan(Entry(before, 0).ObservationEpoch!.Value);
         Markers(MarkerFile(after, 0)).Records.Should().ContainSingle().Which.Should().EndWith("[SPK003] three");
     }
+
+    [Fact]
+    public void A_client_closed_and_started_again_on_its_own_gets_a_new_generation_epoch_and_log_while_slot_1_stays()
+    {
+        // Relaunch mode with the Bridge's record, Restart Manager answering, and a client started on its own.
+        var options = Options;
+        options.VrchatClientMode = "Relaunch";
+        options.VrchatProfiles = [0, 1];
+        var record = new FakeManagedClientStore();
+        var context = new RelaunchLaunchContext();
+        var owners = new Dictionary<string, VrchatLogOwners.Owner[]>(StringComparer.OrdinalIgnoreCase);
+        var roster = new VrchatClientRoster(Path.Combine(_stateDir, VrchatClientRoster.FileName));
+        var reader = new VrchatLogReader(
+            Microsoft.Extensions.Options.Options.Create(options),
+            _monitor,
+            NullLogger<VrchatLogReader>.Instance,
+            CreationTimeFromName,
+            path => owners.TryGetValue(Path.GetFileName(path), out var o) ? o : [],
+            record,
+            roster,
+            context);
+        var observer = new VrchatClientObserver(options, roster, record, CreationTimeFromName, () => _now);
+        VrchatObservation Observe()
+        {
+            var observation = observer.Observe(reader.Read(), CancellationToken.None);
+            foreach (var markers in observation.MarkerFiles)
+            {
+                observer.AcknowledgeMarkers(markers.Slot, markers.Key);
+            }
+
+            foreach (var previous in observation.PreviousMarkers)
+            {
+                observer.AcknowledgePrevious(previous);
+            }
+
+            return observation;
+        }
+
+        void Start(int pid, DateTime created, int launchOrder, string name)
+        {
+            _monitor.AddClient(pid, created, watchWorlds: false);
+            record.Clients.Add(new ManagedClient(pid, created, 1, Profile: launchOrder, LaunchOrder: launchOrder));
+            var path = LogPath(created);
+            File.WriteAllText(path, JoinLines(name, $"usr_{name.ToLowerInvariant()}-0000"));
+            owners[Path.GetFileName(path)] = [new VrchatLogOwners.Owner(pid, created, "VRChat")];
+        }
+
+        Start(100, T0, 0, "Alice");
+        Start(200, T0.AddSeconds(3), 1, "Bob");
+        var before = Observe();
+        var (slot0, slot1) = (Entry(before, 0), Entry(before, 1));
+        slot0.ProcessId.Should().Be(100);
+        slot1.ProcessId.Should().Be(200);
+
+        // close-client 0
+        _monitor.Clients.RemoveAll(c => c.ProcessId == 100);
+        record.Clients.RemoveAll(c => c.ProcessId == 100);
+        owners.Clear();
+        owners[Path.GetFileName(LogPath(T0.AddSeconds(3)))] = [new VrchatLogOwners.Owner(200, T0.AddSeconds(3), "VRChat")];
+        var left = Observe();
+        Entry(left, 0).Running.Should().BeFalse();
+        Entry(left, 0).State.Should().Be("left");
+
+        // launch-client 0, 40 s later
+        var relaunched = T0.AddSeconds(45);
+        context.MarkSingleLaunch(300, relaunched);
+        Start(300, relaunched, 0, "Alice");
+        _now = new DateTimeOffset(relaunched.AddSeconds(5));
+        var after = Observe();
+
+        var newSlot0 = Entry(after, 0);
+        newSlot0.ProcessId.Should().Be(300);
+        newSlot0.Running.Should().BeTrue();
+        newSlot0.LogStatus.Should().Be("shown");
+        newSlot0.ClientGeneration.Should().Be(VrchatClientRoster.GenerationOf(300, relaunched)).And.NotBe(slot0.ClientGeneration);
+        newSlot0.ObservationEpoch.Should().NotBeNull().And.NotBe(slot0.ObservationEpoch);
+        after.NewGenerations.Should().BeEquivalentTo([0]);
+
+        var sameSlot1 = Entry(after, 1);
+        sameSlot1.ProcessId.Should().Be(200);
+        sameSlot1.ClientGeneration.Should().Be(slot1.ClientGeneration);
+        sameSlot1.ObservationEpoch.Should().Be(slot1.ObservationEpoch);
+        sameSlot1.LogStatus.Should().Be("shown");
+    }
 }

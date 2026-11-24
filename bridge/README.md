@@ -21,3 +21,5 @@ Windows の通常ユーザーの対話セッションで動く .NET 10 アプリ
 ```
 
 `LanBindAddress` はループバックでも全インターフェースでもない、Windows の具体的な LAN IP にします。Bridge の状態は `%LOCALAPPDATA%\VRCRemoteTest\state` に固定されます。`Bridge.exe pair` が接続 URL、証明書指紋、トークンを表示します。インストール、ペアリング、ファイアウォール、旧環境撤去は [`docs/setup-windows.md`](../docs/setup-windows.md) を参照してください。旧版の詳しい設計・実機記録は `docs/validation/history` に保存しています。
+
+`VrchatClientMode` が `Relaunch` のとき、v0.10.0 から `POST /api/v1/clients/{slot}/close` と `/launch` で1台だけを閉じて、最後の配置と同じ起動の仕方で起動し直せます（Mac では `vrcrt.sh close-client` / `launch-client`）。Bridge が自分で起動して記録した台にしか効かず、要求から受け取るのは slot の番号だけです。起動の仕方は Bridge のメモリにだけ持つので、設定の変更や再起動のあとは配置し直してください。仕様は `VRC Remote Test — 実装仕様書.md` の管理 API、使い方は `docs/setup-windows.md` の4です。

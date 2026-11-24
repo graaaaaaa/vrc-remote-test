@@ -301,6 +301,66 @@ http POST_api_v1_clients_close 'not json'
 expect "close-clients with an answer that is not JSON is an invalid answer" 3 "not a close report" \
     "$vrcrt" close-clients
 
+# One client (Bridge v0.10.0): POST /api/v1/clients/<slot>/close and /launch.
+http_reset
+http POST_api_v1_clients_0_close '{"slot":0,"processId":100,"closed":1,"notConfirmed":0,"recordUpdated":true,"problems":[]}'
+expect "close-client" 0 "closed slot 0 (PID 100)" "$vrcrt" close-client 0
+expect "close-client asks for that slot only" 0 "" grep -qF '"path": "/api/v1/clients/0/close"' "$share/http/requests.log"
+http POST_api_v1_clients_0_close 409 '{"slot":0,"processId":100,"closed":0,"notConfirmed":1,"recordUpdated":false,"problems":["Could not confirm that the client exited\u001b"]}'
+expect "close-client with the client not confirmed closed is not done" 1 'problem: Could not confirm that the client exited\x1b' \
+    "$vrcrt" close-client 0
+http POST_api_v1_clients_0_close 409 '{"slot":0,"processId":100,"closed":1,"notConfirmed":0,"recordUpdated":false,"problems":["The client exited, but the record could not be updated."]}'
+expect "close-client with the record not updated is not done" 1 "closed slot 0 (PID 100)" "$vrcrt" close-client 0
+http POST_api_v1_clients_0_close 409 '{"error":"notRunning","problems":["The VRChat client the Bridge launched in slot 0 (PID 100) is not running."]}'
+expect "close-client refused" 1 "  - The VRChat client the Bridge launched in slot 0 (PID 100) is not running." "$vrcrt" close-client 0
+http POST_api_v1_clients_0_close 409 '{"error":"busy","operation":"deploy"}'
+expect "close-client while the Bridge is busy" 1 "busy (deploy)" "$vrcrt" close-client 0
+http POST_api_v1_clients_0_close '{"slot":0,"processId":100,"closed":1,"notConfirmed":1,"recordUpdated":true,"problems":[]}'
+expect "close-client with counts that do not add up is an invalid answer" 3 "not a close report" "$vrcrt" close-client 0
+http POST_api_v1_clients_0_close '{"slot":1,"processId":100,"closed":1,"notConfirmed":0,"recordUpdated":true,"problems":[]}'
+expect "close-client answered for another slot is an invalid answer" 3 "not a close report" "$vrcrt" close-client 0
+http POST_api_v1_clients_0_close '{"slot":0,"processId":true,"closed":1,"notConfirmed":0,"recordUpdated":true,"problems":[]}'
+expect "close-client with a PID that is not a number is an invalid answer" 3 "not a close report" "$vrcrt" close-client 0
+http POST_api_v1_clients_0_close 409 '{"slot":0,"processId":100,"closed":1,"notConfirmed":0,"recordUpdated":true,"problems":[]}'
+expect "close-client with a 409 that says done is an invalid answer" 3 "not a close report" "$vrcrt" close-client 0
+http POST_api_v1_clients_0_close DOWN
+expect "close-client without an answer says the outcome is unknown" 3 "whether slot 0 was closed is unknown" \
+    "$vrcrt" close-client 0
+rm "$share/http/POST_api_v1_clients_0_close"
+expect "close-client on a Bridge older than v0.10.0" 3 "older than v0.10.0" "$vrcrt" close-client 0
+http POST_api_v1_clients_0_close 401 ''
+expect "close-client with a token the Bridge rejects" 3 "rejected the pairing token" "$vrcrt" close-client 0
+expect "close-client with a slot out of range is a usage error" 2 "a slot is 0 to 3" "$vrcrt" close-client 4
+expect "close-client with a slot like 01 is a usage error" 2 "a slot is 0 to 3" "$vrcrt" close-client 01
+
+http POST_api_v1_clients_1_launch '{"slot":1,"profile":1,"processId":5678,"clientGeneration":4503599627370495}'
+expect "launch-client" 0 "launched slot 1 (profile 1, PID 5678, generation 4503599627370495)" "$vrcrt" launch-client 1
+http POST_api_v1_clients_1_launch '{"slot":1,"profile":1,"processId":5678,"clientGeneration":9007199254740993}'
+expect "launch-client with a generation past 53 bits is an invalid answer" 3 "not a launch report" "$vrcrt" launch-client 1
+http POST_api_v1_clients_1_launch '{"slot":1,"profile":false,"processId":5678,"clientGeneration":7}'
+expect "launch-client with a profile that is not a number is an invalid answer" 3 "not a launch report" "$vrcrt" launch-client 1
+http POST_api_v1_clients_1_launch 409 '{"error":"alreadyRunning","problems":["The VRChat client the Bridge launched in slot 1 is still running (PID 101)."]}'
+expect "launch-client refused" 1 "alreadyRunning" "$vrcrt" launch-client 1
+http POST_api_v1_clients_1_launch 409 '{"error":"noLaunchPlan","problems":["deploy a build first"]}'
+expect "launch-client after a Bridge restart says to deploy" 1 "  - deploy a build first" "$vrcrt" launch-client 1
+http POST_api_v1_clients_1_launch 400 '{"error":"unknownSlot","problems":["A client slot is 0 to 3."]}'
+expect "launch-client with a slot the Bridge does not know" 1 "unknownSlot" "$vrcrt" launch-client 1
+http POST_api_v1_clients_1_launch 500 '{"error":"launchedNotRecorded","slot":1,"launched":true,"recorded":false,"processId":5678,"problems":["Close it on Windows.\u001b[31m"]}'
+expect "launch-client that started a client it could not record" 1 "VRChat started (PID 5678) but the Bridge could not record it" \
+    "$vrcrt" launch-client 1
+expect "launch-client escapes the problems" 1 '  - Close it on Windows.\x1b[31m' "$vrcrt" launch-client 1
+http POST_api_v1_clients_1_launch 500 'Internal Server Error'
+expect "launch-client with an answer it does not send" 3 "not one it sends" "$vrcrt" launch-client 1
+http POST_api_v1_clients_1_launch "$(printf 'SLOW 0.5\n%s' '{"slot":1,"profile":1,"processId":5678,"clientGeneration":7}')"
+expect "launch-client waits for a slow answer" 0 "launched slot 1" env VRCRT_TEST_LAUNCH_TIMEOUT=2 "$vrcrt" launch-client 1
+http POST_api_v1_clients_1_launch "$(printf 'SLOW 3\n%s' '{"slot":1,"profile":1,"processId":5678,"clientGeneration":7}')"
+expect "launch-client with no answer in time says the outcome is unknown" 3 "whether slot 1 was started is unknown" \
+    env VRCRT_TEST_LAUNCH_TIMEOUT=0.5 "$vrcrt" launch-client 1
+http POST_api_v1_clients_1_launch DOWN
+expect "launch-client without an answer" 3 "cannot reach the Bridge" "$vrcrt" launch-client 1
+rm "$share/http/POST_api_v1_clients_1_launch"
+expect "launch-client on a Bridge older than v0.10.0" 3 "older than v0.10.0" "$vrcrt" launch-client 1
+
 clients joined joined ', "warnings": ['"$(python3 -I -c 'print(",".join(["\"w\""] * 80))')"']'
 expect "status prints at most 50 warnings per slot" 0 "slot 1: ... and 30 more" "$vrcrt" status
 clients joined joined ""
@@ -364,7 +424,7 @@ def handle(raw):
             answer(conn, 200, {})
         elif key == "GET /api/v1/bridge" and n == 1:
             answer(conn, 200, {"version": "0.8.0", "hostGeneration": 1})
-        elif key == "GET /api/v1/bridge":
+        elif key in ("GET /api/v1/bridge", "POST /api/v1/clients/0/launch", "POST /api/v1/clients/0/close"):
             trickle(conn)
         elif key == "POST /api/v1/bridge/restart":
             answer(conn, 202, {"restart": "scheduled", "hostGeneration": 1})
@@ -408,6 +468,17 @@ if command -v openssl >/dev/null 2>&1 \
         else
             fail "the deadline holds against a trickling server (${elapsed} ms for a 1 s wait)"
         fi
+        for command in launch-client close-client; do
+            started=$(now_ms)
+            expect "$command against a trickling header says the outcome is unknown" 3 "is unknown" \
+                real env VRCRT_TEST_LAUNCH_TIMEOUT=1 VRCRT_TEST_CLOSE_TIMEOUT=1 "$vrcrt" "$command" 0
+            elapsed=$(( $(now_ms) - started ))
+            if [ "$elapsed" -le 2500 ]; then
+                pass "$command's deadline holds against a trickling server (${elapsed} ms for a 1 s wait)"
+            else
+                fail "$command's deadline holds against a trickling server (${elapsed} ms for a 1 s wait)"
+            fi
+        done
     else
         fail "the local HTTPS server did not start"
     fi

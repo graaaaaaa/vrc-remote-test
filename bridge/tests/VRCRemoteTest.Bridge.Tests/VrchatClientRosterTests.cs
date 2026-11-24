@@ -153,6 +153,80 @@ public class VrchatClientRosterTests : IDisposable
     }
 
     [Fact]
+    public void A_relaunched_client_waits_for_its_launch_order_while_that_slot_cannot_be_checked()
+    {
+        var roster = NewRoster();
+        var records = new[] { new ManagedClient(100, T0, 1, 0, 0), new ManagedClient(200, T0.AddSeconds(3), 1, 1, 1) };
+        roster.Update(Snapshot(0, Client(100, T0), Client(200, T0.AddSeconds(3))), records);
+
+        // Slot 0's client was closed and started again; this poll cannot tell whether the old one is gone.
+        var relaunched = new[] { new ManagedClient(300, T0.AddMinutes(1), 1, 0, 0), records[1] };
+        var waiting = roster.Update(Snapshot(1, Client(200, T0.AddSeconds(3)), Client(300, T0.AddMinutes(1))), relaunched);
+
+        waiting.Slots[0].Liveness.Should().Be(RosterLiveness.Unknown);
+        SlotOf(waiting, 300).Should().BeNull("it does not take another slot meanwhile");
+        waiting.Unassigned.Should().Be(1);
+        waiting.NewGenerations.Should().BeEmpty();
+
+        var placed = roster.Update(Snapshot(0, Client(200, T0.AddSeconds(3)), Client(300, T0.AddMinutes(1))), relaunched);
+
+        SlotOf(placed, 300).Should().Be(0);
+        SlotOf(placed, 200).Should().Be(1);
+        placed.NewGenerations.Should().BeEquivalentTo([0]);
+        roster.EntryAt(0)!.ProcessId.Should().Be(300);
+    }
+
+    [Fact]
+    public void A_recorded_client_whose_launch_order_is_taken_by_another_running_client_still_gets_a_slot()
+    {
+        var roster = NewRoster();
+        roster.Update(Snapshot(0, Client(100, T0)), []);
+        var records = new[] { new ManagedClient(300, T0.AddMinutes(1), 1, 0, LaunchOrder: 0) };
+
+        var view = roster.Update(Snapshot(0, Client(100, T0), Client(300, T0.AddMinutes(1))), records);
+
+        SlotOf(view, 100).Should().Be(0);
+        SlotOf(view, 300).Should().Be(1);
+    }
+
+    [Fact]
+    public void While_a_launch_is_being_recorded_an_unrecorded_newcomer_is_not_placed()
+    {
+        var roster = NewRoster();
+        var records = new[] { new ManagedClient(100, T0, 1, 0, 0), new ManagedClient(200, T0.AddSeconds(3), 1, 1, 1) };
+        roster.Update(Snapshot(0, Client(100, T0), Client(200, T0.AddSeconds(3))), records);
+        var afterClose = new[] { records[1] };
+
+        // Slot 0 was closed; its new client is running but not recorded yet.
+        var held = roster.Update(Snapshot(0, Client(200, T0.AddSeconds(3)), Client(300, T0.AddMinutes(1))), afterClose, holdUnrecorded: true);
+
+        SlotOf(held, 300).Should().BeNull();
+        held.Unassigned.Should().Be(1);
+        held.Slots[1].Liveness.Should().Be(RosterLiveness.Running, "clients already placed are still observed");
+
+        var recorded = new[] { records[1], new ManagedClient(300, T0.AddMinutes(1), 1, 0, 0) };
+        var placed = roster.Update(Snapshot(0, Client(200, T0.AddSeconds(3)), Client(300, T0.AddMinutes(1))), recorded);
+
+        SlotOf(placed, 300).Should().Be(0);
+        placed.NewGenerations.Should().BeEquivalentTo([0]);
+    }
+
+    [Fact]
+    public void EntryAt_only_reads()
+    {
+        var roster = NewRoster();
+        roster.EntryAt(0).Should().BeNull();
+        roster.EntryAt(-1).Should().BeNull();
+        roster.EntryAt(4).Should().BeNull();
+        File.Exists(FilePath).Should().BeFalse();
+
+        roster.Update(Snapshot(0, Client(100, T0)), []);
+
+        roster.EntryAt(0).Should().Be(new RosterEntry(0, 100, T0));
+        NewRoster().EntryAt(0).Should().Be(new RosterEntry(0, 100, T0), "a new roster reads the saved slots");
+    }
+
+    [Fact]
     public void Epochs_keep_increasing_across_restarts()
     {
         var first = NewRoster();

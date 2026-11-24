@@ -27,14 +27,25 @@
 #   vrcrt.sh restart                      restart the Bridge host, and wait up to 90 s for it
 #   vrcrt.sh close-clients                close the VRChat clients the Bridge launched
 #
+# One client at a time (Bridge v0.10.0 and later, VrchatClientMode Relaunch; the slot is the
+# client's launch order, as `status` shows it):
+#
+#   vrcrt.sh close-client <slot>          close that client only; the others keep running
+#   vrcrt.sh launch-client <slot>         start that client again with the arguments the Bridge
+#                                         used for it in the last deploy (same profile, world and
+#                                         instance); waits up to 90 s for the Bridge's answer
+#                                         (close-client up to 45 s), then says the outcome is unknown
+#
 # Set VRCRT_BRIDGE_URL and VRCRT_CERT_SHA256. The token comes from macOS Keychain,
 # or VRCRT_TOKEN in CI. <cursor> is the JSON that
 # `cursor` prints, or @<file> holding it. Exit codes: 0 done, 1 timed out (or, for config
-# set, restart and close-clients, the Bridge refused, did not apply the change, could not
-# confirm every client closed, or did not come back within 90 s), 2 usage error, 3 the
+# set, restart, close-clients, close-client and launch-client, the Bridge refused, did not
+# apply the change, could not confirm every client closed or record the client it started, or
+# did not come back within 90 s), 2 usage error, 3 the
 # observation cannot answer (old or missing files, a client still being read, the Bridge
 # restarted or re-read a log, Logging not Full, records dropped, the Bridge unreachable,
-# older than v0.8.0, or answering in a shape it does not send).
+# older than v0.8.0 (v0.10.0 for close-client and launch-client), or answering in a shape it
+# does not send; for launch-client also no answer at all, when whether it started is unknown).
 #
 # Log lines are untrusted text a world can write: control characters and tabs are
 # printed escaped, JSON is parsed with Python's json module, and every regular
@@ -98,6 +109,11 @@ APPLY_TIMEOUT_SECONDS = test_setting("VRCRT_TEST_APPLY_TIMEOUT", "90", 0.1, 90.0
 APPLY_POLL_SECONDS = test_setting("VRCRT_TEST_POLL_SECONDS", "0" if FIXTURE_DIR else "2", 0.0 if FIXTURE_DIR else 0.1, 2.0)
 MAX_APPLY_POLLS = 45
 POLL_REQUEST_TIMEOUT = 10.0
+# launch-client: the Bridge may wait up to about 60 s for the previous client's log before it starts one.
+LAUNCH_TIMEOUT_SECONDS = test_setting("VRCRT_TEST_LAUNCH_TIMEOUT", "90", 0.1, 90.0)
+# close-client: the Bridge confirms the exit for up to 20 s, after listing the processes and before saving its record.
+CLOSE_TIMEOUT_SECONDS = test_setting("VRCRT_TEST_CLOSE_TIMEOUT", "45", 0.1, 45.0)
+MAX_GENERATION = (1 << 53) - 1
 BRIDGE_LOG_LINES = 30
 # What one answer may print: a 1 MiB answer must not become megabytes of terminal output.
 MAX_CELL_CHARS = 200
@@ -710,6 +726,90 @@ def cmd_close_clients(args):
     return refused("close-clients", status, text)
 
 
+def is_int(value, low, high):
+    """A JSON integer in [low, high]; true and false are not integers here."""
+    return type(value) is int and low <= value <= high
+
+
+def string_list(value):
+    return isinstance(value, list) and all(isinstance(item, str) for item in value)
+
+
+def single_client_refused(what, slot, status, text):
+    """Why the Bridge did not close or launch the client: exit 1 for a refusal it explains, 3 otherwise."""
+    body = json_of(text)
+    if status == 401:
+        raise Failure(EXIT_OBSERVATION, "the Bridge rejected the pairing token")
+    if status == 404 and not isinstance(body, dict):
+        raise Failure(EXIT_OBSERVATION, "the Bridge has no %s for one client; it is older than v0.10.0 (update it on Windows)"
+                      % what)
+    if status in (400, 409, 500) and isinstance(body, dict) and isinstance(body.get("error"), str) \
+            and (string_list(body.get("problems")) or (body["error"] == "busy" and "problems" not in body)):
+        return refused("%s %d" % (what, slot), status, text)
+    raise Failure(EXIT_OBSERVATION, "the Bridge's answer to %s %d is not one it sends (HTTP %d%s)"
+                  % (what, slot, status, error_summary(text)))
+
+
+def cmd_close_client(args):
+    # The whole request ends by the deadline, however slowly the answer trickles in.
+    try:
+        status, text = bridge_request("POST", "/api/v1/clients/%d/close" % args.slot, timeout=CLOSE_TIMEOUT_SECONDS,
+                                      deadline=time.monotonic() + CLOSE_TIMEOUT_SECONDS)
+    except Unreachable as error:
+        raise Failure(EXIT_OBSERVATION, "%s; whether slot %d was closed is unknown: check `vrcrt.sh status`"
+                      % (error, args.slot))
+    body = json_of(text)
+    if status in (200, 409) and isinstance(body, dict) and "closed" in body:
+        closed, not_confirmed = body.get("closed"), body.get("notConfirmed")
+        updated = body.get("recordUpdated")
+        if not (is_int(body.get("slot"), args.slot, args.slot) and is_int(body.get("processId"), 1, 2 ** 31 - 1)
+                and is_int(closed, 0, 1) and is_int(not_confirmed, 0, 1) and closed + not_confirmed == 1
+                and isinstance(updated, bool) and string_list(body.get("problems"))
+                and (status == 200) == (closed == 1 and updated)):
+            raise Failure(EXIT_OBSERVATION, "the Bridge's answer to close-client %d is not a close report" % args.slot)
+        if closed:
+            print("closed slot %d (PID %d)" % (args.slot, body["processId"]))
+        else:
+            print("slot %d (PID %d) may still be running" % (args.slot, body["processId"]))
+        print_items("problem: ", body["problems"], "list of problems")
+        if status != 200:
+            print("close-client: not done; check `vrcrt.sh status`", file=sys.stderr)
+        return 0 if status == 200 else EXIT_NOT_DONE
+    if status == 200:
+        raise Failure(EXIT_OBSERVATION, "the Bridge's answer to close-client %d is not a close report" % args.slot)
+    return single_client_refused("close-client", args.slot, status, text)
+
+
+def cmd_launch_client(args):
+    try:
+        # The whole request ends by the deadline, however slowly the answer trickles in.
+        status, text = bridge_request("POST", "/api/v1/clients/%d/launch" % args.slot, timeout=LAUNCH_TIMEOUT_SECONDS,
+                                      deadline=time.monotonic() + LAUNCH_TIMEOUT_SECONDS)
+    except Unreachable as error:
+        # Never retried: the Bridge may have started the client before the answer was lost.
+        raise Failure(EXIT_OBSERVATION, "%s; whether slot %d was started is unknown: check `vrcrt.sh status --json` "
+                      "before trying again" % (error, args.slot))
+    body = json_of(text)
+    if status == 200:
+        if not (isinstance(body, dict) and is_int(body.get("slot"), args.slot, args.slot)
+                and is_int(body.get("profile"), 0, 99) and is_int(body.get("processId"), 1, 2 ** 31 - 1)
+                and is_int(body.get("clientGeneration"), 1, MAX_GENERATION)):
+            raise Failure(EXIT_OBSERVATION, "the Bridge's answer to launch-client %d is not a launch report" % args.slot)
+        print("launched slot %d (profile %d, PID %d, generation %d)"
+              % (args.slot, body["profile"], body["processId"], body["clientGeneration"]))
+        return 0
+    if status == 500 and isinstance(body, dict) and body.get("error") == "launchedNotRecorded":
+        pid = body.get("processId")
+        if not (body.get("launched") is True and body.get("recorded") is False
+                and (pid is None or is_int(pid, 1, 2 ** 31 - 1)) and string_list(body.get("problems"))):
+            raise Failure(EXIT_OBSERVATION, "the Bridge's answer to launch-client %d is not a launch report" % args.slot)
+        print("launch-client %d: VRChat started (PID %s) but the Bridge could not record it, so it will not close it;"
+              " close it on Windows" % (args.slot, "unknown" if pid is None else pid), file=sys.stderr)
+        print_items("  - ", body["problems"], "list of problems", sys.stderr)
+        return EXIT_NOT_DONE
+    return single_client_refused("launch-client", args.slot, status, text)
+
+
 def export_one_log(slot, client, directory):
     body = json.dumps({"slot": slot, "clientGeneration": client["clientGeneration"],
                        "observationEpoch": client["observationEpoch"]}).encode("utf-8")
@@ -1304,6 +1404,15 @@ def main(argv):
 
     p = sub.add_parser("close-clients", help="close the VRChat clients the Bridge launched (v0.8.0+)")
     p.set_defaults(run=cmd_close_clients)
+
+    one_slot = argument(lambda value: parse_slot(value, allow_all=False))
+    p = sub.add_parser("close-client", help="close one VRChat client the Bridge launched (v0.10.0+, Relaunch)")
+    p.add_argument("slot", type=one_slot, help="0-3: the client's launch order, as status shows it")
+    p.set_defaults(run=cmd_close_client)
+
+    p = sub.add_parser("launch-client", help="start that client again as the last deploy did (v0.10.0+, Relaunch)")
+    p.add_argument("slot", type=one_slot, help="0-3: the client's launch order, as status shows it")
+    p.set_defaults(run=cmd_launch_client)
 
     args = parser.parse_args(argv)
     try:

@@ -34,6 +34,13 @@ namespace VRCRemoteTest.Bridge.VRChat;
 /// another VRChat on it or the client on another file; when no file can be matched, a
 /// diagnostic is published instead.
 ///
+/// A client the LAN API started on its own (<see cref="ClientSlotControl"/>, listed by
+/// <see cref="RelaunchLaunchContext.IsSingleLaunch"/>) is matched only by the file Restart
+/// Manager shows it alone has open, never by the times in the names: it starts next to the
+/// files of the client it replaces and of clients that have run for a while, any of which a
+/// name range could reach (late files, a clock that moved). Until Restart Manager answers,
+/// its slot says the log is not matched yet.
+///
 /// logs/vrchat-latest.log (Unity 0.5.x) keeps showing what it showed before slots: the
 /// first client's log (the representative client of
 /// <see cref="VrchatProcessMonitor.SelectRepresentative"/>, or in Relaunch mode the running
@@ -65,6 +72,9 @@ public sealed class VrchatLogReader : IVrchatLogReader
 
     private const string TruncationMarker = "... [truncated]";
 
+    /// <summary>How long a client started on its own counts as still creating its log while Restart Manager shows none.</summary>
+    internal static readonly TimeSpan SingleLaunchLogGrace = TimeSpan.FromMinutes(3);
+
     private readonly BridgeOptions _options;
     private readonly IVrchatProcessMonitor _processMonitor;
     private readonly ILogger<VrchatLogReader> _logger;
@@ -72,6 +82,7 @@ public sealed class VrchatLogReader : IVrchatLogReader
     private readonly IManagedClientStore? _managedClients;
     private readonly Func<string, IReadOnlyList<VrchatLogOwners.Owner>>? _queryOwners;
     private readonly VrchatClientRoster _roster;
+    private readonly RelaunchLaunchContext? _launchContext;
 
     /// <summary>Only VrchatLogService's sequential loop calls this reader, so no synchronization is needed.</summary>
     private readonly PinnedLog?[] _pinned = new PinnedLog?[SlotCount];
@@ -95,8 +106,9 @@ public sealed class VrchatLogReader : IVrchatLogReader
         IVrchatProcessMonitor processMonitor,
         ILogger<VrchatLogReader> logger,
         IManagedClientStore managedClients,
-        VrchatClientRoster roster)
-        : this(options, processMonitor, logger, File.GetCreationTimeUtc, DefaultOwnerQuery(), managedClients, roster)
+        VrchatClientRoster roster,
+        RelaunchLaunchContext launchContext)
+        : this(options, processMonitor, logger, File.GetCreationTimeUtc, DefaultOwnerQuery(), managedClients, roster, launchContext)
     {
     }
 
@@ -119,7 +131,8 @@ public sealed class VrchatLogReader : IVrchatLogReader
     /// Test-only seam for the owners too: <paramref name="queryOwners"/> stands in for
     /// <see cref="RestartManagerFileOwners.Query"/> (null: not available) and may throw
     /// like it. <paramref name="managedClients"/> is the Relaunch record (null: none), and
-    /// <paramref name="roster"/> defaults to one kept in memory only.
+    /// <paramref name="roster"/> defaults to one kept in memory only. <paramref name="launchContext"/>
+    /// (null: none) tells which clients were started on their own and when a launch is in progress.
     /// </summary>
     internal VrchatLogReader(
         IOptions<BridgeOptions> options,
@@ -128,7 +141,8 @@ public sealed class VrchatLogReader : IVrchatLogReader
         Func<string, DateTime> creationTimeUtc,
         Func<string, IReadOnlyList<VrchatLogOwners.Owner>>? queryOwners,
         IManagedClientStore? managedClients = null,
-        VrchatClientRoster? roster = null)
+        VrchatClientRoster? roster = null,
+        RelaunchLaunchContext? launchContext = null)
     {
         _options = options.Value;
         _processMonitor = processMonitor;
@@ -137,6 +151,7 @@ public sealed class VrchatLogReader : IVrchatLogReader
         _managedClients = managedClients;
         _queryOwners = queryOwners;
         _roster = roster ?? new VrchatClientRoster(filePath: null);
+        _launchContext = launchContext;
     }
 
     private string? LogDirectory => VrchatLogDirectory.Resolve(_options);
@@ -160,8 +175,13 @@ public sealed class VrchatLogReader : IVrchatLogReader
     {
         var snapshot = _processMonitor.GetClients();
         cancellationToken.ThrowIfCancellationRequested();
+
+        // Read before the record: a client in the snapshot was started before this poll, so if no
+        // launch is in progress now, the record read next already lists it (it is saved before the
+        // launch ends), unless it could not be recorded at all.
+        var holdUnrecorded = _options.IsRelaunchMode && _launchContext?.IsLaunching == true;
         var records = _options.IsRelaunchMode && _managedClients is not null ? _managedClients.Known : [];
-        var roster = _roster.Update(snapshot, records);
+        var roster = _roster.Update(snapshot, records, holdUnrecorded);
 
         var logDirectory = LogDirectory;
         if (logDirectory is null || !Directory.Exists(logDirectory))
@@ -366,6 +386,26 @@ public sealed class VrchatLogReader : IVrchatLogReader
         // Restart Manager settled nothing, so the file names decide as before, except for
         // files it showed belong to another VRChat.
         bool Refused(string path) => _mixedLogs.Contains(path) || ownership?.Refused.Contains(path) == true;
+
+        if (_launchContext?.IsSingleLaunch(client.ProcessId, client.CreationTimeUtc) == true)
+        {
+            // Pinned only ever by its owner (above), and released when Restart Manager says otherwise.
+            if (pinnedPath is not null && !Refused(pinnedPath))
+            {
+                return Show(slot, pinnedPath);
+            }
+
+            _pinned[slot] = null;
+
+            // VRChat has taken up to about 2 min to create its file under load; past that, say it is not matched.
+            var stillStarting = client.CreationTimeUtc is { } created && DateTime.UtcNow - created < SingleLaunchLogGrace;
+            return Problem(
+                slot,
+                stillStarting ? SlotLogStatus.NotYet : SlotLogStatus.Unmatched,
+                $"The {Describe(client, slot)} was started on its own through the LAN API, so its " +
+                $"{OutputLogPattern} file is matched only once Windows Restart Manager shows the client has it open; " +
+                "its log is shown then.");
+        }
 
         if (pinnedPath is not null)
         {
