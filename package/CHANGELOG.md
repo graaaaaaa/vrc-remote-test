@@ -1,8 +1,8 @@
 # Changelog
 
-## [Unreleased]
+## [0.10.0] - 2026-11-24
 
-Closing one VRChat client and starting it again from the Mac, for tests where one player leaves and rejoins the same instance while the others stay (Relaunch mode). **Update the Windows Bridge**; the Unity package has no functional changes.
+Closing one VRChat client and starting it again from the Mac, for tests where one player leaves and rejoins the same instance while the others stay (Relaunch mode). The Unity package has no functional changes, but the Remote Test window warns while their versions differ, so **update both the Windows Bridge** (`docs/setup-windows.md`, step 1, "版を入れ替える") **and the Unity package**. An existing `config.json` and pairing keep working. Checked on Windows on 2026-11-24 with two Relaunch clients on separate accounts: `close-client 0` closed only slot 0, and `launch-client 0` about a minute later started the same profile again, which rejoined the same instance with a new generation, observation epoch and its own log (`docs/validation/slot-close-relaunch.md`).
 
 ### Added (Bridge, LAN API)
 
