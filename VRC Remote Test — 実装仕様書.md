@@ -32,10 +32,15 @@ Windows の前に人がいなくても日々の管理ができるよう、次の
 - `GET /api/v1/config` と `PUT /api/v1/config`: 決まった設定だけを、決まった範囲で変えます。PUT は `If-Match` に `config.json` の SHA-256 を要し、本文は `Bridge` の節への JSON Merge Patch です。本番と同じ binding と検証を通った内容だけを書き、元のバイト列をバックアップに残し、一時ファイルを flush してから置き換えます。
 - `POST /api/v1/bridge/restart`: プロセスの中で host を作り直します。インスタンスのロック、証明書とトークン、操作の門はプロセスの寿命で持ち続けます。新しい host は Kestrel が待ち受けを始めるまで、配備の回復、掃除、状態の発行を始めません。設定の変更のあとに起動できなければ、`config.json` がまだその変更の書いたものであるときに限り、前の内容に戻します。
 - `POST /api/v1/clients/close`: Bridge が起動して記録した VRChat だけを閉じます。Reload で起動した台も v0.8.0 から `reload-clients.json` に記録します。
+- `POST /api/v1/clients/{slot}/close` と `POST /api/v1/clients/{slot}/launch`（v0.10.0、Relaunch だけ）: 1台だけを閉じる、その台を起動し直す。slot は Relaunch の起動の順番（`managed-clients.json` の `launchOrder`）で、観測の slot と同じです。要求から読むのは slot の番号だけです。
+  - close は、その順番の記録と4点（PID、作成時刻、session、名前）で一致するプロセスだけを、同じハンドルで閉じて終了を確かめ、記録からその1件だけを消します。観測の slot が別の台を指しているあいだ（起動し直した直後など）は `slotMismatch` で断ります。
+  - launch は、Bridge が今の host で最後に配置したときにその slot を起動した引数（ワールド、roomId、profile、VR の有無）だけで起動します。これはメモリにだけ持ち、配置の始めに消え、host が作り直されれば無くなります（`noLaunchPlan`）。起動して記録できた slot だけが対象です。起動の前に記録を書き直して書けることを確かめ、一括起動と同じ間隔を空け、待ったあとにもう一度プロセスを確かめます。起動したあとは要求が切れても記録まで済ませます。記録できなければ 500 `launchedNotRecorded`（PID つき）で、推測で閉じません。
+  - 断るときは何もせず、`{error, problems}` を返します（slot が 0〜3 の外は 400 `unknownSlot`、ほかは 409: `notRelaunchMode`、`recordUnreadable`、`recordCorrupt`、`notLaunchedByBridge`、`cannotCheck`、`notRunning`、`slotMismatch`、`noLaunchPlan`、`worldMissing`、`alreadyRunning`、`othersRunning`、`recordUnwritable`、`launchFailed`）。close の結果は `{slot, processId, closed, notConfirmed, recordUpdated, problems}` で、閉じて記録も直したときだけ 200、そうでなければ同じ形で 409。launch の結果は `{slot, profile, processId, clientGeneration}`。
+  - 単独で起動した台のログは、Restart Manager がその台だけが開いていると答えたファイルにだけ付け、名前の時刻では照合しません（閉じた台の遅いログや、ほかの台のログと取り違えないため）。起動してから記録するまでのあいだ、観測は記録の無い新しい台に slot を与えません。記録のある台は、その起動の順番の slot が確かめられないあいだ、別の slot に置かず待ちます。
 - `GET /api/v1/profiles`: Relaunch の profile ごとに、最後にログインしたアカウント。`/clients` の各台にも `loginState` と `account` が付きます。usr_ の ID は出さず、Windows の外に出ない鍵による HMAC の先頭12文字（`idDigest`）で、同じアカウントかだけを比べます。
 - 配備の結果には任意の `launch`（VRChat をどう起動したか）と `warnings` が付きます。413 には何が大きすぎたかと上限を JSON で返します。protocol の版は上げません。
 
-配備、設定の変更、閉じる操作、起動し直しは、1つの操作の門を通り、同時には1つだけです。門は、host が起動し終えるまで閉じています。起動し直しを予約してから新しい host が立つまでは、新しい commit も 409 で断ります。管理の操作の最中に受けた commit は待ち行列に残り、門が空いてから配備します。
+配備、設定の変更、閉じる操作（全台と1台）、1台の起動、起動し直しは、1つの操作の門を通り、同時には1つだけです。門は、host が起動し終えるまで閉じています。起動し直しを予約してから新しい host が立つまでは、新しい commit も 409 で断ります。管理の操作の最中に受けた commit は待ち行列に残り、門が空いてから配備します。
 
 ## 安全の範囲
 

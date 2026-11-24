@@ -124,7 +124,8 @@ public class VrchatLogReaderTests : IDisposable
             _monitor,
             NullLogger<VrchatLogReader>.Instance,
             new FakeManagedClientStore(),
-            new VrchatClientRoster(filePath: null));
+            new VrchatClientRoster(filePath: null),
+            new RelaunchLaunchContext());
 
         var result = reader.ReadSnapshot();
 

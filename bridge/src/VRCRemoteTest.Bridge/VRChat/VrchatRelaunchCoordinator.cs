@@ -42,6 +42,11 @@ namespace VRCRemoteTest.Bridge.VRChat;
 /// after the new first client started). A relaunch that stops before that point clears the
 /// line here, except after a cold start that StagingWatcher does not go on to launch (the
 /// install fails), where StagingWatcher clears it.
+///
+/// Each deploy also refills <see cref="RelaunchLaunchContext"/>: PrepareAsync empties it before
+/// anything else, and every client launched and recorded adds its slot (its launch order) with
+/// the arguments it was started with, so the LAN API can start that one client again
+/// (<see cref="ClientSlotControl"/>).
 /// </summary>
 public sealed class VrchatRelaunchCoordinator : IVrchatClientCoordinator
 {
@@ -61,6 +66,7 @@ public sealed class VrchatRelaunchCoordinator : IVrchatClientCoordinator
     private readonly Func<DateTime> _utcNow;
     private readonly VrchatClientTerminator _terminator;
     private readonly VrchatLaunchPacer _pacer;
+    private readonly RelaunchLaunchContext _launchContext;
 
     public VrchatRelaunchCoordinator(
         IOptions<BridgeOptions> options,
@@ -68,7 +74,8 @@ public sealed class VrchatRelaunchCoordinator : IVrchatClientCoordinator
         IVrchatLauncher launcher,
         IManagedClientStore store,
         VrchatLogNotice logNotice,
-        ILogger<VrchatRelaunchCoordinator> logger)
+        ILogger<VrchatRelaunchCoordinator> logger,
+        RelaunchLaunchContext launchContext)
         : this(
             options,
             processMonitor,
@@ -79,7 +86,8 @@ public sealed class VrchatRelaunchCoordinator : IVrchatClientCoordinator
             Task.Delay,
             () => VrchatLaunchPacer.ListLogFiles(options.Value),
             () => DateTime.UtcNow,
-            TimeZoneInfo.Local)
+            TimeZoneInfo.Local,
+            launchContext)
     {
     }
 
@@ -97,7 +105,8 @@ public sealed class VrchatRelaunchCoordinator : IVrchatClientCoordinator
         Func<TimeSpan, CancellationToken, Task> delay,
         Func<IReadOnlyList<VrchatLogMatcher.Candidate>?> listLogFiles,
         Func<DateTime> utcNow,
-        TimeZoneInfo timeZone)
+        TimeZoneInfo timeZone,
+        RelaunchLaunchContext? launchContext = null)
     {
         _options = options.Value;
         _processMonitor = processMonitor;
@@ -108,7 +117,11 @@ public sealed class VrchatRelaunchCoordinator : IVrchatClientCoordinator
         _utcNow = utcNow;
         _terminator = new VrchatClientTerminator(logger, utcNow, delay);
         _pacer = new VrchatLaunchPacer(logger, delay, listLogFiles, utcNow, timeZone);
+        _launchContext = launchContext ?? new RelaunchLaunchContext();
     }
+
+    /// <summary>What a single relaunch may repeat; for tests.</summary>
+    internal RelaunchLaunchContext LaunchContext => _launchContext;
 
     /// <summary>
     /// Ends with ColdStart only once every client the Bridge launched has exited, the
@@ -119,6 +132,9 @@ public sealed class VrchatRelaunchCoordinator : IVrchatClientCoordinator
     /// </summary>
     public async Task<VrchatPreparation> PrepareAsync(CancellationToken cancellationToken)
     {
+        // Whatever happens next, nothing of the previous batch may be started on its own again.
+        _launchContext.Clear();
+
         var coldStart = false;
         try
         {
@@ -270,6 +286,7 @@ public sealed class VrchatRelaunchCoordinator : IVrchatClientCoordinator
 
         // PrepareAsync left the record empty: every client it listed has exited.
         var launched = new List<ManagedClient>();
+        _launchContext.BeginBatch(deployedWorldPath, roomId);
         var batch = _pacer.StartBatch(count);
         var previousLaunchUtc = DateTime.MinValue;
 
@@ -302,6 +319,9 @@ public sealed class VrchatRelaunchCoordinator : IVrchatClientCoordinator
                 WatchWorlds: false,
                 Profile: profile);
 
+            // Held until the client is recorded (or cannot be), so the roster does not place it elsewhere meanwhile.
+            using var launching = _launchContext.BeginLaunch();
+            var filesBefore = _pacer.ListPaths();
             previousLaunchUtc = _utcNow();
             LaunchResult result;
             try
@@ -311,6 +331,11 @@ public sealed class VrchatRelaunchCoordinator : IVrchatClientCoordinator
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
                 result = LaunchResult.Failure(ex.Message);
+            }
+
+            if (result.Succeeded)
+            {
+                _launchContext.RecordLaunch(previousLaunchUtc, filesBefore);
             }
 
             if (!result.Succeeded)
@@ -335,7 +360,9 @@ public sealed class VrchatRelaunchCoordinator : IVrchatClientCoordinator
             }
 
             launched.Add(new ManagedClient(processId, creationTimeUtc, sessionId, profile, i));
-            if (!TrySave(launched))
+            var saved = TrySave(launched);
+            launching.Dispose();
+            if (!saved)
             {
                 var message =
                     $"Launched {i + 1} of {count} VRChat client(s), then stopped: client {i + 1} (PID {processId}) could " +
@@ -345,6 +372,7 @@ public sealed class VrchatRelaunchCoordinator : IVrchatClientCoordinator
                 return VrchatLaunchOutcome.Failure(message, ErrorCode.UnknownError, count, i + 1);
             }
 
+            _launchContext.AddSlot(i, profile, request.NoVr);
             _logger.LogInformation(
                 "Launched VRChat client {Index}/{Count} (profile {Profile}, PID {ProcessId}, created {CreationTimeUtc:O}, " +
                 "roomId {RoomId}).",

@@ -63,8 +63,9 @@ public sealed class BridgeHostTests : IAsyncLifetime
     private string DefaultBridge(string more = "") =>
         $"    \"LanBindAddress\": \"192.0.2.10\",\n    \"VrchatWorldsDirectory\": {JsonSerializer.Serialize(Worlds)},\n    \"RetainBuilds\": 10{more}";
 
-    private async Task StartAsync(string? config = null)
+    private async Task StartAsync(string? config = null, Action<IServiceCollection>? services = null)
     {
+        var extra = services;
         File.WriteAllText(ConfigPath, config ?? Config(DefaultBridge(), "  \"Serilog\": { \"Note\": \"kept\" },\n"));
         var identity = BridgeIdentity.LoadOrCreate(ConfigDirectory);
         _runtime = new BridgeRuntime(
@@ -83,6 +84,7 @@ public sealed class BridgeHostTests : IAsyncLifetime
 
                 services.RemoveAll<IVrchatProcessMonitor>();
                 services.AddSingleton<IVrchatProcessMonitor>(_processes);
+                extra?.Invoke(services);
             },
         };
         _run = Task.Run(() => BridgeHost.RunAsync(_runtime, [], test, _stop.Token));
@@ -428,5 +430,229 @@ public sealed class BridgeHostTests : IAsyncLifetime
         _stop.Cancel();
 
         Assert.Equal(0, await _run!.WaitAsync(TimeSpan.FromSeconds(30)));
+    }
+
+    // ---- one client: POST /clients/{slot}/close and /launch (v0.10.0) ----
+
+    private readonly FakeManagedClientStore _record = new();
+    private readonly FakeVrchatLauncher _launcher = new();
+    private DateTime _slotNow = new(2026, 10, 30, 12, 0, 0, DateTimeKind.Utc);
+
+    /// <summary>Whether the next host's launch context starts with slots 0 and 1 of a batch, as a deploy leaves it.</summary>
+    private bool _seedBatch = true;
+
+    private string RelaunchWorld => Path.Combine(Worlds, "vrc-remote-b1.vrcw");
+
+    /// <summary>
+    /// A Relaunch host whose clients 100 (slot 0) and 101 (slot 1) the Bridge launched and
+    /// recorded, with the real ClientSlotControl over fake processes, record, launcher and clock.
+    /// </summary>
+    private async Task<(FakeVrchatProcess Slot0, FakeVrchatProcess Slot1)> StartRelaunchAsync(string mode = "Relaunch")
+    {
+        var exe = Path.Combine(_root, "VRChat.exe");
+        File.WriteAllText(exe, string.Empty);
+        File.WriteAllText(RelaunchWorld, "world");
+        var created0 = _slotNow.AddMinutes(-3).AddTicks(123);
+        var created1 = _slotNow.AddMinutes(-3).AddSeconds(4).AddTicks(456);
+        _record.Clients.Add(new ManagedClient(100, created0, 1, 0, 0));
+        _record.Clients.Add(new ManagedClient(101, created1, 1, 1, 1));
+        var slot0 = Process(100, created0);
+        var slot1 = Process(101, created1);
+        _launcher.Clock = () => _slotNow;
+        _launcher.OnLaunch = pid => Process(pid, _launcher.Launched[^1].CreationTimeUtc);
+
+        var profiles = mode == "Relaunch" ? ",\n    \"VrchatProfiles\": [0, 1]" : string.Empty;
+        await StartAsync(
+            Config(DefaultBridge(
+                $",\n    \"AutoLaunchVrchat\": true,\n    \"VrchatExecutable\": {JsonSerializer.Serialize(exe)}" +
+                $",\n    \"VrchatClientMode\": \"{mode}\"{profiles}")),
+            services =>
+            {
+                services.RemoveAll<IManagedClientStore>();
+                services.AddSingleton<IManagedClientStore>(_record);
+                services.RemoveAll<IVrchatLauncher>();
+                services.AddSingleton<IVrchatLauncher>(_launcher);
+                services.RemoveAll<ClientSlotControl>();
+                services.AddSingleton(sp =>
+                {
+                    var context = sp.GetRequiredService<RelaunchLaunchContext>();
+                    if (_seedBatch)
+                    {
+                        context.BeginBatch(RelaunchWorld, "1234567890");
+                        context.AddSlot(0, 0, noVr: true);
+                        context.AddSlot(1, 1, noVr: true);
+                    }
+
+                    return new ClientSlotControl(
+                        sp.GetRequiredService<Microsoft.Extensions.Options.IOptions<BridgeOptions>>(),
+                        sp.GetRequiredService<IVrchatProcessMonitor>(),
+                        sp.GetRequiredService<IManagedClientStore>(),
+                        sp.GetRequiredService<IVrchatLauncher>(),
+                        context,
+                        sp.GetRequiredService<VrchatClientRoster>(),
+                        Microsoft.Extensions.Logging.Abstractions.NullLogger<ClientSlotControl>.Instance,
+                        (wait, _) =>
+                        {
+                            lock (_launcher)
+                            {
+                                _slotNow += wait;
+                            }
+
+                            return Task.CompletedTask;
+                        },
+                        () => null,
+                        () => _slotNow,
+                        File.Exists);
+                });
+            });
+        return (slot0, slot1);
+    }
+
+    private FakeVrchatProcess Process(int pid, DateTime created)
+    {
+        var process = _processes.AddProcess(pid, created);
+        process.Clock = () => _slotNow;
+        return process;
+    }
+
+    [Fact]
+    public async Task One_client_is_closed_and_started_again_over_the_LAN_API()
+    {
+        var (slot0, slot1) = await StartRelaunchAsync();
+
+        var close = await _client!.PostAsync("clients/0/close", null);
+        var closed = JsonNode.Parse(await close.Content.ReadAsStringAsync())!;
+        Assert.Equal(HttpStatusCode.OK, close.StatusCode);
+        Assert.Equal(100, closed["processId"]!.GetValue<int>());
+        Assert.Equal(1, closed["closed"]!.GetValue<int>());
+        Assert.True(closed["recordUpdated"]!.GetValue<bool>());
+        Assert.False(slot0.IsRunning);
+
+        var launch = await _client.PostAsync("clients/0/launch", null);
+        var launched = JsonNode.Parse(await launch.Content.ReadAsStringAsync())!;
+        Assert.Equal(HttpStatusCode.OK, launch.StatusCode);
+        var (pid, created) = _launcher.Launched.Single();
+        Assert.Equal(pid, launched["processId"]!.GetValue<int>());
+        Assert.Equal(0, launched["profile"]!.GetValue<int>());
+        Assert.Equal(VrchatClientRoster.GenerationOf(pid, created), launched["clientGeneration"]!.GetValue<long>());
+        Assert.Equal(RelaunchWorld, _launcher.Requests.Single().WorldPath);
+        Assert.Equal("1234567890", _launcher.Requests.Single().RoomId);
+
+        Assert.True(slot1.IsRunning);
+        Assert.Equal(0, slot1.CloseCalls + slot1.KillCalls);
+        Assert.Contains(_record.Clients, c => c.ProcessId == pid && c.LaunchOrder == 0);
+        Assert.Contains(_record.Clients, c => c.ProcessId == 101 && c.LaunchOrder == 1);
+    }
+
+    [Fact]
+    public async Task Without_the_token_the_single_client_routes_answer_401_and_touch_nothing()
+    {
+        var (slot0, _) = await StartRelaunchAsync();
+        slot0.Exit();
+
+        foreach (var token in new string?[] { null, "not-the-token" })
+        {
+            foreach (var path in new[] { "clients/0/close", "clients/1/close", "clients/0/launch" })
+            {
+                using var request = new HttpRequestMessage(HttpMethod.Post, path);
+                request.Headers.Authorization = token is null ? null : new AuthenticationHeaderValue("Bearer", token);
+
+                using var anonymous = new HttpClient(new HttpClientHandler
+                {
+                    ServerCertificateCustomValidationCallback = (_, _, _, _) => true,
+                }) { BaseAddress = _client!.BaseAddress };
+                Assert.Equal(HttpStatusCode.Unauthorized, (await anonymous.SendAsync(request)).StatusCode);
+            }
+        }
+
+        Assert.False(_launcher.LaunchCalled);
+        Assert.All(_processes.Processes, p => Assert.Equal(0, p.CloseCalls + p.KillCalls));
+        Assert.Equal(0, _record.SaveCalls);
+    }
+
+    [Theory]
+    [InlineData("-1", HttpStatusCode.BadRequest, "unknownSlot")]
+    [InlineData("4", HttpStatusCode.BadRequest, "unknownSlot")]
+    [InlineData("01", HttpStatusCode.Conflict, "alreadyRunning")]
+    [InlineData("99999999999", HttpStatusCode.NotFound, "")]
+    public async Task The_slot_is_an_integer_from_0_to_3(string slot, HttpStatusCode status, string error)
+    {
+        await StartRelaunchAsync();
+
+        var response = await _client!.PostAsync($"clients/{slot}/launch", null);
+
+        Assert.Equal(status, response.StatusCode);
+        var body = await response.Content.ReadAsStringAsync();
+        if (error.Length == 0)
+        {
+            Assert.Equal(string.Empty, body);
+        }
+        else
+        {
+            Assert.Equal(error, JsonNode.Parse(body)!["error"]!.GetValue<string>());
+            Assert.NotEmpty(JsonNode.Parse(body)!["problems"]!.AsArray());
+        }
+
+        Assert.False(_launcher.LaunchCalled);
+    }
+
+    [Fact]
+    public async Task The_single_client_routes_are_busy_while_another_operation_holds_the_gate()
+    {
+        var (slot0, _) = await StartRelaunchAsync();
+        using (_runtime!.Gate.TryEnter("deploy"))
+        {
+            foreach (var path in new[] { "clients/0/close", "clients/0/launch" })
+            {
+                var response = await _client!.PostAsync(path, null);
+                Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);
+                Assert.Contains("\"operation\":\"deploy\"", await response.Content.ReadAsStringAsync());
+            }
+        }
+
+        Assert.True(slot0.IsRunning);
+        Assert.False(_launcher.LaunchCalled);
+    }
+
+    [Fact]
+    public async Task In_Reload_mode_the_single_client_routes_refuse()
+    {
+        var (slot0, _) = await StartRelaunchAsync("Reload");
+
+        var response = await _client!.PostAsync("clients/0/close", null);
+
+        Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);
+        Assert.Equal("notRelaunchMode", JsonNode.Parse(await response.Content.ReadAsStringAsync())!["error"]!.GetValue<string>());
+        Assert.True(slot0.IsRunning);
+    }
+
+    [Fact]
+    public async Task A_restarted_host_has_no_launch_to_repeat()
+    {
+        var (slot0, _) = await StartRelaunchAsync();
+        slot0.Exit();
+        _seedBatch = false;
+        _now += TimeSpan.FromSeconds(11);
+        Assert.Equal(HttpStatusCode.Accepted, (await _client!.PostAsync("bridge/restart", null)).StatusCode);
+        await WaitForGenerationAsync(2);
+
+        var response = await _client.PostAsync("clients/0/launch", null);
+
+        Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);
+        Assert.Equal("noLaunchPlan", JsonNode.Parse(await response.Content.ReadAsStringAsync())!["error"]!.GetValue<string>());
+        Assert.False(_launcher.LaunchCalled);
+    }
+
+    [Fact]
+    public async Task Twenty_launches_at_once_start_one_client()
+    {
+        var (slot0, _) = await StartRelaunchAsync();
+        slot0.Exit();
+
+        var responses = await Task.WhenAll(Enumerable.Range(0, 20).Select(_ => _client!.PostAsync("clients/0/launch", null)));
+
+        Assert.Single(_launcher.Requests);
+        Assert.Single(responses, r => r.StatusCode == HttpStatusCode.OK);
+        Assert.All(responses.Where(r => r.StatusCode != HttpStatusCode.OK), r => Assert.Equal(HttpStatusCode.Conflict, r.StatusCode));
     }
 }

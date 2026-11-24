@@ -17,7 +17,9 @@ namespace VRCRemoteTest.Bridge.Lan;
 /// The LAN routes that let the Mac look after the Bridge without anyone at the Windows PC
 /// (v0.8.0): its version, configuration and log; changing a fixed set of settings, each
 /// within a range (<see cref="Editable"/>); restarting the host in-process; closing the
-/// VRChat clients it launched; and which account each profile was last logged in to. Same
+/// VRChat clients it launched; closing one of them, or starting it again with the arguments
+/// the Bridge used for it (v0.10.0, Relaunch mode, <see cref="ClientSlotControl"/>); and which
+/// account each profile was last logged in to. Same
 /// authentication as every other route. Nothing here runs a command, takes a free-form path
 /// or changes the listen address, the port, the state directory, the Worlds directory or
 /// the pairing. Management operations take the operation gate and answer 409 busy when a
@@ -64,6 +66,10 @@ internal static class BridgeAdminApi
         api.MapPut("/config", (Func<HttpContext, Task<IResult>>)(context => PutConfig(context, runtime)));
         api.MapPost("/bridge/restart", () => Restart(runtime));
         api.MapPost("/clients/close", (Func<HttpContext, Task<IResult>>)(context => Close(context, runtime)));
+
+        // Only the slot comes from the request: no body or query is read.
+        api.MapPost("/clients/{slot:int}/close", (HttpContext context, int slot) => CloseOne(context, runtime, slot));
+        api.MapPost("/clients/{slot:int}/launch", (HttpContext context, int slot) => LaunchOne(context, runtime, slot));
     }
 
     private static IResult Info(HttpContext context, BridgeRuntime runtime)
@@ -424,6 +430,97 @@ internal static class BridgeAdminApi
             problem = report.Problem is null ? null : LogRedactor.Redact(report.Problem),
         }, statusCode: report.Refused ? StatusCodes.Status409Conflict : StatusCodes.Status200OK);
     }
+
+    private static async Task<IResult> CloseOne(HttpContext context, BridgeRuntime runtime, int slot)
+    {
+        using var lease = runtime.Gate.TryEnter("close-client");
+        if (lease is null)
+        {
+            return Busy(runtime);
+        }
+
+        var control = context.RequestServices.GetRequiredService<ClientSlotControl>();
+        var result = await control.CloseAsync(slot, context.RequestAborted);
+        if (result.Refusal is { } refusal)
+        {
+            return Refused(refusal, result.Problems);
+        }
+
+        return Results.Json(new
+        {
+            slot = result.Slot,
+            processId = result.ProcessId,
+            closed = result.Closed,
+            notConfirmed = result.NotConfirmed,
+            recordUpdated = result.RecordUpdated,
+            problems = result.Problems.Select(LogRedactor.Redact).ToList(),
+        }, statusCode: result.Done ? StatusCodes.Status200OK : StatusCodes.Status409Conflict);
+    }
+
+    /// <summary>
+    /// The gate is held until the client is recorded: from Process.Start on, the launch ignores
+    /// the request being aborted, so a client that started is never left unrecorded by a
+    /// disconnect (its answer then simply reaches no one).
+    /// </summary>
+    private static async Task<IResult> LaunchOne(HttpContext context, BridgeRuntime runtime, int slot)
+    {
+        using var lease = runtime.Gate.TryEnter("launch-client");
+        if (lease is null)
+        {
+            return Busy(runtime);
+        }
+
+        var control = context.RequestServices.GetRequiredService<ClientSlotControl>();
+        SlotLaunchResult result;
+        try
+        {
+            result = await control.LaunchAsync(slot, context.RequestAborted);
+        }
+        catch (OperationCanceledException) when (context.RequestAborted.IsCancellationRequested)
+        {
+            // Stopped before anything was started; nobody is listening for the answer.
+            return Results.Empty;
+        }
+
+        if (result.Refusal is { } refusal)
+        {
+            return Refused(refusal, result.Problems);
+        }
+
+        if (result.NotRecorded)
+        {
+            return Results.Json(new
+            {
+                error = "launchedNotRecorded",
+                slot = result.Slot,
+                launched = true,
+                recorded = false,
+                processId = result.ProcessId,
+                problems = result.Problems.Select(LogRedactor.Redact).ToList(),
+            }, statusCode: StatusCodes.Status500InternalServerError);
+        }
+
+        return Results.Json(new
+        {
+            slot = result.Slot,
+            profile = result.Profile,
+            processId = result.ProcessId,
+            clientGeneration = result.ClientGeneration,
+        });
+    }
+
+    /// <summary>The refusal's name in camelCase (unknownSlot, alreadyRunning, ...); 400 for a slot out of range, else 409.</summary>
+    internal static string ErrorName(SlotRefusal refusal)
+    {
+        var name = refusal.ToString();
+        return char.ToLowerInvariant(name[0]) + name[1..];
+    }
+
+    private static IResult Refused(SlotRefusal refusal, IReadOnlyList<string> problems) =>
+        Problem(
+            refusal == SlotRefusal.UnknownSlot ? StatusCodes.Status400BadRequest : StatusCodes.Status409Conflict,
+            ErrorName(refusal),
+            problems);
 
     /// <summary>The bytes config.json would hold after <paramref name="patch"/>; the rest of the file keeps its values.</summary>
     internal static byte[] Apply(byte[]? before, JsonObject patch, IReadOnlyList<ExecutableCandidate> candidates)

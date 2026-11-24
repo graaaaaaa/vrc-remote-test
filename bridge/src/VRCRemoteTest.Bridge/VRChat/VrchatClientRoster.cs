@@ -41,7 +41,10 @@ public enum RosterLiveness
 public sealed record RosterSlot(int Slot, RosterEntry? Entry, RosterLiveness Liveness, VrchatClientInfo? Client);
 
 /// <param name="NewGenerations">Slots that were given to a new client by this update.</param>
-/// <param name="Unassigned">Running clients without a slot: unknown creation time, or more than four.</param>
+/// <param name="Unassigned">
+/// Running clients without a slot: unknown creation time, more than four, or waiting to be placed (their
+/// launch order's slot cannot be checked, or they may be a client still being recorded).
+/// </param>
 public sealed record RosterView(
     IReadOnlyList<RosterSlot> Slots, IReadOnlySet<int> NewGenerations, int Unassigned)
 {
@@ -120,7 +123,12 @@ public sealed class VrchatClientRoster
     }
 
     /// <param name="records">The Bridge's Relaunch record; empty in Reload mode.</param>
-    public RosterView Update(VrchatClientSnapshot snapshot, IReadOnlyList<ManagedClient> records)
+    /// <param name="holdUnrecorded">
+    /// A launch is between Process.Start and its record (<see cref="RelaunchLaunchContext.IsLaunching"/>): a
+    /// newcomer the record does not list yet may be that client, so it is left unplaced for now instead of
+    /// taking another slot and moving to its launch order once recorded (a second new generation).
+    /// </param>
+    public RosterView Update(VrchatClientSnapshot snapshot, IReadOnlyList<ManagedClient> records, bool holdUnrecorded = false)
     {
         lock (_gate)
         {
@@ -176,7 +184,18 @@ public sealed class VrchatClientRoster
                     continue;
                 }
 
-                if (FreeSlot(liveness, RecordedSlot(client, records)) is not { } free)
+                // A recorded client waits for its launch order while that slot cannot be checked,
+                // rather than taking another one and moving later (a second new generation). One
+                // whose launch order is taken by another running client still goes elsewhere.
+                var preferred = RecordedSlot(client, records);
+                if ((preferred is { } target && liveness[target] == RosterLiveness.Unknown)
+                    || (preferred is null && holdUnrecorded))
+                {
+                    unassigned++;
+                    continue;
+                }
+
+                if (FreeSlot(liveness, preferred) is not { } free)
                 {
                     unassigned++;
                     continue;
@@ -194,6 +213,24 @@ public sealed class VrchatClientRoster
             }
 
             return ViewLocked(s => liveness[s], clients, newGenerations, unassigned);
+        }
+    }
+
+    /// <summary>
+    /// The client the slot was last given, as the last <see cref="Update"/> left it; null when
+    /// none. Reads only: nothing is placed or saved (the file is read once if nothing was yet).
+    /// </summary>
+    public RosterEntry? EntryAt(int slot)
+    {
+        if (slot is < 0 or >= SlotCount)
+        {
+            return null;
+        }
+
+        lock (_gate)
+        {
+            EnsureLoadedLocked();
+            return _entries[slot];
         }
     }
 

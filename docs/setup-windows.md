@@ -87,6 +87,8 @@ Unity の Preflight が `Windows Bridge: Connected` になり、`Remote Build & 
 | `vrcrt.sh config set KEY=VALUE…` | 設定を変えて Bridge を起動し直し、効いたかを確かめる |
 | `vrcrt.sh restart` | Bridge を起動し直す |
 | `vrcrt.sh close-clients` | Bridge が起動した VRChat を閉じる |
+| `vrcrt.sh close-client <slot>` | Bridge 0.10.0 以降、Relaunch: その slot の台だけを閉じる |
+| `vrcrt.sh launch-client <slot>` | Bridge 0.10.0 以降、Relaunch: その slot の台を、最後の配置と同じ起動の仕方で起動し直す |
 | `vrcrt.sh profiles` | profile ごとに、最後にログインしたアカウント |
 
 台数とアカウント（`VrchatClientMode`、`VrchatClientCount`、`VrchatProfiles`）は、Unity の VRC Remote Test ウィンドウの「VRChat Clients」でも変えられます（パッケージ 0.9.0 以降。Bridge 0.8.0 以降で動くが、版が違うとウィンドウが警告するので、両方を同じ版にそろえる）。中で呼んでいるのは同じ `PUT /api/v1/config` です。
@@ -94,6 +96,7 @@ Unity の Preflight が `Windows Bridge: Connected` になり、`Remote Build & 
 - Relaunch で profile を足すとき（例: `0, 1` から `0, 1, 2, 3` の4台にする）は、その profile に Windows で一度ログインしておきます。`start-vrchat-dev.ps1 -Profiles 2` のように1台だけ起動して、手でログインします。パスワードはスクリプトにも設定ファイルにも書きません。ウィンドウは、profile ごとに最後にログインしたアカウントを表示します。Bridge がアカウントを知るのは、自分で起動した台のログからだけです。そのため、`start-vrchat-dev.ps1` でログインしただけの profile は「account not seen yet」と出て、最初の配布でその profile が起動したあとにアカウントが出ます。
 - 3台以上にするときは、ウィンドウの Settings で Result Timeout を 180 秒以上にします。閉じて起動する時間がかかるためです。
 - Reload で台数だけを変えたときは、動いている台はそのまま残ります。`Close Bridge's VRChat` で閉じると、次の配置で新しい台数が起動します。
+- 1台だけ抜けて途中参加し直す試験（Relaunch だけ）は、`close-client <slot>` と `launch-client <slot>` で Windows に触らずにできます。slot は `status` の SLOT で、Relaunch ではその台の起動の順番（`VrchatProfiles` の何番目か）です。`launch-client` は、Bridge が最後の配置でその slot を起動したときの profile・ワールド・roomId・VR の有無だけを使い、Mac からは何も渡しません。これは Bridge の中にだけ覚えていて、設定の変更や `restart` で Bridge が起動し直すと消えるので、そのあとは配置し直すまで `noLaunchPlan` で断ります。Bridge が起動していない VRChat が動いているとき、その台がまだ動いているとき、記録が読めない・壊れているときも断り、何もしません。起動し直した台のログは、Windows が「その台が開いている」と答えたファイルにだけ付けます。答えが来るまで、その slot のログは `notYet` です。`status` に新しい PID・世代・EPOCH が出るまで数秒かかります。手順と確かめ方は [`docs/validation/slot-close-relaunch.md`](validation/slot-close-relaunch.md)。
 
 変えられる設定は `AutoLaunchVrchat`、`VrchatClientMode`、`VrchatProfiles`、`VrchatClientCount`、`VrchatMode`、`VrchatStartupTimeoutSeconds`（30〜600）、`VrchatStartupSettleDelaySeconds`（1〜300）、`RetainBuilds`（1〜100）、`MaxArtifactSizeBytes`（1 MiB〜2 GiB）、`LogMarkerPrefixes` です。`VrchatExecutable` は、Bridge が Steam のライブラリで見つけた `VRChat.exe` の候補から選びます（`VrchatExecutableCandidate=steam-0` のように指定）。`LanBindAddress`、`LanPort`、`VrchatWorldsDirectory` とペアリングは、Mac からは変えられません。
 

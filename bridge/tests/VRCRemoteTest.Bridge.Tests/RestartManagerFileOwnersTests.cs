@@ -128,7 +128,8 @@ public class RestartManagerFileOwnersTests : IDisposable
             monitor,
             NullLogger<VrchatLogReader>.Instance,
             new FakeManagedClientStore(),
-            new VrchatClientRoster(filePath: null));
+            new VrchatClientRoster(filePath: null),
+            new RelaunchLaunchContext());
 
         using (HoldOpen(path))
         {

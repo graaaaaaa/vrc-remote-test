@@ -59,6 +59,8 @@ Windows Bridge の実行体（`VRCRemoteTest.Bridge.exe`）は、[Releases](http
 | `scripts/vrcrt.sh config set KEY=VALUE…` | 設定を変え、Bridge が起動し直して効いたかを待つ（最大90秒）。`KEY=null` で項目を消す |
 | `scripts/vrcrt.sh restart` | Bridge を起動し直し、新しい host が立つのを待つ |
 | `scripts/vrcrt.sh close-clients` | Bridge が起動した VRChat を閉じる。閉じたと確かめられない台が残れば終了コード 1 |
+| `scripts/vrcrt.sh close-client <slot>` | Bridge 0.10.0 以降、Relaunch: その slot の台だけを閉じる。ほかの台はそのまま。閉じたと確かめられないか記録を直せなければ終了コード 1 |
+| `scripts/vrcrt.sh launch-client <slot>` | Bridge 0.10.0 以降、Relaunch: その slot の台を、最後の配置と同じ profile・ワールド・インスタンスで起動し直す。動いていれば断る。Bridge の答えを最大90秒待ち、答えが無ければ終了コード 3（起動したかは `status --json` で確かめる） |
 | `scripts/vrcrt.sh profiles` | profile ごとに、最後にログインしたアカウント |
 
 待つ前に `cursor` で位置を取り、操作のあとに `--after` で渡すと、操作より前の行を新しい出来事と取り違えません。
@@ -71,7 +73,7 @@ cursor="$(scripts/vrcrt.sh cursor)"
 scripts/vrcrt.sh wait-marker 1 'PLAYER_RESTORED' 60 --after "$cursor"
 ```
 
-終了コードは 0 が成功、1 が時間切れ（管理のコマンドでは、Bridge が断った、設定の変更が戻された・失敗した、も含む）、2 が使い方の誤り（正規表現の誤りと、2秒を超えた正規表現を含む）、3 が観測では答えられないとき（Bridgeの観測情報が無いか古い、Bridge の再起動などで読み直した、Logging が Full でない、マーカーが上限で捨てられた、管理のコマンドでは Bridge に届かないか 0.8.0 より古い）。管理のコマンドの詳しい使い方は `docs/setup-windows.md` の4。`wait-marker` の正規表現は、Bridge がエスケープしたあとの行に当てます。同じインスタンスでも同じビルドとは限りません。動作の確認は `bash scripts/test-vrcrt.sh`。
+終了コードは 0 が成功、1 が時間切れ（管理のコマンドでは、Bridge が断った、設定の変更が戻された・失敗した、も含む）、2 が使い方の誤り（正規表現の誤りと、2秒を超えた正規表現を含む）、3 が観測では答えられないとき（Bridgeの観測情報が無いか古い、Bridge の再起動などで読み直した、Logging が Full でない、マーカーが上限で捨てられた、管理のコマンドでは Bridge に届かないか 0.8.0 より古い。`close-client` と `launch-client` は 0.10.0 より古い）。管理のコマンドの詳しい使い方は `docs/setup-windows.md` の4。`wait-marker` の正規表現は、Bridge がエスケープしたあとの行に当てます。同じインスタンスでも同じビルドとは限りません。動作の確認は `bash scripts/test-vrcrt.sh`。
 
 ビルドから結果・全文ログまで一度に保存する場合は、対話用 Unity Editor で対象プロジェクトを閉じ、保存済みシーンを指定して実行します。保存先は新しいディレクトリにしてください。ペアリングトークンは Keychain から読みます。`-quit` は付けず、ビルド完了後に拡張が Unity を終了します。
 

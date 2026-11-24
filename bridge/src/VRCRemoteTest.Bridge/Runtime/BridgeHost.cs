@@ -113,6 +113,10 @@ public static class BridgeHost
                 : sp.GetRequiredService<VrchatClientCoordinator>());
         builder.Services.AddSingleton<OwnedClientCloser>();
 
+        // Per host, never kept across a restart: a new host has no launch to repeat.
+        builder.Services.AddSingleton<RelaunchLaunchContext>();
+        builder.Services.AddSingleton<ClientSlotControl>();
+
         // Phase 5: snapshot reader + its own polling BackgroundService. Since the client
         // observation plan's P1 every client has a slot (VrchatClientRoster, observation only) and
         // its own log, state and marker lines (VrchatClientObserver); vrchat-latest.log stays on

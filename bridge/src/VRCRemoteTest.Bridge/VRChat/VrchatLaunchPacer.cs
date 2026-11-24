@@ -173,6 +173,33 @@ internal sealed class VrchatLaunchPacer
     }
 
     /// <summary>
+    /// One client started on its own (<see cref="ClientSlotControl"/>): the same wait as the
+    /// next client of a batch whose only launch so far was <paramref name="last"/>, i.e. at
+    /// least <see cref="LaunchInterval"/> after it and, until <see cref="LogWaitBudget"/> after
+    /// it, until a file that was not there before it has appeared. Nothing to wait for without
+    /// a previous launch, or once its budget has passed (then only the interval, long over).
+    /// Any new file ends the wait, another running client's late one included: this only spaces
+    /// the launches, and a client started on its own is matched to its log by its owner alone
+    /// (<see cref="VrchatLogReader"/>).
+    /// </summary>
+    public Task WaitBeforeSingleLaunchAsync(LastLaunch? last, CancellationToken cancellationToken)
+    {
+        if (last is null)
+        {
+            return Task.CompletedTask;
+        }
+
+        var deadlineUtc = last.Utc + LogWaitBudget;
+        var watch = last.FilesBefore is { } before && _utcNow() < deadlineUtc
+            ? new LogWatch(before.ToHashSet(StringComparer.OrdinalIgnoreCase), deadlineUtc)
+            : null;
+        return WaitBeforeNextLaunchAsync(new Batch(1, watch), launched: 1, last.Utc, cancellationToken);
+    }
+
+    /// <summary>The output_log paths that exist now; null when they cannot be listed.</summary>
+    public IReadOnlyList<string>? ListPaths() => _listLogFiles()?.Select(c => c.Path).ToList();
+
+    /// <summary>
     /// Null when the directory cannot be listed or holds too many files to list. A
     /// directory that does not exist yet is empty: VRChat creates it on its first start.
     /// </summary>

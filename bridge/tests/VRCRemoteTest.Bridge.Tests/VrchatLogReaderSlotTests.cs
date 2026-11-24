@@ -40,7 +40,8 @@ public class VrchatLogReaderSlotTests : IDisposable
         try { Directory.Delete(_tempDir, recursive: true); } catch (IOException) { }
     }
 
-    private VrchatLogReader CreateReader(bool withOwners = false, FakeManagedClientStore? record = null) =>
+    private VrchatLogReader CreateReader(
+        bool withOwners = false, FakeManagedClientStore? record = null, RelaunchLaunchContext? launchContext = null) =>
         new(
             Options.Create(new BridgeOptions
             {
@@ -51,7 +52,8 @@ public class VrchatLogReaderSlotTests : IDisposable
             _logger,
             CreationTimeFromName,
             withOwners ? QueryOwners : null,
-            record);
+            record,
+            launchContext: launchContext);
 
     private IReadOnlyList<VrchatLogOwners.Owner> QueryOwners(string path)
     {
@@ -240,5 +242,86 @@ public class VrchatLogReaderSlotTests : IDisposable
         Content(read, 0).Should().Contain("could not be checked");
         Content(read, 1).Should().Contain("second client line");
         read.Latest.Content.Should().Contain("could not be checked", "vrchat-latest.log stays on its client as before");
+    }
+
+    [Fact]
+    public void A_client_started_on_its_own_gets_only_the_log_Restart_Manager_shows_it_has_open()
+    {
+        var record = new FakeManagedClientStore();
+        var context = new RelaunchLaunchContext();
+        record.Clients.Add(new ManagedClient(100, T0, 1, Profile: 0, LaunchOrder: 0));
+        record.Clients.Add(new ManagedClient(200, T0.AddSeconds(3), 1, Profile: 1, LaunchOrder: 1));
+        _monitor.AddClient(100, T0);
+        _monitor.AddClient(200, T0.AddSeconds(3));
+        var log100 = WriteLogFor(T0, "client 100 line");
+        var log200 = WriteLogFor(T0.AddSeconds(3), "client 200 line");
+        Open(log100, 100);
+        Open(log200, 200);
+        var reader = CreateReader(withOwners: true, record, context);
+        Content(reader.Read(), 0).Should().Contain("client 100 line");
+
+        // Slot 0 is closed; 40 s later it is started on its own. A file named in the new client's
+        // range that it does not have open (here a late file nobody holds) is not its log.
+        _monitor.Clients.RemoveAll(c => c.ProcessId == 100);
+        _owners.Remove(Path.GetFileName(log100));
+        var relaunched = T0.AddSeconds(40);
+        record.Clients.RemoveAll(c => c.ProcessId == 100);
+        record.Clients.Add(new ManagedClient(300, relaunched, 1, Profile: 0, LaunchOrder: 0));
+        context.MarkSingleLaunch(300, relaunched);
+        _monitor.AddClient(300, relaunched);
+        WriteLogFor(relaunched, "a late line that is not client 300's");
+
+        var waiting = reader.Read();
+
+        waiting.Roster.Slots[0].Entry!.ProcessId.Should().Be(300);
+        waiting.Slots[0].Status.Should().BeOneOf(SlotLogStatus.NotYet, SlotLogStatus.Unmatched);
+        Content(waiting, 0).Should().Contain("matched only once Windows Restart Manager").And.NotContain("late line");
+        Content(waiting, 1).Should().Contain("client 200 line");
+
+        // Without the mark the names would have matched it: the guard is what keeps it out.
+        var unguarded = CreateReader(withOwners: true, record);
+        Content(unguarded.Read(), 0).Should().Contain("late line");
+
+        var own = WriteLogFor(relaunched.AddSeconds(1), "client 300 line");
+        Open(own, 300);
+
+        var shown = reader.Read();
+
+        shown.Slots[0].Status.Should().Be(SlotLogStatus.Shown);
+        Content(shown, 0).Should().Contain("client 300 line").And.NotContain("late line");
+        Content(shown, 1).Should().Contain("client 200 line");
+
+        // Restart Manager stops answering: the file it showed stays, nothing is matched by name instead.
+        _failing.Add(Path.GetFileName(own));
+        Content(reader.Read(), 0).Should().Contain("client 300 line");
+    }
+
+    [Fact]
+    public void While_a_launch_is_being_recorded_its_client_gets_no_slot_or_log()
+    {
+        var record = new FakeManagedClientStore();
+        var context = new RelaunchLaunchContext();
+        record.Clients.Add(new ManagedClient(200, T0.AddSeconds(3), 1, Profile: 1, LaunchOrder: 1));
+        _monitor.AddClient(200, T0.AddSeconds(3));
+        WriteLogFor(T0.AddSeconds(3), "client 200 line");
+        var reader = CreateReader(record: record, launchContext: context);
+        reader.Read();
+
+        _monitor.AddClient(300, T0.AddSeconds(40));
+        WriteLogFor(T0.AddSeconds(40), "client 300 line");
+        using (context.BeginLaunch())
+        {
+            var during = reader.Read();
+
+            during.Roster.Unassigned.Should().Be(1);
+            during.Roster.Slots[0].Liveness.Should().Be(RosterLiveness.Empty);
+            Content(during, 1).Should().Contain("client 200 line");
+        }
+
+        record.Clients.Add(new ManagedClient(300, T0.AddSeconds(40), 1, Profile: 0, LaunchOrder: 0));
+        var after = reader.Read();
+
+        after.Roster.Slots[0].Entry!.ProcessId.Should().Be(300);
+        after.Roster.NewGenerations.Should().BeEquivalentTo([0]);
     }
 }
