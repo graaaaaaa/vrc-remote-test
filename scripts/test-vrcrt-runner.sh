@@ -349,6 +349,18 @@ touch "$run/cancel.request"; : > "$fake/calls.log"
 check "a cancel before continue starts no child" 4 result CANCELED
 [ -s "$fake/calls.log" ] && fail "nothing was asked of the Bridge" || pass "nothing was asked of the Bridge"
 
+prepare_run; ready_clients "$tag"; deploy_result "$run" PASS PASS null "\"$tag\""
+detached="$(python3 -I "$runner" continue --run "$run" --claim-token "$token" --detach 2>"$work/err")"
+code=$?
+for _ in $(seq 100); do [ "$(field "$run/run.json" state)" = finished ] && break; sleep 0.1; done
+if [ "$code" -eq 0 ] && printf '%s' "$detached" | grep -q '"pid"' && [ "$(field "$run/run.json" result)" = PASS ]; then
+    pass "continue --detach returns at once and the run finishes on its own"
+else
+    fail "continue --detach returns at once and the run finishes on its own (exit $code)"; cat "$work/err"
+fi
+python3 -I "$runner" continue --run "$run" --claim-token "$token" --detach > /dev/null 2>&1
+[ $? -eq 3 ] && pass "continue --detach refuses a run that is not prepared" || fail "continue --detach refuses a run that is not prepared"
+
 # --- arguments and places
 python3 -I "$runner" prepare --slots 0,0 --run-root "$root" > /dev/null 2>&1
 [ $? -eq 2 ] && pass "slots must be different" || fail "slots must be different"

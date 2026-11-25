@@ -1063,6 +1063,7 @@ def continue_run(directory, token):
 
 
 def deploy_collect(run):
+    run.check()  # a cancel written before continue started (the window's Cancel during prepare) ends here
     record = run.record
     slots = record["slots"]
     cursor = record["cursor"]
@@ -1352,6 +1353,37 @@ def summary(directory):
             "reason": record.get("reason"), "results": record.get("results")}
 
 
+def detach_continue(directory, token):
+    """For the Unity window: checks what continue would refuse, then forks a child that starts
+    its own session, puts its standard streams on /dev/null and runs continue, so closing the
+    Editor (or its pipes) does not stop it. Prints {"pid", "runDir"} and returns 0."""
+    record = Run(directory).record or {}
+    if record.get("schema") != RUN_SCHEMA or not isinstance(record.get("claimKey"), str):
+        raise Usage("%s has no run.json of this runner" % directory)
+    if record.get("state") != "prepared":
+        raise Stop("UNKNOWN", "notPrepared", "run %s is %s" % (record.get("runId"), record.get("state")))
+    with Claim(os.path.dirname(os.path.dirname(directory)), record["claimKey"]) as claim:
+        current = claim.read()
+        if not current or current.get("token") != token or current.get("runId") != record.get("runId"):
+            raise Stop("UNKNOWN", "claimLost", "this token does not hold the Bridge's claim for this run")
+    sys.stdout.flush()
+    pid = os.fork()
+    if pid == 0:
+        code = EXIT_FOR["UNKNOWN"]
+        try:
+            os.setsid()
+            null = os.open(os.devnull, os.O_RDWR)
+            for descriptor in (0, 1, 2):
+                os.dup2(null, descriptor)
+            code = EXIT_FOR[continue_run(directory, token)]
+        except BaseException:
+            pass
+        finally:
+            os._exit(code)
+    print(json.dumps({"pid": pid, "runDir": directory}))
+    return 0
+
+
 def interrupt(signum, frame):
     raise KeyboardInterrupt
 
@@ -1370,6 +1402,8 @@ def main(argv):
     p = sub.add_parser("continue")
     p.add_argument("--run", required=True)
     p.add_argument("--claim-token", required=True)
+    p.add_argument("--detach", action="store_true",
+                   help="check, then go on in a new session with no terminal or pipes and print its PID (the Unity window)")
     p = sub.add_parser("run")
     p.add_argument("--build", choices=["headless"], required=True)
     p.add_argument("--project", required=True)
@@ -1399,6 +1433,8 @@ def main(argv):
             if not TOKEN.fullmatch(args.claim_token):
                 raise Usage("--claim-token is the one prepare printed")
             directory = run_directory(args.run)
+            if args.detach:
+                return detach_continue(directory, args.claim_token)
             result = continue_run(directory, args.claim_token)
             print(json.dumps(summary(directory)))
             return EXIT_FOR[result]
