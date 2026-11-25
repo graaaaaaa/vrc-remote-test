@@ -39,17 +39,28 @@
 #                                         used for it in the last deploy (same profile, world and
 #                                         instance); waits up to 90 s for the Bridge's answer
 #                                         (close-client up to 45 s), then says the outcome is unknown
+#   ... [--json]                          print the Bridge's checked answer as JSON instead of the line
+#   ... --expect @FILE [--operation-id ID]
+#                                         (Bridge v0.12.0 and later) do it only if the Bridge still
+#                                         looks as FILE says (bridgeInstanceId, hostGeneration,
+#                                         activeConfigEtag, savedConfigEtag, operationRevision,
+#                                         buildId, clientGeneration); otherwise the Bridge does
+#                                         nothing and the exit code is 1 ("precondition failed: ...").
+#                                         A FILE of the wrong shape is exit 2, a Bridge that does not
+#                                         announce slotPreconditions.v1 exit 3; neither sends anything
 #
 # Set VRCRT_BRIDGE_URL and VRCRT_CERT_SHA256. The token comes from macOS Keychain,
 # or VRCRT_TOKEN in CI. <cursor> is the JSON that
 # `cursor` prints, or @<file> holding it. Exit codes: 0 done, 1 timed out (or, for config
 # set, restart, close-clients, close-client and launch-client, the Bridge refused, did not
-# apply the change, could not confirm every client closed or record the client it started, or
-# did not come back within 90 s), 2 usage error, 3 the
+# apply the change, could not confirm every client closed or record the client it started, found
+# an --expect precondition no longer true, or did not come back within 90 s), 2 usage error (an
+# --expect file of the wrong shape included, or the Bridge refusing it as invalidPrecondition), 3 the
 # observation cannot answer (old or missing files, a client still being read, the Bridge
 # restarted or re-read a log, Logging not Full, records dropped, the Bridge unreachable,
-# older than v0.8.0 (v0.10.0 for close-client and launch-client), or answering in a shape it
-# does not send; for launch-client also no answer at all, when whether it started is unknown).
+# older than v0.8.0 (v0.10.0 for close-client and launch-client, and for --expect one that does
+# not announce slotPreconditions.v1: "unsupported"), or answering in a shape it does not send;
+# for launch-client also no answer at all, when whether it started is unknown).
 #
 # Log lines are untrusted text a world can write: control characters and tabs are
 # printed escaped, JSON is parsed with Python's json module, and every regular
@@ -118,6 +129,7 @@ LAUNCH_TIMEOUT_SECONDS = test_setting("VRCRT_TEST_LAUNCH_TIMEOUT", "90", 0.1, 90
 # close-client: the Bridge confirms the exit for up to 20 s, after listing the processes and before saving its record.
 CLOSE_TIMEOUT_SECONDS = test_setting("VRCRT_TEST_CLOSE_TIMEOUT", "45", 0.1, 45.0)
 MAX_GENERATION = (1 << 53) - 1
+MAX_INT64 = (1 << 63) - 1
 BRIDGE_LOG_LINES = 30
 # What one answer may print: a 1 MiB answer must not become megabytes of terminal output.
 MAX_CELL_CHARS = 200
@@ -739,6 +751,169 @@ def string_list(value):
     return isinstance(value, list) and all(isinstance(item, str) for item in value)
 
 
+# --- Slot preconditions (Bridge v0.12.0, docs/plans/r1b-contract.md §1.3 and §2). A close or launch
+# sent with --expect does nothing unless the Bridge still looks as the caller last read it.
+PRECONDITION_FEATURE = "slotPreconditions.v1"
+# The Bridge reads at most this much of a close or launch body; past it the body is refused.
+MAX_PRECONDITION_BYTES = 4096
+MAX_CAPABILITIES_BYTES = 64 * 1024
+OPERATION_ID = re.compile(r"[A-Za-z0-9_-]{1,64}")
+INSTANCE_ID = re.compile(r"[0-9a-f]{32}")
+BUILD_ID = re.compile(r"[0-9A-Za-z_-]{1,128}")
+
+
+def etag_ok(value):
+    """null, or a string of 1 to 128 characters as the Bridge (.NET) counts them: UTF-16 code units."""
+    return value is None or (isinstance(value, str) and 0 < len(value.encode("utf-16-le", "surrogatepass")) <= 2 * 128)
+
+
+# The seven fields of `expect`, all required, each with its check and what it must be.
+EXPECT_FIELDS = (
+    ("bridgeInstanceId", lambda v: isinstance(v, str) and INSTANCE_ID.fullmatch(v) is not None,
+     "32 lowercase hexadecimal digits"),
+    ("hostGeneration", lambda v: is_int(v, 1, 2 ** 31 - 1), "an integer from 1 to 2147483647"),
+    ("activeConfigEtag", etag_ok, "a string of 1 to 128 characters, or null"),
+    ("savedConfigEtag", etag_ok, "a string of 1 to 128 characters, or null"),
+    ("operationRevision", lambda v: is_int(v, 0, MAX_INT64), "an integer of at least 0"),
+    ("buildId", lambda v: v is None or (isinstance(v, str) and BUILD_ID.fullmatch(v) is not None),
+     "1 to 128 of 0-9, A-Z, a-z, _ and -, or null"),
+    ("clientGeneration", lambda v: is_int(v, 1, MAX_INT64), "an integer of at least 1"),
+)
+EXPECT_NAMES = tuple(name for name, _, _ in EXPECT_FIELDS)
+
+
+def unique_names(pairs):
+    """object_pairs_hook: a name given twice in any object makes the document invalid, as the
+    Bridge reads it (json.loads would otherwise keep the last one silently)."""
+    names = set()
+    for name, _ in pairs:
+        if name in names:
+            raise ValueError("%s appears twice in one object" % clip(json.dumps(name), MAX_CELL_CHARS))
+        names.add(name)
+    return dict(pairs)
+
+
+def no_constant(name):
+    raise ValueError("%s is not a JSON number" % name)
+
+
+def expect_problems(expect):
+    """What is wrong with an `expect` object by the contract's rules; [] when nothing is."""
+    if not isinstance(expect, dict):
+        return ["the file does not hold a JSON object"]
+    problems = ["%s is missing" % name for name in EXPECT_NAMES if name not in expect]
+    problems += ["%s is not one of the seven fields" % clip(json.dumps(name), MAX_CELL_CHARS)
+                 for name in expect if name not in EXPECT_NAMES]
+    problems += ["%s must be %s" % (name, form) for name, ok, form in EXPECT_FIELDS
+                 if name in expect and not ok(expect[name])]
+    return problems
+
+
+def load_expect(value):
+    """The `expect` object of --expect @FILE, checked as the Bridge will check it. A usage error
+    otherwise, found before anything is asked of the Bridge."""
+    if not value.startswith("@") or len(value) < 2:
+        raise Failure(EXIT_USAGE, "--expect needs @FILE, a file holding the expect object")
+    try:
+        with open(value[1:], "rb") as stream:
+            data = stream.read(MAX_PRECONDITION_BYTES + 1)
+    except OSError as error:
+        raise Failure(EXIT_USAGE, "cannot read the --expect file: %s" % (error.strerror or error))
+    if len(data) > MAX_PRECONDITION_BYTES:
+        raise Failure(EXIT_USAGE, "the --expect file is larger than %d bytes" % MAX_PRECONDITION_BYTES)
+    try:
+        expect = json.loads(data.decode("utf-8"), object_pairs_hook=unique_names, parse_constant=no_constant)
+    except (ValueError, RecursionError) as error:
+        raise Failure(EXIT_USAGE, "the --expect file is not valid JSON: %s" % clip(error, MAX_CELL_CHARS))
+    problems = expect_problems(expect)
+    if problems:
+        raise Failure(EXIT_USAGE, "the --expect file is not an expect object: %s" % "; ".join(problems[:10]))
+    return expect
+
+
+def operation_id(value):
+    if not OPERATION_ID.fullmatch(value):
+        raise Failure(EXIT_USAGE, "--operation-id is 1 to 64 of A-Z, a-z, 0-9, _ and -")
+    return value
+
+
+def precondition_body(args):
+    """The close or launch body for --expect, or None without it (the request as before R1b)."""
+    if args.expect is None:
+        if args.operation_id is not None:
+            raise Failure(EXIT_USAGE, "--operation-id goes with --expect")
+        return None
+    request = {"expect": load_expect(args.expect)}
+    if args.operation_id is not None:
+        request["operationId"] = args.operation_id
+    body = json.dumps(request, ensure_ascii=True, separators=(",", ":")).encode("ascii")
+    if len(body) > MAX_PRECONDITION_BYTES:
+        raise Failure(EXIT_USAGE, "the request with this --expect file is larger than %d bytes" % MAX_PRECONDITION_BYTES)
+    return body
+
+
+def require_preconditions():
+    """Returns only when GET /capabilities lists slotPreconditions.v1. An older Bridge never reads
+    the body, so it would close or launch without checking anything: nothing is sent to it."""
+    deadline = time.monotonic() + POLL_REQUEST_TIMEOUT
+    try:
+        status, text = bridge_request("GET", "/api/v1/capabilities", limit=MAX_CAPABILITIES_BYTES,
+                                      timeout=POLL_REQUEST_TIMEOUT, deadline=deadline)
+    except Failure as failure:
+        reason = str(failure)
+    else:
+        info = json_of(text) if status == 200 else None
+        features = info.get("features") if isinstance(info, dict) else None
+        if isinstance(features, list) and PRECONDITION_FEATURE in features:
+            return
+        reason = ("HTTP %d for /api/v1/capabilities" % status if status != 200
+                  else "its capabilities have no usable features list" if not isinstance(features, list)
+                  else "its features do not include it")
+    raise Failure(EXIT_OBSERVATION, "unsupported: the Bridge does not announce %s (%s), so it cannot check --expect;"
+                  " nothing was sent" % (PRECONDITION_FEATURE, clip(reason, MAX_CELL_CHARS)))
+
+
+def operation_fields_ok(reply, close):
+    """The fields R1b adds to close and launch answers (contract §1.4), checked only when present:
+    a Bridge before v0.12.0 sends none of them, and their absence changes nothing."""
+    checks = {
+        "operationRevision": lambda v: is_int(v, 0, MAX_INT64),
+        "bridgeInstanceId": lambda v: isinstance(v, str) and INSTANCE_ID.fullmatch(v) is not None,
+        "operationId": lambda v: v is None or (isinstance(v, str) and OPERATION_ID.fullmatch(v) is not None),
+    }
+    if close:
+        # The generation the close was for; null where the Bridge had none to name.
+        checks["clientGeneration"] = lambda v: v is None or is_int(v, 1, MAX_GENERATION)
+    return all(ok(reply[name]) for name, ok in checks.items() if name in reply)
+
+
+def print_json(value):
+    print(json.dumps(value, indent=2, ensure_ascii=True))
+
+
+def precondition_outcome(what, slot, status, text, as_json):
+    """With --expect: exit 1 for 412 preconditionFailed (the Bridge did nothing), 2 for 400
+    invalidPrecondition; None for any other answer, which is read as without --expect."""
+    reply = json_of(text)
+    if not isinstance(reply, dict):
+        return None
+    if status == 412 and reply.get("error") == "preconditionFailed":
+        mismatched = reply.get("mismatched")
+        if not (isinstance(mismatched, list) and 0 < len(mismatched) <= len(EXPECT_NAMES)
+                and all(isinstance(name, str) and name in EXPECT_NAMES for name in mismatched)
+                and isinstance(reply.get("current"), dict) and operation_fields_ok(reply, close=False)):
+            raise Failure(EXIT_OBSERVATION, "the Bridge's answer to %s %d is not one it sends (HTTP 412)" % (what, slot))
+        if as_json:
+            print_json(reply)
+        # The names come from EXPECT_NAMES, so they are safe to print as they are.
+        print("%s %d: precondition failed: %s" % (what, slot, ",".join(mismatched)), file=sys.stderr)
+        return EXIT_NOT_DONE
+    if status == 400 and reply.get("error") == "invalidPrecondition" and string_list(reply.get("problems")):
+        refused("%s %d" % (what, slot), status, text)
+        return EXIT_USAGE
+    return None
+
+
 def single_client_refused(what, slot, status, text):
     """Why the Bridge did not close or launch the client: exit 1 for a refusal it explains, 3 otherwise."""
     body = json_of(text)
@@ -755,10 +930,14 @@ def single_client_refused(what, slot, status, text):
 
 
 def cmd_close_client(args):
-    # The whole request ends by the deadline, however slowly the answer trickles in.
+    # Every check of the arguments and of the Bridge's support comes before the one POST.
+    request = precondition_body(args)
+    if request is not None:
+        require_preconditions()
+    # The whole request ends by the deadline, however slowly the answer trickles in. Never resent.
     try:
-        status, text = bridge_request("POST", "/api/v1/clients/%d/close" % args.slot, timeout=CLOSE_TIMEOUT_SECONDS,
-                                      deadline=time.monotonic() + CLOSE_TIMEOUT_SECONDS)
+        status, text = bridge_request("POST", "/api/v1/clients/%d/close" % args.slot, body=request,
+                                      timeout=CLOSE_TIMEOUT_SECONDS, deadline=time.monotonic() + CLOSE_TIMEOUT_SECONDS)
     except Unreachable as error:
         raise Failure(EXIT_OBSERVATION, "%s; whether slot %d was closed is unknown: check `vrcrt.sh status`"
                       % (error, args.slot))
@@ -769,26 +948,34 @@ def cmd_close_client(args):
         if not (is_int(body.get("slot"), args.slot, args.slot) and is_int(body.get("processId"), 1, 2 ** 31 - 1)
                 and is_int(closed, 0, 1) and is_int(not_confirmed, 0, 1) and closed + not_confirmed == 1
                 and isinstance(updated, bool) and string_list(body.get("problems"))
-                and (status == 200) == (closed == 1 and updated)):
+                and (status == 200) == (closed == 1 and updated) and operation_fields_ok(body, close=True)):
             raise Failure(EXIT_OBSERVATION, "the Bridge's answer to close-client %d is not a close report" % args.slot)
-        if closed:
-            print("closed slot %d (PID %d)" % (args.slot, body["processId"]))
+        if args.json:
+            print_json(body)
         else:
-            print("slot %d (PID %d) may still be running" % (args.slot, body["processId"]))
-        print_items("problem: ", body["problems"], "list of problems")
+            if closed:
+                print("closed slot %d (PID %d)" % (args.slot, body["processId"]))
+            else:
+                print("slot %d (PID %d) may still be running" % (args.slot, body["processId"]))
+            print_items("problem: ", body["problems"], "list of problems")
         if status != 200:
             print("close-client: not done; check `vrcrt.sh status`", file=sys.stderr)
         return 0 if status == 200 else EXIT_NOT_DONE
     if status == 200:
         raise Failure(EXIT_OBSERVATION, "the Bridge's answer to close-client %d is not a close report" % args.slot)
-    return single_client_refused("close-client", args.slot, status, text)
+    outcome = precondition_outcome("close-client", args.slot, status, text, args.json) if request is not None else None
+    return outcome if outcome is not None else single_client_refused("close-client", args.slot, status, text)
 
 
 def cmd_launch_client(args):
+    # Every check of the arguments and of the Bridge's support comes before the one POST.
+    request = precondition_body(args)
+    if request is not None:
+        require_preconditions()
     try:
         # The whole request ends by the deadline, however slowly the answer trickles in.
-        status, text = bridge_request("POST", "/api/v1/clients/%d/launch" % args.slot, timeout=LAUNCH_TIMEOUT_SECONDS,
-                                      deadline=time.monotonic() + LAUNCH_TIMEOUT_SECONDS)
+        status, text = bridge_request("POST", "/api/v1/clients/%d/launch" % args.slot, body=request,
+                                      timeout=LAUNCH_TIMEOUT_SECONDS, deadline=time.monotonic() + LAUNCH_TIMEOUT_SECONDS)
     except Unreachable as error:
         # Never retried: the Bridge may have started the client before the answer was lost.
         raise Failure(EXIT_OBSERVATION, "%s; whether slot %d was started is unknown: check `vrcrt.sh status --json` "
@@ -797,21 +984,28 @@ def cmd_launch_client(args):
     if status == 200:
         if not (isinstance(body, dict) and is_int(body.get("slot"), args.slot, args.slot)
                 and is_int(body.get("profile"), 0, 99) and is_int(body.get("processId"), 1, 2 ** 31 - 1)
-                and is_int(body.get("clientGeneration"), 1, MAX_GENERATION)):
+                and is_int(body.get("clientGeneration"), 1, MAX_GENERATION) and operation_fields_ok(body, close=False)):
             raise Failure(EXIT_OBSERVATION, "the Bridge's answer to launch-client %d is not a launch report" % args.slot)
-        print("launched slot %d (profile %d, PID %d, generation %d)"
-              % (args.slot, body["profile"], body["processId"], body["clientGeneration"]))
+        if args.json:
+            print_json(body)
+        else:
+            print("launched slot %d (profile %d, PID %d, generation %d)"
+                  % (args.slot, body["profile"], body["processId"], body["clientGeneration"]))
         return 0
     if status == 500 and isinstance(body, dict) and body.get("error") == "launchedNotRecorded":
         pid = body.get("processId")
         if not (body.get("launched") is True and body.get("recorded") is False
-                and (pid is None or is_int(pid, 1, 2 ** 31 - 1)) and string_list(body.get("problems"))):
+                and (pid is None or is_int(pid, 1, 2 ** 31 - 1)) and string_list(body.get("problems"))
+                and operation_fields_ok(body, close=False)):
             raise Failure(EXIT_OBSERVATION, "the Bridge's answer to launch-client %d is not a launch report" % args.slot)
+        if args.json:
+            print_json(body)
         print("launch-client %d: VRChat started (PID %s) but the Bridge could not record it, so it will not close it;"
               " close it on Windows" % (args.slot, "unknown" if pid is None else pid), file=sys.stderr)
         print_items("  - ", body["problems"], "list of problems", sys.stderr)
         return EXIT_NOT_DONE
-    return single_client_refused("launch-client", args.slot, status, text)
+    outcome = precondition_outcome("launch-client", args.slot, status, text, args.json) if request is not None else None
+    return outcome if outcome is not None else single_client_refused("launch-client", args.slot, status, text)
 
 
 def export_one_log(slot, client, directory):
@@ -1230,6 +1424,8 @@ def cmd_log(args):
 
 
 def cmd_bridge(args):
+    """The whole answer, so the fields of later Bridges (v0.12.0: bridgeInstanceId, operationRevision,
+    currentBatch) pass through for whoever builds an --expect file, and older ones still work."""
     if not args.json:
         raise Failure(EXIT_USAGE, "bridge needs --json (doctor prints the same for people)")
     info = get_json("/api/v1/bridge")
@@ -1385,6 +1581,17 @@ class Parser(argparse.ArgumentParser):
         sys.exit(EXIT_USAGE)
 
 
+def add_precondition_arguments(p):
+    """close-client and launch-client: the optional precondition (Bridge v0.12.0+) and --json."""
+    p.add_argument("--expect", metavar="@FILE",
+                   help="do it only if the Bridge still matches the expect object in FILE (bridgeInstanceId, "
+                        "hostGeneration, activeConfigEtag, savedConfigEtag, operationRevision, buildId, "
+                        "clientGeneration); exit 1 when it does not (v0.12.0+)")
+    p.add_argument("--operation-id", type=argument(operation_id), metavar="ID",
+                   help="with --expect: an ID the Bridge echoes and logs (1-64 of A-Z a-z 0-9 _ -)")
+    p.add_argument("--json", action="store_true", help="print the Bridge's checked answer as JSON instead of the line")
+
+
 def main(argv):
     parser = Parser(prog="vrcrt.sh", description="Read the VRC Remote Test Bridge's per-client observation, "
                                                  "and look after the Bridge, over HTTPS.")
@@ -1463,10 +1670,12 @@ def main(argv):
     one_slot = argument(lambda value: parse_slot(value, allow_all=False))
     p = sub.add_parser("close-client", help="close one VRChat client the Bridge launched (v0.10.0+, Relaunch)")
     p.add_argument("slot", type=one_slot, help="0-3: the client's launch order, as status shows it")
+    add_precondition_arguments(p)
     p.set_defaults(run=cmd_close_client)
 
     p = sub.add_parser("launch-client", help="start that client again as the last deploy did (v0.10.0+, Relaunch)")
     p.add_argument("slot", type=one_slot, help="0-3: the client's launch order, as status shows it")
+    add_precondition_arguments(p)
     p.set_defaults(run=cmd_launch_client)
 
     args = parser.parse_args(argv)

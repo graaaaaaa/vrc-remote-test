@@ -90,6 +90,8 @@ public class SlotPreconditionTests
     [Theory]
     [InlineData("bridgeInstanceId", "\"0123456789ABCDEF0123456789ABCDEF\"")]
     [InlineData("bridgeInstanceId", "null")]
+    [InlineData("bridgeInstanceId", "\"0123456789abcdef0123456789abcdef\\n\"")]
+    [InlineData("buildId", "\"b1\\n\"")]
     [InlineData("hostGeneration", "0")]
     [InlineData("hostGeneration", "true")]
     [InlineData("hostGeneration", "\"3\"")]
@@ -111,6 +113,7 @@ public class SlotPreconditionTests
     [InlineData("\"\"")]
     [InlineData("\"a b\"")]
     [InlineData("5")]
+    [InlineData("\"op\\n\"")]
     public void A_bad_operation_id_is_refused(string id)
     {
         Parse("{\"expect\":" + Expect() + ",\"operationId\":" + id + "}").Item3.Should().NotBeNull();

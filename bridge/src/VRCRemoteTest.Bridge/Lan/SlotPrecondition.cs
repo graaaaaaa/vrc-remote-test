@@ -27,9 +27,10 @@ public sealed record SlotPrecondition(
     internal const int MaxBodyBytes = 4096;
     private const int MaxEtagLength = 128;
 
-    private static readonly Regex InstanceIdPattern = new("^[0-9a-f]{32}$", RegexOptions.CultureInvariant);
-    private static readonly Regex BuildIdPattern = new("^[0-9A-Za-z_-]{1,128}$", RegexOptions.CultureInvariant);
-    private static readonly Regex OperationIdPattern = new("^[A-Za-z0-9_-]{1,64}$", RegexOptions.CultureInvariant);
+    // \z, not $: in .NET, $ also matches before a final newline.
+    private static readonly Regex InstanceIdPattern = new("^[0-9a-f]{32}\\z", RegexOptions.CultureInvariant);
+    private static readonly Regex BuildIdPattern = new("^[0-9A-Za-z_-]{1,128}\\z", RegexOptions.CultureInvariant);
+    private static readonly Regex OperationIdPattern = new("^[A-Za-z0-9_-]{1,64}\\z", RegexOptions.CultureInvariant);
 
     internal static readonly string[] Keys =
     [
