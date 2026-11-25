@@ -72,9 +72,11 @@ bridge() {
     } > "$fake/bridge.json"
 }
 # client <slot> <generation> <epoch> <joinedSeq> <state> <inErrorWorld> <loginState> [instance]
+# JOIN_ATTEMPT=<seq> adds joinAttemptSeq (the join's Joining line); without it the field is absent.
 client() {
     printf '{"slot":%s,"clientGeneration":%s,"observationEpoch":%s,"processId":%s,"running":true,"profile":%s,"state":"%s",' \
         "$1" "$2" "$3" "$((100 + $1))" "$1" "$5"
+    [ -n "${JOIN_ATTEMPT:-}" ] && printf '"joinAttemptSeq":%s,' "$JOIN_ATTEMPT"
     printf '"instance":"%s","inErrorWorld":%s,"loggingLevel":"full","logStatus":"shown","loginState":"%s","joinedSeq":%s,"observedThroughSeq":50,"catchingUp":false}' \
         "${8:-local:inst}" "$6" "$7" "$4"
 }
@@ -154,6 +156,8 @@ check "deploy-collect passes with every client ready and tagged" 0 result PASS
 ls "$run"/evidence/slot-0/g111-e7/vrchat-slot-0-*.log > /dev/null 2>&1 && ls "$run"/evidence/slot-1/g222-e8/markers.json > /dev/null 2>&1 \
     && pass "evidence is kept per slot, generation and epoch" || fail "evidence is kept per slot, generation and epoch"
 ls "$root"/locks/*.json > /dev/null 2>&1 && fail "the claim is released at the end" || pass "the claim is released at the end"
+[ "$(stat -f %Lp "$run/progress.jsonl")" = "600" ] && [ "$(stat -f %Lp "$run/run.json")" = "600" ] \
+    && pass "run files are owner-only" || fail "run files are owner-only"
 
 prepare_run; ready_clients OTHERTAG1; deploy_result "$run" PASS PASS null "\"$tag\""
 check "another build's tag fails the run" 1 results.worldBuildMatch FAIL
@@ -163,6 +167,20 @@ markers 1 222 8 "[{\"seq\":5,\"text\":\"[VRCRT] vrcrt.build=$tag\",\"truncated\"
 check "a later other tag fails even after this one" 1 results.worldBuildMatch FAIL
 prepare_run; ready_clients "$tag"; deploy_result "$run" PASS PASS null null
 check "no tag for these bytes leaves the build match unknown" 0 results.worldBuildMatch UNKNOWN
+
+# VRChat logs a world's Start() markers between Joining (joinAttemptSeq) and Finished entering world (joinedSeq).
+prepare_run; deploy_result "$run" PASS PASS null "\"$tag\""
+clients "__NOW__" "$(JOIN_ATTEMPT=2 client 0 111 7 9 joined false authenticated)" "$(JOIN_ATTEMPT=2 client 1 222 8 9 joined false authenticated)"
+markers 0 111 7 "$(tagged "$tag")"; markers 1 222 8 "$(tagged "$tag")"
+check "a tag logged while the world loads (before the join finished) matches" 0 results.worldBuildMatch PASS
+prepare_run; deploy_result "$run" PASS PASS null "\"$tag\""
+clients "__NOW__" "$(JOIN_ATTEMPT=6 client 0 111 7 9 joined false authenticated)" "$(JOIN_ATTEMPT=6 client 1 222 8 9 joined false authenticated)"
+markers 0 111 7 "$(tagged OTHERTAG1)"; markers 1 222 8 "$(tagged OTHERTAG1)"
+check "a tag from before this join's Joining line is not counted" 0 results.worldBuildMatch UNKNOWN
+prepare_run; deploy_result "$run" PASS PASS null "\"$tag\""
+clients "__NOW__" "$(client 0 111 7 9 joined false authenticated)" "$(client 1 222 8 9 joined false authenticated)"
+markers 0 111 7 "$(tagged "$tag")"; markers 1 222 8 "$(tagged "$tag")"
+check "without joinAttemptSeq only lines after the join count" 0 results.worldBuildMatch UNKNOWN
 
 prepare_run; ready_clients "$tag"; markers 0 111 7 "$(tagged "$tag" true)"; deploy_result "$run" PASS PASS null "\"$tag\""
 check "a cut tag line proves nothing" 0 results.worldBuildMatch UNKNOWN
@@ -210,6 +228,11 @@ BRIDGE_MODE=Reload bridge
 clients "__NOW__" "$(client 0 11 5 60 joined false authenticated)" "$(client 1 22 6 60 joined false authenticated)"
 markers 0 11 5 "[]"; markers 1 22 6 "[]"
 check "Reload: a join after the cursor in the same generation is ready" 0 results.clientReadiness PASS
+BRIDGE_MODE=Reload prepare_run; deploy_result "$run" PASS PASS null null
+BRIDGE_MODE=Reload bridge
+clients "__NOW__" "$(JOIN_ATTEMPT=45 client 0 11 5 60 joined false authenticated)" "$(JOIN_ATTEMPT=55 client 1 22 6 60 joined false authenticated)"
+markers 0 11 5 "[]"; markers 1 22 6 "[]"
+check "Reload: a join that began before the deploy is not ready" 1 reason notReady
 prepare_run; deploy_result "$run" PASS PASS null null
 clients "__NOW__" "$(client 0 11 5 60 joined false authenticated)" "$(client 1 222 8 4 joined false authenticated)"
 check "Relaunch: a client that was not relaunched is not ready" 1 reason notReady

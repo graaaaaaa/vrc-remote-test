@@ -321,7 +321,9 @@ class Run:
         if self.progress_bytes + len(line) + 1 > MAX_PROGRESS_BYTES:
             return
         self.progress_bytes += len(line) + 1
-        with open(os.path.join(self.directory, "progress.jsonl"), "a", encoding="utf-8") as stream:
+        descriptor = os.open(os.path.join(self.directory, "progress.jsonl"),
+                             os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(descriptor, "a", encoding="utf-8") as stream:
             stream.write(line + "\n")
 
     def begin(self, name, **fields):
@@ -712,6 +714,12 @@ def slot_state(entry, base, mode):
             or entry.get("state") in (None, "unknown")):
         return ("wait", "observationIncomplete", True)
     generation, joined = entry.get("clientGeneration"), entry.get("joinedSeq")
+    # The Joining line of this join. A world's load-time markers (Udon Start) come between it and
+    # Finished entering world (joinedSeq), so the build tag is looked for from here. None from a
+    # Bridge that does not report it: then only lines after joinedSeq count.
+    attempt = entry.get("joinAttemptSeq")
+    if not (isinstance(attempt, int) and isinstance(joined, int) and attempt <= joined):
+        attempt = None
     new_client = base is None or base.get("clientGeneration") != generation
     if new_client:
         if not isinstance(joined, int):
@@ -723,7 +731,8 @@ def slot_state(entry, base, mode):
             return ("stop", "UNKNOWN", "baselineUnknown")
         if base.get("observationEpoch") != epoch:
             return ("stop", "UNKNOWN", "epochChangedSinceDeploy")
-        if not isinstance(joined, int) or joined <= (base.get("seq") or 0):
+        # The whole join after the cursor: a join that began before the deploy may have loaded the old world.
+        if not isinstance(joined, int) or (attempt if attempt is not None else joined) <= (base.get("seq") or 0):
             return ("wait", "notJoinedSinceDeploy", False)
     if entry.get("state") != "joined" or not entry.get("instance"):
         return ("wait", "notJoined", False)
@@ -734,7 +743,7 @@ def slot_state(entry, base, mode):
     if entry.get("loginState") != "authenticated":
         return ("wait", "loginNotConfirmed", True)
     return ("ready", {"clientGeneration": generation, "observationEpoch": epoch, "joinedSeq": joined,
-                      "instance": entry.get("instance"), "profile": entry.get("profile"), "processId": entry.get("processId")})
+                      "joinAttemptSeq": attempt, "instance": entry.get("instance"), "profile": entry.get("profile"), "processId": entry.get("processId")})
 
 
 def wait_ready(run, slots, cursor, mode):
@@ -795,6 +804,8 @@ def recheck(run, slots, fixed, bridge_before, when):
         for name in ("clientGeneration", "observationEpoch", "joinedSeq", "instance"):
             if entry.get(name) != want[name]:
                 raise Stop("UNKNOWN", "unexpectedChange", "slot %d %s changed %s" % (slot, name, when))
+        if want["joinAttemptSeq"] is not None and entry.get("joinAttemptSeq") != want["joinAttemptSeq"]:
+            raise Stop("UNKNOWN", "unexpectedChange", "slot %d joinAttemptSeq changed %s" % (slot, when))
         if entry.get("inErrorWorld") is not False or entry.get("loginState") != "authenticated":
             raise Stop("UNKNOWN", "unexpectedChange", "slot %d %s" % (slot, when))
     return clients
@@ -806,9 +817,10 @@ def build_tags(text):
 
 
 def wait_world_build(run, slots, fixed, tag):
-    """Each slot shows this build's tag after its current join (fixed generation, epoch and
-    joinedSeq), read through. PASS only when every tag seen there is this one; any other tag is
-    FAIL; nothing, two tags on a line, or only cut or withheld lines is UNKNOWN."""
+    """Each slot shows this build's tag in its current join (fixed generation and epoch, after
+    the join's Joining line, or after joinedSeq when the Bridge does not report that line), read
+    through. PASS only when every tag seen there is this one; any other tag is FAIL; nothing, two
+    tags on a line, or only cut or withheld lines is UNKNOWN."""
     if not tag:
         return "UNKNOWN", "noTagForTheseBytes"
     end = time.monotonic() + TAG_SECONDS
@@ -822,7 +834,7 @@ def wait_world_build(run, slots, fixed, tag):
             if (header.get("clientGeneration") != want["clientGeneration"]
                     or header.get("observationEpoch") != want["observationEpoch"] or header.get("catchingUp")):
                 continue
-            after = want["joinedSeq"]
+            after = want["joinAttemptSeq"] if want["joinAttemptSeq"] is not None else want["joinedSeq"]
             if (header.get("droppedThroughSeq") or 0) > after:
                 return "UNKNOWN", "markersDropped"
             for record in markers.get("records") or []:

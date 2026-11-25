@@ -2,7 +2,7 @@
 
 ## [0.11.0] - 2026-11-26
 
-Deploy, wait until every listed VRChat client is ready, and collect the evidence with one button in the Unity window (or one command), with a structured record of what happened. The Bridge has no changes, but the Remote Test window warns while their versions differ, so **update both the Unity package and the Windows Bridge** (`docs/setup-windows.md`, step 1, "版を入れ替える"). An existing `config.json` and pairing keep working. Not yet checked on Windows: `docs/validation/runner-deploy-collect.md` is the procedure. The plan behind this release is `docs/plans/r1-automation.md` (R1a).
+Deploy, wait until every listed VRChat client is ready, and collect the evidence with one button in the Unity window (or one command), with a structured record of what happened. The Bridge has no changes, but the Remote Test window warns while their versions differ, so **update both the Unity package and the Windows Bridge** (`docs/setup-windows.md`, step 1, "版を入れ替える"). An existing `config.json` and pairing keep working. Checked on Windows with Bridge 0.10.0 and two VRChat clients (`docs/validation/runner-deploy-collect.md`); four clients are not checked yet. The plan behind this release is `docs/plans/r1-automation.md` (R1a).
 
 ### Added (Unity)
 
@@ -13,7 +13,7 @@ Deploy, wait until every listed VRChat client is ready, and collect the evidence
 
 ### Added (Mac scripts)
 
-- `package/Tools~/vrcrt_runner.py` (Python 3.9+, standard library only): `prepare`, `continue [--detach]`, `run --build headless`, `recover`, `prune`. The procedure deploy-collect waits until every listed slot is ready (Relaunch: a new generation; Reload: a join after the cursor in the same epoch; log read through, joined in one instance, not in the error world, logged in; a likely logged-out profile is named), checks this build's tag after each client's join, and saves markers and full logs per slot, generation and epoch with their sizes and hashes in `run.json`. PASS, FAIL, UNKNOWN or CANCELED; a missing or stale observation is never success. Runs live in `~/Library/Application Support/VRCRemoteTest/runs/` (0700); Git, iCloud, `~/Documents` and `~/Desktop` are refused. One run at a time per Bridge among runners on this Mac that use the same run root and the same Bridge URL and certificate pin; children run in their own process groups and are always stopped.
+- `package/Tools~/vrcrt_runner.py` (Python 3.9+, standard library only): `prepare`, `continue [--detach]`, `run --build headless`, `recover`, `prune`. The procedure deploy-collect waits until every listed slot is ready (Relaunch: a new generation; Reload: a join that began after the cursor in the same epoch; log read through, joined in one instance, not in the error world, logged in; a likely logged-out profile is named), checks this build's tag in each client's current join (from its Joining line: VRChat logs a world's load-time markers before "Finished entering world"), and saves markers and full logs per slot, generation and epoch with their sizes and hashes in `run.json`. PASS, FAIL, UNKNOWN or CANCELED; a missing or stale observation is never success. Runs live in `~/Library/Application Support/VRCRemoteTest/runs/` (0700); Git, iCloud, `~/Documents` and `~/Desktop` are refused. One run at a time per Bridge among runners on this Mac that use the same run root and the same Bridge URL and certificate pin; children run in their own process groups and are always stopped.
 - `vrcrt.sh` now lives in `package/Tools~/` so that the package carries it; `scripts/vrcrt.sh` passes everything through unchanged. New, read-only: `bridge --json`, `log <slot> --markers --json` (cut and withheld records flagged), `export-log <slot> <dir> --generation G --epoch E`. The regular-expression child no longer inherits the environment (it gets only `PYTHONIOENCODING=utf-8`).
 
 ### Changed (Mac scripts)
@@ -22,7 +22,7 @@ Deploy, wait until every listed VRChat client is ready, and collect the evidence
 
 ### Tests
 
-- Unity EditMode: 249 tests (classification, result files, attempts and cancellation, single-client control, the runner process). `scripts/test-vrcrt.sh` now also runs `test-vrcrt-runner.sh` (62 checks: readiness, tags, claims, cancellation, Ctrl-C, stubborn descendants, recovery, prune) and `test-vrcrt-run.sh` (16 checks of the old interface).
+- Unity EditMode: 249 tests (classification, result files, attempts and cancellation, single-client control, the runner process). `scripts/test-vrcrt.sh` now also runs `test-vrcrt-runner.sh` (67 checks: readiness, tags, claims, cancellation, Ctrl-C, stubborn descendants, recovery, prune) and `test-vrcrt-run.sh` (16 checks of the old interface).
 
 ### Not included
 

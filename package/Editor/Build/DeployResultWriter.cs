@@ -351,7 +351,7 @@ namespace VRCRemoteTest
         private static string Cut(string message) =>
             message == null || message.Length <= MaxMessageLength ? message : message.Substring(0, MaxMessageLength) + "...(truncated)";
 
-        private static void SetMode(string path, int mode)
+        internal static void SetMode(string path, int mode)
         {
             if (Application.platform != RuntimePlatform.OSXEditor && Application.platform != RuntimePlatform.LinuxEditor)
             {

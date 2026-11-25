@@ -128,6 +128,7 @@ R1 のあと §2 の代表の件で測り直し、R2〜R6 を効果の大きい�
 - 準備ができたときの各 slot の {generation, epoch, joinedSeq, instance} を固定し、以後の確認（状態を変える操作の直前、最後の判定）で全 slot をその期待と照らす。予期しない退出・入り直し（`joinedSeq` の増加）・エラーワールドへの移り・世代や epoch の変化・Bridge のプロセスや host の世代や etag の変化は、前の準備完了を無効にし UNKNOWN で止める。
 - ワールド・ビルドの準備（目印を使うワールドだけ）:
   - prepare が候補の tag（runId から作る）を出し、Unity は新しくビルドするときそれを `ActiveWorldBuildTag` として示す。利用者のビルド前処理がそれをワールドに埋め、ワールドは読み込み時に `vrcrt.build=<tag>` を含む目印の行を出す（接頭辞は Bridge の `LogMarkerPrefixes` のもの。形は `proposed`）。runner が照らすのは、結果ファイルに書かれた「実際に埋めた tag」だけ（prepare の候補ではない）。
+  - （2026-11-26 実機で変更）目印を数える起点は `joinedSeq` ではなく、その参加の Joining の行（`joinAttemptSeq`）。VRChat はワールドの `Start()` の目印を Finished entering world より前に出すため。Reload では、Joining の行がカーソルより後の参加だけを「配備の後に入った」と数える。
   - 各 slot で、固定した世代・epoch の、カーソルより後の目印から `vrcrt.build=` の欄を、空白で区切られた1つの欄として正確に読む（部分一致でなく、1行に2つあれば使えない）。今回の tag なら PASS、別の値なら FAIL（前の配備のワールドに入ったまま）。期限までに無い、結果ファイルの tag が null、切り詰め・伏せの印の付いた行しかない、なら UNKNOWN。同じインスタンスや新しい目印だけでは PASS にしない。
   - この PASS はワールドが目印を偽らない前提だと記録と文書に書く。
 - 目印の読み取りの上限: 1回の待ちで slot ごとに1回 `log --markers --json` を読む（Bridge の上限つきファイル＋CLI の上限）だけで、目印の数に比例した仕事を増やさない。`droppedThroughSeq` がカーソルを越えたら「観測の欠け」を記録して UNKNOWN。目印の中身から、対象・保存先・次の手順・引数を作らない。

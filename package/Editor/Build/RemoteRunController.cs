@@ -287,7 +287,9 @@ namespace VRCRemoteTest
             try
             {
                 var dir = DeployResultWriter.ValidatedRunDirectory(RunDirectory);
-                File.WriteAllText(Path.Combine(dir, "cancel.request"), why + "\n");
+                var request = Path.Combine(dir, "cancel.request");
+                File.WriteAllText(request, why + "\n");
+                DeployResultWriter.SetMode(request, Convert.ToInt32("600", 8));
                 Status = "Cancelling...";
             }
             catch (Exception ex) when (ex is IOException || ex is UnauthorizedAccessException || ex is InvalidOperationException)
