@@ -16,6 +16,19 @@ public sealed class BridgeOperationGate
     private readonly object _sync = new();
     private string? _current;
     private bool _restartPending;
+    private long _revision;
+
+    /// <summary>
+    /// Grows by one each time something on Windows changed, or may have, under the gate or at a
+    /// host start: a deploy, closing or launching clients, a configuration write. Never
+    /// decreases for the life of the process (a new process starts again from 0 with a new
+    /// BridgeRuntime.InstanceId). A request refused before any side effect leaves it alone.
+    /// Read by /bridge and compared by the slot preconditions (Lan/SlotPrecondition).
+    /// </summary>
+    public long Revision => Interlocked.Read(ref _revision);
+
+    /// <summary>Something changed or may have: returns the new revision.</summary>
+    public long Bump() => Interlocked.Increment(ref _revision);
 
     /// <summary>What holds the gate, or null; for the busy answer and /bridge.</summary>
     public string? Current

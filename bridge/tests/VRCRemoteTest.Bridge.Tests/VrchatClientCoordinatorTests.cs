@@ -158,7 +158,7 @@ public class VrchatClientCoordinatorTests
     {
         var coordinator = CreateCoordinator(clientCount: 3);
 
-        var outcome = await coordinator.LaunchClientsAsync(WorldPath, CancellationToken.None);
+        var outcome = await coordinator.LaunchClientsAsync(WorldPath, "20261126T000000000Z-aabbccdd", CancellationToken.None);
 
         outcome.Succeeded.Should().BeTrue();
         _events.Should().Equal("launch 5000", "wait 3s", "launch 5001", "wait 3s", "launch 5002");
@@ -178,8 +178,8 @@ public class VrchatClientCoordinatorTests
     {
         var coordinator = CreateCoordinator(clientCount: 1);
 
-        await coordinator.LaunchClientsAsync(WorldPath, CancellationToken.None);
-        await coordinator.LaunchClientsAsync(WorldPath, CancellationToken.None);
+        await coordinator.LaunchClientsAsync(WorldPath, "20261126T000000000Z-aabbccdd", CancellationToken.None);
+        await coordinator.LaunchClientsAsync(WorldPath, "20261126T000000000Z-aabbccdd", CancellationToken.None);
 
         // Ten random digits; a collision is a 1 in 10^10 event.
         _launcher.Requests[0].RoomId.Should().NotBe(_launcher.Requests[1].RoomId);
@@ -190,7 +190,7 @@ public class VrchatClientCoordinatorTests
     {
         var coordinator = CreateCoordinator(clientCount: 3, mode: "vr");
 
-        await coordinator.LaunchClientsAsync(WorldPath, CancellationToken.None);
+        await coordinator.LaunchClientsAsync(WorldPath, "20261126T000000000Z-aabbccdd", CancellationToken.None);
 
         _launcher.Requests.Select(r => r.NoVr).Should().Equal(false, true, true);
     }
@@ -200,7 +200,7 @@ public class VrchatClientCoordinatorTests
     {
         var coordinator = CreateCoordinator();
 
-        var outcome = await coordinator.LaunchClientsAsync(WorldPath, CancellationToken.None);
+        var outcome = await coordinator.LaunchClientsAsync(WorldPath, "20261126T000000000Z-aabbccdd", CancellationToken.None);
 
         outcome.Succeeded.Should().BeTrue();
         _events.Should().Equal("launch 5000");
@@ -212,7 +212,7 @@ public class VrchatClientCoordinatorTests
         _launcher.FailingLaunchIndexes = [1];
         var coordinator = CreateCoordinator(clientCount: 3);
 
-        var outcome = await coordinator.LaunchClientsAsync(WorldPath, CancellationToken.None);
+        var outcome = await coordinator.LaunchClientsAsync(WorldPath, "20261126T000000000Z-aabbccdd", CancellationToken.None);
 
         outcome.Succeeded.Should().BeFalse();
         outcome.ErrorMessage.Should().Contain("Launched 1 of 3");
@@ -225,7 +225,7 @@ public class VrchatClientCoordinatorTests
         _launcher.ThrowOnLaunch = new InvalidOperationException("simulated failure");
         var coordinator = CreateCoordinator(clientCount: 2);
 
-        var outcome = await coordinator.LaunchClientsAsync(WorldPath, CancellationToken.None);
+        var outcome = await coordinator.LaunchClientsAsync(WorldPath, "20261126T000000000Z-aabbccdd", CancellationToken.None);
 
         outcome.Succeeded.Should().BeFalse();
         outcome.ErrorMessage.Should().Contain("Launched 0 of 2").And.Contain("simulated failure");
@@ -243,7 +243,7 @@ public class VrchatClientCoordinatorTests
                 return Task.Delay(Timeout.Infinite, token);
             });
 
-        var act = async () => await coordinator.LaunchClientsAsync(WorldPath, cts.Token);
+        var act = async () => await coordinator.LaunchClientsAsync(WorldPath, "20261126T000000000Z-aabbccdd", cts.Token);
 
         await act.Should().ThrowAsync<OperationCanceledException>();
         _launcher.Requests.Should().ContainSingle();
@@ -258,7 +258,7 @@ public class VrchatClientCoordinatorTests
         using var cts = new CancellationTokenSource();
         cts.Cancel();
 
-        var act = async () => await coordinator.LaunchClientsAsync(WorldPath, cts.Token);
+        var act = async () => await coordinator.LaunchClientsAsync(WorldPath, "20261126T000000000Z-aabbccdd", cts.Token);
 
         await act.Should().ThrowAsync<OperationCanceledException>();
         _launcher.Requests.Should().BeEmpty();
@@ -279,7 +279,7 @@ public class VrchatClientCoordinatorTests
         };
         var coordinator = CreateCoordinator(clientCount: clientCount);
 
-        var act = async () => await coordinator.LaunchClientsAsync(WorldPath, cts.Token);
+        var act = async () => await coordinator.LaunchClientsAsync(WorldPath, "20261126T000000000Z-aabbccdd", cts.Token);
 
         await act.Should().ThrowAsync<OperationCanceledException>();
         _launcher.Requests.Should().HaveCount(clientCount, "clients that already started are left running");
@@ -297,7 +297,7 @@ public class VrchatClientCoordinatorTests
                 return Task.CompletedTask;
             });
 
-        var act = async () => await coordinator.LaunchClientsAsync(WorldPath, cts.Token);
+        var act = async () => await coordinator.LaunchClientsAsync(WorldPath, "20261126T000000000Z-aabbccdd", cts.Token);
 
         await act.Should().ThrowAsync<OperationCanceledException>();
         _launcher.Requests.Should().ContainSingle();
@@ -308,7 +308,7 @@ public class VrchatClientCoordinatorTests
     {
         var coordinator = CreateCoordinator(clientCount: 4);
 
-        await coordinator.LaunchClientsAsync(WorldPath, CancellationToken.None);
+        await coordinator.LaunchClientsAsync(WorldPath, "20261126T000000000Z-aabbccdd", CancellationToken.None);
 
         LaunchOffsets().Should().Equal(0, 3, 6, 9);
         var clients = LaunchedClients();
@@ -329,7 +329,7 @@ public class VrchatClientCoordinatorTests
         _logDelaysSeconds.AddRange([22, 20, 20]);
         var coordinator = CreateCoordinator(clientCount: 3);
 
-        var outcome = await coordinator.LaunchClientsAsync(WorldPath, CancellationToken.None);
+        var outcome = await coordinator.LaunchClientsAsync(WorldPath, "20261126T000000000Z-aabbccdd", CancellationToken.None);
 
         outcome.Succeeded.Should().BeTrue();
 
@@ -353,7 +353,7 @@ public class VrchatClientCoordinatorTests
         _logDelaysSeconds.AddRange([11, 11]);
         var coordinator = CreateCoordinator(clientCount: 3);
 
-        await coordinator.LaunchClientsAsync(WorldPath, CancellationToken.None);
+        await coordinator.LaunchClientsAsync(WorldPath, "20261126T000000000Z-aabbccdd", CancellationToken.None);
 
         var clients = LaunchedClients();
         MatchedLog(clients[0], clients).Should().Be("output_log_2026-10-17_09-00-10.txt");
@@ -368,7 +368,7 @@ public class VrchatClientCoordinatorTests
         _logDelaysSeconds.Add(2.5);
         var coordinator = CreateCoordinator(clientCount: 2);
 
-        await coordinator.LaunchClientsAsync(WorldPath, CancellationToken.None);
+        await coordinator.LaunchClientsAsync(WorldPath, "20261126T000000000Z-aabbccdd", CancellationToken.None);
 
         _events.Should().Equal("launch 5000", "wait 3s", "wait 0.9s", "launch 5001");
         var clients = LaunchedClients();
@@ -383,7 +383,7 @@ public class VrchatClientCoordinatorTests
         _logDelaysSeconds.Add(10);
         var coordinator = CreateCoordinator(clientCount: 2);
 
-        await coordinator.LaunchClientsAsync(WorldPath, CancellationToken.None);
+        await coordinator.LaunchClientsAsync(WorldPath, "20261126T000000000Z-aabbccdd", CancellationToken.None);
 
         LaunchOffsets().Should().Equal(0, 11.9);
     }
@@ -394,7 +394,7 @@ public class VrchatClientCoordinatorTests
         _logDelaysSeconds.Add(null);
         var coordinator = CreateCoordinator(clientCount: 4);
 
-        var outcome = await coordinator.LaunchClientsAsync(WorldPath, CancellationToken.None);
+        var outcome = await coordinator.LaunchClientsAsync(WorldPath, "20261126T000000000Z-aabbccdd", CancellationToken.None);
 
         outcome.Succeeded.Should().BeTrue();
         LaunchOffsets().Should().Equal(0, 60, 63, 66);
@@ -408,9 +408,9 @@ public class VrchatClientCoordinatorTests
         _logDelaysSeconds.AddRange([null, null, 10, 0.8]);
         var coordinator = CreateCoordinator(clientCount: 2);
 
-        await coordinator.LaunchClientsAsync(WorldPath, CancellationToken.None);
+        await coordinator.LaunchClientsAsync(WorldPath, "20261126T000000000Z-aabbccdd", CancellationToken.None);
         var secondBatchStart = _now;
-        await coordinator.LaunchClientsAsync(WorldPath, CancellationToken.None);
+        await coordinator.LaunchClientsAsync(WorldPath, "20261126T000000000Z-aabbccdd", CancellationToken.None);
 
         (_launcher.Launched[3].CreationTimeUtc - secondBatchStart).TotalSeconds.Should().Be(11.9);
     }
@@ -421,7 +421,7 @@ public class VrchatClientCoordinatorTests
         _logDirectoryUnreadable = true;
         var coordinator = CreateCoordinator(clientCount: 3);
 
-        var outcome = await coordinator.LaunchClientsAsync(WorldPath, CancellationToken.None);
+        var outcome = await coordinator.LaunchClientsAsync(WorldPath, "20261126T000000000Z-aabbccdd", CancellationToken.None);
 
         outcome.Succeeded.Should().BeTrue();
         _events.Should().Equal("launch 5000", "wait 3s", "launch 5001", "wait 3s", "launch 5002");
@@ -443,7 +443,7 @@ public class VrchatClientCoordinatorTests
                 return Task.CompletedTask;
             });
 
-        await coordinator.LaunchClientsAsync(WorldPath, CancellationToken.None);
+        await coordinator.LaunchClientsAsync(WorldPath, "20261126T000000000Z-aabbccdd", CancellationToken.None);
 
         LaunchOffsets().Should().Equal(0, 9.9);
     }
@@ -466,7 +466,7 @@ public class VrchatClientCoordinatorTests
                 return token.IsCancellationRequested ? Task.FromCanceled(token) : Task.CompletedTask;
             });
 
-        var act = async () => await coordinator.LaunchClientsAsync(WorldPath, cts.Token);
+        var act = async () => await coordinator.LaunchClientsAsync(WorldPath, "20261126T000000000Z-aabbccdd", cts.Token);
 
         await act.Should().ThrowAsync<OperationCanceledException>();
         _launcher.Requests.Should().ContainSingle();
@@ -482,7 +482,7 @@ public class VrchatClientCoordinatorTests
         _logDelaysSeconds.AddRange([22, 0.8]);
         var coordinator = CreateCoordinator(clientCount: 2);
 
-        await coordinator.LaunchClientsAsync(WorldPath, CancellationToken.None);
+        await coordinator.LaunchClientsAsync(WorldPath, "20261126T000000000Z-aabbccdd", CancellationToken.None);
 
         LaunchOffsets().Should().Equal([0, 6.9], "the other VRChat's file ended the wait");
         var launched = LaunchedClients();

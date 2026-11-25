@@ -90,7 +90,8 @@ public class ClientSlotControlTests
 
         var result = await Create().CloseAsync(0, CancellationToken.None);
 
-        result.Should().BeEquivalentTo(new SlotCloseResult(null, 0, 100, 1, 0, true, []));
+        result.Should().BeEquivalentTo(new SlotCloseResult(
+            null, 0, 100, 1, 0, true, [], VrchatClientRoster.GenerationOf(100, Created0), Attempted: true));
         result.Done.Should().BeTrue();
         slot0.IsRunning.Should().BeFalse();
         slot0.CloseCalls.Should().Be(1);
@@ -274,7 +275,7 @@ public class ClientSlotControlTests
             @"C:\VRChat\VRChat.exe", WorldPath, RoomId, NoVr: false, WatchWorlds: false, Profile: 0));
         var (pid, created) = _launcher.Launched.Single();
         result.Should().BeEquivalentTo(new SlotLaunchResult(
-            null, 0, 0, pid, VrchatClientRoster.GenerationOf(pid, created), false, []));
+            null, 0, 0, pid, VrchatClientRoster.GenerationOf(pid, created), false, [], Attempted: true));
         result.Done.Should().BeTrue();
         _store.Clients.Should().BeEquivalentTo(new[]
         {
@@ -566,5 +567,109 @@ public class ClientSlotControlTests
         relaunched.IsRunning.Should().BeFalse();
         slot1.IsRunning.Should().BeTrue();
         _store.Clients.Should().ContainSingle().Which.ProcessId.Should().Be(101);
+    }
+
+    // ---- preconditions (r1b-contract §1.3) ----
+
+    private static long Generation0 => VrchatClientRoster.GenerationOf(100, Created0);
+
+    [Fact]
+    public async Task Close_with_the_expected_generation_closes_and_remembers_it_for_the_launch()
+    {
+        var (slot0, _) = TwoRunning();
+
+        var result = await Create().CloseAsync(0, CancellationToken.None, expectedGeneration: Generation0);
+
+        result.Done.Should().BeTrue();
+        result.Attempted.Should().BeTrue();
+        result.ClientGeneration.Should().Be(Generation0);
+        slot0.IsRunning.Should().BeFalse();
+        _context.ClosedGeneration(0).Should().Be(Generation0);
+    }
+
+    [Fact]
+    public async Task Close_with_another_generation_closes_nothing()
+    {
+        var (slot0, _) = TwoRunning();
+
+        var result = await Create().CloseAsync(0, CancellationToken.None, expectedGeneration: Generation0 + 1);
+
+        result.Refusal.Should().Be(SlotRefusal.PreconditionFailed);
+        result.Attempted.Should().BeFalse();
+        result.ClientGeneration.Should().Be(Generation0);
+        slot0.IsRunning.Should().BeTrue();
+        slot0.CloseCalls.Should().Be(0);
+        _store.Clients.Should().HaveCount(2);
+        _context.ClosedGeneration(0).Should().BeNull();
+    }
+
+    [Fact]
+    public async Task Launch_expecting_the_closed_generation_starts_the_slot()
+    {
+        TwoRunning();
+        var control = Create();
+        (await control.CloseAsync(0, CancellationToken.None, Generation0)).Done.Should().BeTrue();
+
+        var result = await control.LaunchAsync(0, CancellationToken.None, expectedGeneration: Generation0);
+
+        result.Done.Should().BeTrue();
+        result.Attempted.Should().BeTrue();
+        _launcher.Requests.Should().ContainSingle();
+    }
+
+    [Fact]
+    public async Task Launch_expecting_the_recorded_exited_client_starts_the_slot()
+    {
+        var (slot0, _) = TwoRunning();
+        slot0.Exit();
+
+        var result = await Create().LaunchAsync(0, CancellationToken.None, expectedGeneration: Generation0);
+
+        result.Done.Should().BeTrue();
+    }
+
+    [Fact]
+    public async Task Launch_expecting_another_generation_starts_nothing()
+    {
+        TwoRunning();
+        var control = Create();
+        (await control.CloseAsync(0, CancellationToken.None)).Done.Should().BeTrue();
+
+        var result = await control.LaunchAsync(0, CancellationToken.None, expectedGeneration: Generation0 + 7);
+
+        result.Refusal.Should().Be(SlotRefusal.PreconditionFailed);
+        result.Attempted.Should().BeFalse();
+        result.ClientGeneration.Should().Be(Generation0);
+        _launcher.Requests.Should().BeEmpty();
+    }
+
+    [Fact]
+    public async Task A_new_batch_forgets_the_closed_generations()
+    {
+        TwoRunning();
+        var control = Create();
+        (await control.CloseAsync(0, CancellationToken.None)).Done.Should().BeTrue();
+
+        _context.BeginBatch(WorldPath, RoomId, "20261126T000000000Z-11112222");
+        _context.AddSlot(0, profile: 0, noVr: false);
+        var result = await control.LaunchAsync(0, CancellationToken.None, expectedGeneration: Generation0);
+
+        result.Refusal.Should().Be(SlotRefusal.PreconditionFailed);
+        result.ClientGeneration.Should().BeNull();
+        _context.BatchBuildId.Should().Be("20261126T000000000Z-11112222");
+        _launcher.Requests.Should().BeEmpty();
+    }
+
+    [Fact]
+    public async Task A_failed_start_counts_as_attempted()
+    {
+        var (slot0, _) = TwoRunning();
+        slot0.Exit();
+        _launcher.ShouldSucceed = false;
+
+        var result = await Create().LaunchAsync(0, CancellationToken.None);
+
+        result.Refusal.Should().Be(SlotRefusal.LaunchFailed);
+        result.Attempted.Should().BeTrue();
     }
 }

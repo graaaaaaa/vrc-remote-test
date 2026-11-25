@@ -50,6 +50,7 @@ public static class BridgeLanApi
             buildProtocolVersion = ProtocolConstants.CurrentProtocolVersion,
             maxArtifactSizeBytes = options.MaxArtifactSizeBytes,
             maxClients = BridgeOptions.MaxVrchatClientCount,
+            features = new[] { SlotPrecondition.Feature },
         }));
 
         api.MapPut("/builds/{buildId}/artifact", (HttpContext context, string buildId) =>

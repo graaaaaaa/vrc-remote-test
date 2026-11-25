@@ -216,6 +216,9 @@ public sealed class StagingWatcher : BackgroundService, IBridgeWatcher
             // One file the Bridge cannot handle must not stall every build queued behind
             // it: the share is attacker-writable, so a single crafted name or a transient
             // I/O error would otherwise block ingestion on every scan.
+            // A deploy changes what runs on Windows (or may, if it stops halfway): the revision
+            // moves before and after it, whatever the outcome.
+            _gate?.Bump();
             try
             {
                 await ClaimAndProcessAsync(readyFile, cancellationToken);
@@ -223,6 +226,10 @@ public sealed class StagingWatcher : BackgroundService, IBridgeWatcher
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
                 _logger.LogError(ex, "Failed to ingest {File}; continuing with the next manifest.", readyFile);
+            }
+            finally
+            {
+                _gate?.Bump();
             }
         }
     }
@@ -727,7 +734,7 @@ public sealed class StagingWatcher : BackgroundService, IBridgeWatcher
         VrchatLaunchOutcome outcome;
         try
         {
-            outcome = await _clientCoordinator.LaunchClientsAsync(deployedWorldPath, cancellationToken);
+            outcome = await _clientCoordinator.LaunchClientsAsync(deployedWorldPath, manifest.BuildId, cancellationToken);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {

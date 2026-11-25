@@ -35,6 +35,8 @@ public sealed class RelaunchLaunchContext
     private readonly HashSet<(int ProcessId, long CreationTicks)> _singleLaunches = [];
     private string? _worldPath;
     private string? _roomId;
+    private string? _buildId;
+    private readonly Dictionary<int, long> _closedGenerations = [];
     private LastLaunch? _lastLaunch;
     private int _launching;
 
@@ -62,17 +64,51 @@ public sealed class RelaunchLaunchContext
             _slots.Clear();
             _worldPath = null;
             _roomId = null;
+            _buildId = null;
+            _closedGenerations.Clear();
+        }
+    }
+
+    /// <summary>The build ID of the current batch (the deploy that launched it); null without one.</summary>
+    public string? BatchBuildId
+    {
+        get { lock (_gate) return _buildId; }
+    }
+
+    /// <summary>The slots of the current batch that can be launched again, in order.</summary>
+    public IReadOnlyList<int> LaunchedSlots
+    {
+        get { lock (_gate) return _slots.Keys.OrderBy(k => k).ToList(); }
+    }
+
+    /// <summary>A single close confirmed this generation's exit in <paramref name="slot"/> (for a launch's precondition).</summary>
+    public void MarkClosed(int slot, long clientGeneration)
+    {
+        lock (_gate)
+        {
+            _closedGenerations[slot] = clientGeneration;
+        }
+    }
+
+    /// <summary>The generation a single close last confirmed closed in this slot during the current batch, or null.</summary>
+    public long? ClosedGeneration(int slot)
+    {
+        lock (_gate)
+        {
+            return _closedGenerations.TryGetValue(slot, out var generation) ? generation : null;
         }
     }
 
     /// <summary>A batch starts: its slots are added by <see cref="AddSlot"/> as each is recorded.</summary>
-    public void BeginBatch(string worldPath, string roomId)
+    public void BeginBatch(string worldPath, string roomId, string? buildId = null)
     {
         lock (_gate)
         {
             _slots.Clear();
+            _closedGenerations.Clear();
             _worldPath = worldPath;
             _roomId = roomId;
+            _buildId = buildId;
         }
     }
 

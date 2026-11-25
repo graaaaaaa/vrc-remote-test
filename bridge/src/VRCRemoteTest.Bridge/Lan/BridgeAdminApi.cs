@@ -67,7 +67,8 @@ internal static class BridgeAdminApi
         api.MapPost("/bridge/restart", () => Restart(runtime));
         api.MapPost("/clients/close", (Func<HttpContext, Task<IResult>>)(context => Close(context, runtime)));
 
-        // Only the slot comes from the request: no body or query is read.
+        // The slot, and an optional precondition body (SlotPrecondition): no query is read, and
+        // nothing in the body chooses what is closed or launched, it can only stop it.
         api.MapPost("/clients/{slot:int}/close", (HttpContext context, int slot) => CloseOne(context, runtime, slot));
         api.MapPost("/clients/{slot:int}/launch", (HttpContext context, int slot) => LaunchOne(context, runtime, slot));
     }
@@ -97,11 +98,61 @@ internal static class BridgeAdminApi
             lastConfigApply = runtime.LastConfigApply,
             busy = runtime.Gate.Current,
             restartPending = runtime.Gate.RestartPending,
+            bridgeInstanceId = runtime.InstanceId,
+            operationRevision = runtime.Gate.Revision,
+            currentBatch = CurrentBatch(context),
             configNotes = Notes(options, profiles, runtime, saved),
             stateExportsBytes = DirectorySize(Path.Combine(options.StateDirectory, "exports")),
             freeDiskBytes = FreeSpace(options.StateDirectory),
         });
     }
+
+    /// <summary>The Relaunch batch whose slots can be launched again one at a time, and the deploy that started it.</summary>
+    private static object CurrentBatch(HttpContext context)
+    {
+        var launchContext = context.RequestServices.GetRequiredService<RelaunchLaunchContext>();
+        return new { buildId = launchContext.BatchBuildId, launchedSlots = launchContext.LaunchedSlots };
+    }
+
+    /// <summary>The values a precondition is compared with, now (clientGeneration is the slot's and filled in later).</summary>
+    private static SlotPrecondition CurrentValues(HttpContext context, BridgeRuntime runtime) => new(
+        runtime.InstanceId,
+        runtime.HostGeneration,
+        runtime.ActiveConfigEtag,
+        BridgeRuntime.HashFile(runtime.ConfigPath),
+        runtime.Gate.Revision,
+        context.RequestServices.GetRequiredService<RelaunchLaunchContext>().BatchBuildId,
+        0);
+
+    /// <summary>Reads and checks the optional precondition body; a refusal is the 400 to answer.</summary>
+    private static async Task<(SlotPrecondition? Precondition, string? OperationId, IResult? Refusal)> ReadPreconditionAsync(
+        HttpContext context)
+    {
+        var body = await SlotPrecondition.ReadBodyAsync(context);
+        var (precondition, operationId, problems) = SlotPrecondition.Parse(body, context.Request.ContentType);
+        return problems is null
+            ? (precondition, operationId, null)
+            : (null, null, Problem(StatusCodes.Status400BadRequest, "invalidPrecondition", problems));
+    }
+
+    private static IResult PreconditionFailed(
+        SlotPrecondition current, IReadOnlyList<string> mismatched, long? clientGeneration, string? operationId) =>
+        Results.Json(new
+        {
+            error = "preconditionFailed",
+            mismatched,
+            current = new
+            {
+                bridgeInstanceId = current.BridgeInstanceId,
+                hostGeneration = current.HostGeneration,
+                activeConfigEtag = current.ActiveConfigEtag,
+                savedConfigEtag = current.SavedConfigEtag,
+                operationRevision = current.OperationRevision,
+                buildId = current.BuildId,
+                clientGeneration,
+            },
+            operationId,
+        }, statusCode: StatusCodes.Status412PreconditionFailed);
 
     /// <summary>Keyed by the names config.json and PUT /config use, so they are not camel-cased like the rest.</summary>
     internal static Dictionary<string, object?> ActiveConfig(BridgeOptions o) => new()
@@ -340,6 +391,7 @@ internal static class BridgeAdminApi
         var active = context.RequestServices.GetRequiredService<IOptions<BridgeOptions>>().Value;
         if (options.IsRelaunchMode != active.IsRelaunchMode)
         {
+            runtime.Gate.Bump();
             var closer = context.RequestServices.GetRequiredService<OwnedClientCloser>();
             var closed = await closer.CloseAsync(requireNoOthers: true, context.RequestAborted);
             if (closed.Refused || closed.NotConfirmed > 0 || closed.RecordNotUpdated)
@@ -368,6 +420,7 @@ internal static class BridgeAdminApi
                 ConfigFile.Backup(runtime.ConfigPath, before, DateTimeOffset.UtcNow);
             }
 
+            runtime.Gate.Bump();
             ConfigFile.Replace(runtime.ConfigPath, after, currentEtag);
         }
         catch (ConfigChangedException)
@@ -421,6 +474,7 @@ internal static class BridgeAdminApi
         }
 
         var closer = context.RequestServices.GetRequiredService<OwnedClientCloser>();
+        runtime.Gate.Bump();
         var report = await closer.CloseAsync(requireNoOthers: false, context.RequestAborted);
         return Results.Json(new
         {
@@ -433,14 +487,40 @@ internal static class BridgeAdminApi
 
     private static async Task<IResult> CloseOne(HttpContext context, BridgeRuntime runtime, int slot)
     {
+        var (precondition, operationId, invalid) = await ReadPreconditionAsync(context);
+        if (invalid is not null)
+        {
+            return invalid;
+        }
+
         using var lease = runtime.Gate.TryEnter("close-client");
         if (lease is null)
         {
             return Busy(runtime);
         }
 
+        if (precondition is not null)
+        {
+            var current = CurrentValues(context, runtime);
+            var mismatched = precondition.Mismatched(current);
+            if (mismatched.Count > 0)
+            {
+                return PreconditionFailed(current, mismatched, null, operationId);
+            }
+        }
+
         var control = context.RequestServices.GetRequiredService<ClientSlotControl>();
-        var result = await control.CloseAsync(slot, context.RequestAborted);
+        var result = await control.CloseAsync(slot, context.RequestAborted, precondition?.ClientGeneration);
+        if (result.Attempted)
+        {
+            runtime.Gate.Bump();
+        }
+
+        if (result.Refusal == SlotRefusal.PreconditionFailed)
+        {
+            return PreconditionFailed(CurrentValues(context, runtime), ["clientGeneration"], result.ClientGeneration, operationId);
+        }
+
         if (result.Refusal is { } refusal)
         {
             return Refused(refusal, result.Problems);
@@ -454,6 +534,10 @@ internal static class BridgeAdminApi
             notConfirmed = result.NotConfirmed,
             recordUpdated = result.RecordUpdated,
             problems = result.Problems.Select(LogRedactor.Redact).ToList(),
+            clientGeneration = result.ClientGeneration,
+            operationRevision = runtime.Gate.Revision,
+            bridgeInstanceId = runtime.InstanceId,
+            operationId,
         }, statusCode: result.Done ? StatusCodes.Status200OK : StatusCodes.Status409Conflict);
     }
 
@@ -464,22 +548,48 @@ internal static class BridgeAdminApi
     /// </summary>
     private static async Task<IResult> LaunchOne(HttpContext context, BridgeRuntime runtime, int slot)
     {
+        var (precondition, operationId, invalid) = await ReadPreconditionAsync(context);
+        if (invalid is not null)
+        {
+            return invalid;
+        }
+
         using var lease = runtime.Gate.TryEnter("launch-client");
         if (lease is null)
         {
             return Busy(runtime);
         }
 
+        if (precondition is not null)
+        {
+            var current = CurrentValues(context, runtime);
+            var mismatched = precondition.Mismatched(current);
+            if (mismatched.Count > 0)
+            {
+                return PreconditionFailed(current, mismatched, null, operationId);
+            }
+        }
+
         var control = context.RequestServices.GetRequiredService<ClientSlotControl>();
         SlotLaunchResult result;
         try
         {
-            result = await control.LaunchAsync(slot, context.RequestAborted);
+            result = await control.LaunchAsync(slot, context.RequestAborted, precondition?.ClientGeneration);
         }
         catch (OperationCanceledException) when (context.RequestAborted.IsCancellationRequested)
         {
             // Stopped before anything was started; nobody is listening for the answer.
             return Results.Empty;
+        }
+
+        if (result.Attempted)
+        {
+            runtime.Gate.Bump();
+        }
+
+        if (result.Refusal == SlotRefusal.PreconditionFailed)
+        {
+            return PreconditionFailed(CurrentValues(context, runtime), ["clientGeneration"], result.ClientGeneration, operationId);
         }
 
         if (result.Refusal is { } refusal)
@@ -497,6 +607,9 @@ internal static class BridgeAdminApi
                 recorded = false,
                 processId = result.ProcessId,
                 problems = result.Problems.Select(LogRedactor.Redact).ToList(),
+                operationRevision = runtime.Gate.Revision,
+                bridgeInstanceId = runtime.InstanceId,
+                operationId,
             }, statusCode: StatusCodes.Status500InternalServerError);
         }
 
@@ -506,6 +619,9 @@ internal static class BridgeAdminApi
             profile = result.Profile,
             processId = result.ProcessId,
             clientGeneration = result.ClientGeneration,
+            operationRevision = runtime.Gate.Revision,
+            bridgeInstanceId = runtime.InstanceId,
+            operationId,
         });
     }
 
