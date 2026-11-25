@@ -19,6 +19,17 @@ namespace VRCRemoteTest
         [JsonProperty("version")]
         public string Version { get; set; }
 
+        /// <summary>SHA-256 of the running Bridge executable; null when it could not be read.</summary>
+        [JsonProperty("exeSha256")]
+        public string ExeSha256 { get; set; }
+
+        /// <summary>
+        /// When the Bridge process started. hostGeneration starts again at 1 in a new process,
+        /// so the two together tell one host from another.
+        /// </summary>
+        [JsonProperty("processStartedAtUtc")]
+        public DateTimeOffset? ProcessStartedAtUtc { get; set; }
+
         /// <summary>Goes up by one each time the host restarts in-process.</summary>
         [JsonProperty("hostGeneration")]
         public long HostGeneration { get; set; }

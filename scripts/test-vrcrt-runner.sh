@@ -1,0 +1,435 @@
+#!/usr/bin/env bash
+# Checks package/Tools~/vrcrt_runner.py with a stand-in for vrcrt.sh: a small program that
+# answers status, bridge, cursor, log --markers --json and export-log from files under
+# $VRCRT_FIXTURE_DIR/fake, which each check writes. Run from anywhere: bash scripts/test-vrcrt-runner.sh
+set -u
+
+here="$(CDPATH= cd -P -- "$(dirname -- "$0")" && pwd)"
+runner="$here/../package/Tools~/vrcrt_runner.py"
+work="$(mktemp -d "${TMPDIR:-/tmp}/vrcrt-runner-test.XXXXXX")"
+trap 'rm -rf "$work"' EXIT
+export VRCRT_FIXTURE_DIR="$work/fixture"
+export VRCRT_RUNNER_TEST_CLI="$work/fake-cli.sh"
+export VRCRT_RUNNER_TEST_POLL=0.05
+export VRCRT_RUNNER_TEST_READY=2
+export VRCRT_RUNNER_TEST_TAG=1
+export VRCRT_BRIDGE_URL="https://192.0.2.1:38443"
+export VRCRT_CERT_SHA256="$(printf 'a%.0s' $(seq 64))"
+fake="$VRCRT_FIXTURE_DIR/fake"
+mkdir -p "$fake"
+
+failures=0
+pass() { printf 'ok   %s\n' "$1"; }
+fail() { printf 'FAIL %s\n' "$1"; failures=$((failures + 1)); }
+
+cat > "$work/fake.py" <<'FAKE'
+import json, os, sys, time
+from datetime import datetime, timezone
+d = os.path.join(os.environ["VRCRT_FIXTURE_DIR"], "fake")
+args = sys.argv[1:]
+with open(os.path.join(d, "calls.log"), "a") as log:
+    log.write(" ".join(args) + "\n")
+with open(os.path.join(d, "env.log"), "a") as log:
+    log.write(json.dumps(dict(os.environ)) + "\n")
+def answer(name):
+    path = os.path.join(d, name)
+    if not os.path.exists(path):
+        sys.stderr.write("fake: no " + name + "\n"); sys.exit(3)
+    data = open(path).read()
+    if data.startswith("SLEEP "):
+        time.sleep(float(data.split()[1])); data = data.split("\n", 1)[1]
+    if data.startswith("EXIT "):
+        sys.stderr.write(data); sys.exit(int(data.split()[1]))
+    sys.stdout.write(data.replace("__NOW__", datetime.now(timezone.utc).isoformat()))
+    sys.exit(0)
+command = args[0]
+if command == "status":
+    answer("clients.json")
+elif command == "bridge":
+    answer("bridge.json")
+elif command == "cursor":
+    answer("cursor.json")
+elif command == "log":
+    answer("markers-%s.json" % args[1])
+elif command == "export-log":
+    slot, folder, generation, epoch = args[1], args[2], args[4], args[6]
+    path = os.path.join(folder, "vrchat-slot-%s-generation-%s-epoch-%s-0123456789abcdef0123456789abcdef.log" % (slot, generation, epoch))
+    with open(path, "w") as out:
+        out.write("full log of slot %s\n" % slot)
+    print(path)
+else:
+    sys.stderr.write("fake: unknown command\n"); sys.exit(2)
+FAKE
+printf '#!/usr/bin/env bash\nexec python3 -I "%s" "$@"\n' "$work/fake.py" > "$work/fake-cli.sh"
+
+# bridge <processStartedAtUtc> [freeDiskBytes] [mode]
+bridge() {
+    {
+        printf '{"version":"0.11.0","exeSha256":"%s","processStartedAtUtc":"%s","hostGeneration":2,"activeConfigEtag":"e1","savedConfigEtag":"e1",' \
+            "$(printf 'b%.0s' $(seq 64))" "${1:-2026-11-26T00:00:00+00:00}"
+        printf '"activeConfig":{"VrchatClientMode":"%s","VrchatProfiles":[0,1],"VrchatMode":"Desktop"},"freeDiskBytes":%s,"stateExportsBytes":1024}' \
+            "${3:-${BRIDGE_MODE:-Relaunch}}" "${2:-53687091200}"
+    } > "$fake/bridge.json"
+}
+# client <slot> <generation> <epoch> <joinedSeq> <state> <inErrorWorld> <loginState> [instance]
+# JOIN_ATTEMPT=<seq> adds joinAttemptSeq (the join's Joining line); without it the field is absent.
+client() {
+    printf '{"slot":%s,"clientGeneration":%s,"observationEpoch":%s,"processId":%s,"running":true,"profile":%s,"state":"%s",' \
+        "$1" "$2" "$3" "$((100 + $1))" "$1" "$5"
+    [ -n "${JOIN_ATTEMPT:-}" ] && printf '"joinAttemptSeq":%s,' "$JOIN_ATTEMPT"
+    printf '"instance":"%s","inErrorWorld":%s,"loggingLevel":"full","logStatus":"shown","loginState":"%s","joinedSeq":%s,"observedThroughSeq":50,"catchingUp":false}' \
+        "${8:-local:inst}" "$6" "$7" "$4"
+}
+# clients <updatedAtUtc> <entry> <entry>
+clients() {
+    printf '{"schemaVersion":1,"processListReadable":true,"clients":[%s,%s],"updatedAtUtc":"%s"}' "$2" "$3" "$1" > "$fake/clients.json"
+}
+cursor() { printf '{"schemaVersion":1,"slots":{"0":{"clientGeneration":11,"observationEpoch":%s,"seq":%s,"running":true},"1":{"clientGeneration":22,"observationEpoch":6,"seq":50,"running":true}}}' \
+    "${CURSOR_EPOCH0:-5}" "${CURSOR_SEQ0:-50}" > "$fake/cursor.json"; }
+# markers <slot> <generation> <epoch> <records JSON> [droppedThroughSeq]
+markers() {
+    printf '{"schemaVersion":1,"slot":%s,"header":{"clientGeneration":%s,"observationEpoch":%s,"catchingUp":false,"droppedThroughSeq":%s},"records":%s}' \
+        "$1" "$2" "$3" "${5:-0}" "$4" > "$fake/markers-$1.json"
+}
+tagged() { printf '[{"seq":5,"text":"2026.11.26 00:00:00 Debug - [VRCRT] PRT001 vrcrt.build=%s ev=LOAD","truncated":%s,"withheld":false}]' "$1" "${2:-false}"; }
+
+ready_clients() {
+    clients "__NOW__" "$(client 0 111 7 4 joined false authenticated)" "$(client 1 222 8 4 joined false authenticated)"
+    markers 0 111 7 "$(tagged "${1:-RUNTAG}")"
+    markers 1 222 8 "$(tagged "${1:-RUNTAG}")"
+}
+before_clients() {
+    clients "__NOW__" "$(client 0 11 5 40 joined false authenticated)" "$(client 1 22 6 40 joined false authenticated)"
+}
+# deploy_result <runDir> <deploy> <launch> <stopReason JSON> <tag JSON>
+deploy_result() {
+    printf '{"schema":"vrcrt.deploy-result","schemaVersion":1,"attemptId":"20261126T000000000Z-11112222","buildId":"20261126T000001000Z-33334444",' > "$1/deploy-result.json"
+    printf '"artifact":{"sha256":null,"size":1,"worldBuildTag":%s},"classification":{"deploy":"%s","launch":"%s","stopReason":%s}}' \
+        "$5" "$2" "$3" "$4" >> "$1/deploy-result.json"
+}
+field() { python3 -I -c 'import json,sys; v=json.load(open(sys.argv[1]))
+for k in sys.argv[2].split("."): v = v.get(k) if isinstance(v, dict) else None
+print(v)' "$1" "$2"; }
+
+root="$work/root"
+# prepare_run [extra prepare args...]: sets $run and $token
+prepare_run() {
+    rm -f "$root"/locks/*.json
+    bridge; before_clients; cursor
+    local line
+    line="$(python3 -I "$runner" prepare --slots 0,1 --owner-pid $$ --run-root "$root" "$@")" || return $?
+    run="$(printf '%s' "$line" | python3 -I -c 'import json,sys; print(json.load(sys.stdin)["runDir"])')"
+    token="$(printf '%s' "$line" | python3 -I -c 'import json,sys; print(json.load(sys.stdin)["claimToken"])')"
+    tag="$(printf '%s' "$line" | python3 -I -c 'import json,sys; print(json.load(sys.stdin)["worldBuildTag"])')"
+}
+# check <name> <expected exit> <run.json field> <expected value>
+check() {
+    local name="$1" code="$2" key="$3" want="$4" status got
+    python3 -I "$runner" continue --run "$run" --claim-token "$token" > "$work/out" 2>&1
+    status=$?
+    got="$(field "$run/run.json" "$key")"
+    if [ "$status" -ne "$code" ] || [ "$got" != "$want" ]; then
+        fail "$name: exit $status (want $code), $key=$got (want $want)"; sed 's/^/     /' "$work/out"
+    else
+        pass "$name"
+    fi
+}
+
+# --- prepare
+prepare_run
+if [ -d "$run" ] && [ "$(field "$run/run.json" state)" = "prepared" ] && [ -f "$run/before.cursor.json" ]; then
+    pass "prepare saves the state before the deploy"
+else
+    fail "prepare saves the state before the deploy"
+fi
+[ "$(stat -f %Lp "$run")" = "700" ] && pass "the run folder is owner-only" || fail "the run folder is owner-only"
+python3 -I "$runner" prepare --slots 0,1 --owner-pid $$ --run-root "$root" > "$work/out" 2>&1
+[ $? -eq 3 ] && grep -q otherRunActive "$work/out" && pass "a second prepare on the same Bridge is refused" \
+    || { fail "a second prepare on the same Bridge is refused"; cat "$work/out"; }
+
+# --- the whole procedure
+ready_clients "$tag"
+deploy_result "$run" PASS PASS null "\"$tag\""
+check "deploy-collect passes with every client ready and tagged" 0 result PASS
+[ "$(field "$run/run.json" results.worldBuildMatch)" = "PASS" ] && pass "world build matches" || fail "world build matches"
+[ "$(field "$run/run.json" results.testVerdict)" = "notJudged" ] && pass "the test itself is not judged" || fail "the test itself is not judged"
+ls "$run"/evidence/slot-0/g111-e7/vrchat-slot-0-*.log > /dev/null 2>&1 && ls "$run"/evidence/slot-1/g222-e8/markers.json > /dev/null 2>&1 \
+    && pass "evidence is kept per slot, generation and epoch" || fail "evidence is kept per slot, generation and epoch"
+ls "$root"/locks/*.json > /dev/null 2>&1 && fail "the claim is released at the end" || pass "the claim is released at the end"
+[ "$(stat -f %Lp "$run/progress.jsonl")" = "600" ] && [ "$(stat -f %Lp "$run/run.json")" = "600" ] \
+    && pass "run files are owner-only" || fail "run files are owner-only"
+
+prepare_run; ready_clients OTHERTAG1; deploy_result "$run" PASS PASS null "\"$tag\""
+check "another build's tag fails the run" 1 results.worldBuildMatch FAIL
+
+prepare_run; ready_clients "$tag"; deploy_result "$run" PASS PASS null "\"$tag\""
+markers 1 222 8 "[{\"seq\":5,\"text\":\"[VRCRT] vrcrt.build=$tag\",\"truncated\":false,\"withheld\":false},{\"seq\":7,\"text\":\"[VRCRT] vrcrt.build=OTHERTAG1\",\"truncated\":false,\"withheld\":false}]"
+check "a later other tag fails even after this one" 1 results.worldBuildMatch FAIL
+prepare_run; ready_clients "$tag"; deploy_result "$run" PASS PASS null null
+check "no tag for these bytes leaves the build match unknown" 0 results.worldBuildMatch UNKNOWN
+
+# VRChat logs a world's Start() markers between Joining (joinAttemptSeq) and Finished entering world (joinedSeq).
+prepare_run; deploy_result "$run" PASS PASS null "\"$tag\""
+clients "__NOW__" "$(JOIN_ATTEMPT=2 client 0 111 7 9 joined false authenticated)" "$(JOIN_ATTEMPT=2 client 1 222 8 9 joined false authenticated)"
+markers 0 111 7 "$(tagged "$tag")"; markers 1 222 8 "$(tagged "$tag")"
+check "a tag logged while the world loads (before the join finished) matches" 0 results.worldBuildMatch PASS
+prepare_run; deploy_result "$run" PASS PASS null "\"$tag\""
+clients "__NOW__" "$(JOIN_ATTEMPT=6 client 0 111 7 9 joined false authenticated)" "$(JOIN_ATTEMPT=6 client 1 222 8 9 joined false authenticated)"
+markers 0 111 7 "$(tagged OTHERTAG1)"; markers 1 222 8 "$(tagged OTHERTAG1)"
+check "a tag from before this join's Joining line is not counted" 0 results.worldBuildMatch UNKNOWN
+prepare_run; deploy_result "$run" PASS PASS null "\"$tag\""
+clients "__NOW__" "$(client 0 111 7 9 joined false authenticated)" "$(client 1 222 8 9 joined false authenticated)"
+markers 0 111 7 "$(tagged "$tag")"; markers 1 222 8 "$(tagged "$tag")"
+check "without joinAttemptSeq only lines after the join count" 0 results.worldBuildMatch UNKNOWN
+
+prepare_run; ready_clients "$tag"; markers 0 111 7 "$(tagged "$tag" true)"; deploy_result "$run" PASS PASS null "\"$tag\""
+check "a cut tag line proves nothing" 0 results.worldBuildMatch UNKNOWN
+
+prepare_run; ready_clients "$tag"; markers 0 111 7 "$(tagged "$tag")" 9; deploy_result "$run" PASS PASS null "\"$tag\""
+check "dropped markers leave the build match unknown" 0 results.worldBuildMatch UNKNOWN
+
+# --- the deploy result decides whether to go on
+prepare_run; ready_clients "$tag"; deploy_result "$run" UNKNOWN UNKNOWN '"deployedButLaunch:partial"' null
+check "a contradictory deploy result stops UNKNOWN" 3 result UNKNOWN
+prepare_run; ready_clients "$tag"; deploy_result "$run" FAIL FAIL '"partialLaunch"' null
+check "a real partial start fails the readiness" 1 results.clientReadiness FAIL
+prepare_run; ready_clients "$tag"; deploy_result "$run" PASS notApplicable '"autoLaunchDisabled"' null
+check "AutoLaunch off stops UNKNOWN" 3 reason "launch:autoLaunchDisabled"
+prepare_run; ready_clients "$tag"
+check "no deploy result is UNKNOWN" 3 reason noDeployResult
+prepare_run; ready_clients "$tag"
+printf '{"schema":"vrcrt.deploy-result","schemaVersion":1,"artifact":[1],"classification":{"deploy":"PASS"}}' > "$run/deploy-result.json"
+check "a deploy result missing its launch verdict is UNKNOWN" 3 reason deployResultInvalid
+
+# --- readiness
+prepare_run; deploy_result "$run" PASS PASS null null
+clients "__NOW__" "$(client 0 111 7 4 joined false authenticated)" "$(client 1 222 8 4 joined true authenticated)"
+check "a client in the error world fails after the wait" 1 reason notReady
+prepare_run; deploy_result "$run" PASS PASS null null
+clients "__NOW__" "$(client 0 111 7 4 joined false authenticated)" "$(client 1 222 8 null starting null likelyLoggedOut)"
+check "a likely logged-out client stops UNKNOWN" 3 reason likelyLoggedOut
+grep -q "profile 1 on Windows" "$run/run.json" && pass "it says which profile to log in again" || fail "it says which profile to log in again"
+prepare_run; deploy_result "$run" PASS PASS null null
+clients "2026-01-01T00:00:00+00:00" "$(client 0 111 7 4 joined false authenticated)" "$(client 1 222 8 4 joined false authenticated)"
+check "a stale client list is UNKNOWN, not FAIL" 3 results.clientReadiness UNKNOWN
+prepare_run; deploy_result "$run" PASS PASS null null
+clients "__NOW__" "$(client 0 111 7 4 joined false authenticated)" "$(client 1 222 8 4 joined false authenticated local:other)"
+check "clients in different instances are not ready" 1 reason notReady
+BRIDGE_MODE=Reload prepare_run; deploy_result "$run" PASS PASS null null
+BRIDGE_MODE=Reload bridge
+clients "__NOW__" "$(client 0 11 9 60 joined false authenticated)" "$(client 1 222 8 4 joined false authenticated)"
+check "Reload: the same client read again from its start is UNKNOWN" 3 reason epochChangedSinceDeploy
+CURSOR_EPOCH0=null CURSOR_SEQ0=0 BRIDGE_MODE=Reload prepare_run; deploy_result "$run" PASS PASS null null
+BRIDGE_MODE=Reload bridge
+clients "__NOW__" "$(client 0 11 5 4 joined false authenticated)" "$(client 1 222 8 4 joined false authenticated)"
+check "Reload: a client whose log was not read before the deploy is UNKNOWN" 3 reason baselineUnknown
+BRIDGE_MODE=Reload prepare_run; deploy_result "$run" PASS PASS null null
+BRIDGE_MODE=Reload bridge
+clients "__NOW__" "$(client 0 11 5 60 joined false authenticated)" "$(client 1 22 6 60 joined false authenticated)"
+markers 0 11 5 "[]"; markers 1 22 6 "[]"
+check "Reload: a join after the cursor in the same generation is ready" 0 results.clientReadiness PASS
+BRIDGE_MODE=Reload prepare_run; deploy_result "$run" PASS PASS null null
+BRIDGE_MODE=Reload bridge
+clients "__NOW__" "$(JOIN_ATTEMPT=45 client 0 11 5 60 joined false authenticated)" "$(JOIN_ATTEMPT=55 client 1 22 6 60 joined false authenticated)"
+markers 0 11 5 "[]"; markers 1 22 6 "[]"
+check "Reload: a join that began before the deploy is not ready" 1 reason notReady
+prepare_run; deploy_result "$run" PASS PASS null null
+clients "__NOW__" "$(client 0 11 5 60 joined false authenticated)" "$(client 1 222 8 4 joined false authenticated)"
+check "Relaunch: a client that was not relaunched is not ready" 1 reason notReady
+prepare_run; deploy_result "$run" PASS PASS null null
+clients "__NOW__" "$(client 0 111 7 4 joined false authenticated | sed 's/"logStatus":"shown"/"logStatus":"notYet"/')" "$(client 1 222 8 4 joined false authenticated)"
+check "a client whose log the Bridge has not matched yet is UNKNOWN" 3 results.clientReadiness UNKNOWN
+prepare_run; deploy_result "$run" PASS PASS null null
+clients "__NOW__" "$(client 0 111 null null unknown null unknown)" "$(client 1 222 8 4 joined false authenticated)"
+check "a client whose log is not read yet is UNKNOWN, not FAIL" 3 results.clientReadiness UNKNOWN
+prepare_run; deploy_result "$run" PASS PASS null null
+clients "__NOW__" "$(client 0 11 5 40 joined false authenticated)" "$(client 1 222 8 4 joined false authenticated)"
+check "a client that did not join after the deploy is not ready" 1 reason notReady
+
+# --- what changes on the way
+prepare_run; ready_clients "$tag"; deploy_result "$run" PASS PASS null "\"$tag\""
+bridge "2026-11-26T01:00:00+00:00"
+check "a restarted Bridge is UNKNOWN" 3 reason bridgeChanged
+prepare_run; ready_clients "$tag"; deploy_result "$run" PASS PASS null "\"$tag\""
+bridge "2026-11-26T00:00:00+00:00" 1024
+check "low Windows disk stops before exporting" 3 reason windowsDiskLow
+prepare_run; ready_clients "$tag"; deploy_result "$run" PASS PASS null "\"$tag\""
+VRCRT_RUNNER_TEST_MAC_FREE=4611686018427387904 check "low Mac disk stops before writing" 3 reason macDiskLow
+
+# --- cancel, claims, recovery
+prepare_run; deploy_result "$run" PASS PASS null null
+clients "__NOW__" "$(client 0 111 7 4 joined false authenticated)" "$(client 1 222 8 4 joined true authenticated)"
+( sleep 0.5; touch "$run/cancel.request" ) &
+start=$(python3 -I -c 'import time; print(time.monotonic())')
+check "cancel.request ends the wait as CANCELED" 4 result CANCELED
+elapsed=$(python3 -I -c "import time; print(int(time.monotonic() - $start))")
+[ "$elapsed" -lt 2 ] && pass "the cancellation is seen within a second" || fail "the cancellation is seen within a second (${elapsed} s)"
+prepare_run; ready_clients "$tag"; deploy_result "$run" PASS PASS null null
+printf 'SLEEP 30\n%s' "$(cat "$fake/clients.json")" > "$fake/clients.json"
+( sleep 0.5; touch "$run/cancel.request" ) &
+start=$(python3 -I -c 'import time; print(time.monotonic())')
+check "cancelling stops a CLI child that hangs" 4 result CANCELED
+elapsed=$(python3 -I -c "import time; print(int(time.monotonic() - $start))")
+[ "$elapsed" -lt 8 ] && pass "the hung child is stopped and reaped quickly" || fail "the hung child is stopped and reaped quickly (${elapsed} s)"
+prepare_run; ready_clients "$tag"; deploy_result "$run" PASS PASS null "\"$tag\""
+python3 -I - "$fake/markers-0.json" "$tag" <<'PY'
+import json, sys
+records = [{"seq": n, "text": "2026.11.26 00:00:00 Debug - [VRCRT] FLOOD n=%d" % n, "truncated": False, "withheld": False}
+           for n in range(1, 10001)]
+records.append({"seq": 10001, "text": "[VRCRT] vrcrt.build=%s" % sys.argv[2], "truncated": False, "withheld": False})
+json.dump({"schemaVersion": 1, "slot": 0, "header": {"clientGeneration": 111, "observationEpoch": 7, "catchingUp": False,
+           "droppedThroughSeq": 0}, "records": records}, open(sys.argv[1], "w"))
+PY
+start=$(python3 -I -c 'import time; print(time.monotonic())')
+check "10,000 marker records are read in bounded time" 0 results.worldBuildMatch PASS
+elapsed=$(python3 -I -c "import time; print(int(time.monotonic() - $start))")
+[ "$elapsed" -lt 10 ] && pass "the flood does not stretch the run (${elapsed} s)" || fail "the flood does not stretch the run (${elapsed} s)"
+VRCRT_RUNNER_TEST_RUN=1 prepare_run; deploy_result "$run" PASS PASS null null
+clients "__NOW__" "$(client 0 111 7 4 joined false authenticated)" "$(client 1 222 8 4 joined true authenticated)"
+sleep 1.1
+check "the run's own deadline, fixed at prepare, stops it UNKNOWN" 3 reason runDeadline
+prepare_run; ready_clients "$tag"; deploy_result "$run" PASS PASS null null
+good="$token"; token=00000000000000000000000000000000
+check "continue with another claim token changes nothing" 3 state prepared
+token="$good"
+python3 -I "$runner" recover --run "$run" > "$work/out" 2>&1
+[ $? -eq 3 ] && grep -q runActive "$work/out" && [ "$(field "$run/run.json" state)" = prepared ] \
+    && pass "recover refuses a run whose owner is active" || { fail "recover refuses a run whose owner is active"; cat "$work/out"; }
+VRCRT_BRIDGE_URL=https://192.0.2.9:38443 python3 -I "$runner" recover --run "$run" > "$work/out" 2>&1
+[ $? -eq 3 ] && grep -q runActive "$work/out" \
+    && pass "recover uses the run's own claim, whatever Bridge this shell names" || { fail "recover uses the run's own claim"; cat "$work/out"; }
+clients "__NOW__" "$(client 0 111 7 4 joined false authenticated)" "$(client 1 222 8 4 joined true authenticated)"
+python3 -I "$runner" continue --run "$run" --claim-token "$token" > /dev/null 2>&1 &
+first=$!
+sleep 0.5
+python3 -I "$runner" continue --run "$run" --claim-token "$token" > "$work/out" 2>&1
+[ $? -eq 3 ] && grep -q notPrepared "$work/out" && pass "a second continue with the same token is refused" \
+    || { fail "a second continue with the same token is refused"; cat "$work/out"; }
+wait "$first"
+rm -f "$root"/locks/*.json
+prepare_run
+python3 -I - "$run/run.json" <<'PY'
+import json, sys
+p = sys.argv[1]; r = json.load(open(p)); r["state"] = "running"
+r["operations"].append({"name": "waitClientsReady", "inProgress": True, "result": "UNKNOWN"}); json.dump(r, open(p, "w"))
+PY
+python3 -I - "$root"/locks/*.json <<'PY'
+import json, sys
+p = sys.argv[1]; c = json.load(open(p)); c["owner"] = {"pid": 1, "start": "not this process"}; json.dump(c, open(p, "w"))
+PY
+python3 -I "$runner" recover --run "$run" > /dev/null 2>&1
+[ "$(field "$run/run.json" reason)" = "runnerInterrupted" ] && pass "recover finalizes an interrupted run" || fail "recover finalizes an interrupted run"
+rm -f "$root"/locks/*.json
+
+prepare_run; deploy_result "$run" PASS PASS null null
+printf 'SLEEP 30\n{}' > "$fake/clients.json"
+cat > "$work/stubborn.sh" <<STUB
+#!/usr/bin/env bash
+bash -c 'trap "" TERM; echo \$\$ > "$work/stubborn.pid"; while :; do sleep 1; done' &
+exec python3 -I "$work/fake.py" "\$@"
+STUB
+chmod +x "$work/stubborn.sh"
+VRCRT_RUNNER_TEST_CLI="$work/stubborn.sh" python3 -I "$runner" continue --run "$run" --claim-token "$token" > /dev/null 2>&1 &
+pid=$!
+sleep 1.5
+kill -INT "$pid"
+wait "$pid"
+code=$?
+[ "$code" -eq 4 ] && [ "$(field "$run/run.json" result)" = CANCELED ] && pass "Ctrl-C ends the run as CANCELED" \
+    || fail "Ctrl-C ends the run as CANCELED (exit $code, $(field "$run/run.json" result))"
+if [ -f "$work/stubborn.pid" ] && kill -0 "$(cat "$work/stubborn.pid")" 2>/dev/null; then
+    fail "a descendant that ignores SIGTERM is killed with its group"; kill -9 "$(cat "$work/stubborn.pid")"
+else
+    pass "a descendant that ignores SIGTERM is killed with its group"
+fi
+ls "$root"/locks/*.json > /dev/null 2>&1 && fail "after Ctrl-C the claim is released" || pass "after Ctrl-C the claim is released"
+rm -f "$root"/locks/*.json
+
+mkdir -p "$work/project/Assets/Scenes"; touch "$work/project/Assets/Scenes/Main.unity"
+cat > "$work/unity" <<UNITY
+#!/usr/bin/env bash
+sleep 1
+printf '{"schema":"vrcrt.deploy-result","schemaVersion":1,"attemptId":"20261126T000000000Z-11112222","buildId":"20261126T000001000Z-33334444","artifact":{"worldBuildTag":"%s"},"classification":{"deploy":"PASS","launch":"PASS","stopReason":null}}' "\$VRC_REMOTE_TEST_WORLD_BUILD_TAG" > "\$VRC_REMOTE_TEST_RUN_DIR/deploy-result.json"
+env > "$work/unity-env.log"
+UNITY
+chmod +x "$work/unity"
+bridge; before_clients; cursor; ready_clients RUNTAGX
+VRCRT_TOKEN=test-token VRCRT_RUNNER_TEST_NO_PS=1 VRCRT_RUNNER_TEST_PREPARE=0.3 python3 -I "$runner" run --build headless \
+    --project "$work/project" --scene Assets/Scenes/Main.unity --slots 0,1 --unity "$work/unity" --run-root "$root" > "$work/out" 2>&1
+code=$?
+headless_run="$(ls -dt "$root"/runs/*/ | head -1)"
+if [ "$(field "$headless_run/run.json" results.deploy)" = PASS ]; then
+    pass "a headless build is not cut short by prepare's deadline"
+else
+    fail "a headless build is not cut short by prepare's deadline (exit $code)"; cat "$work/out"
+fi
+grep -q "^VRC_REMOTE_TEST_TOKEN=test-token" "$work/unity-env.log" && ! grep -q "^VRCRT_TOKEN=" "$work/unity-env.log" \
+    && pass "headless Unity gets its token and no other" || fail "headless Unity gets its token and no other"
+rm -f "$root"/locks/*.json
+
+prepare_run; ready_clients "$tag"; deploy_result "$run" PASS PASS null null
+touch "$run/cancel.request"; : > "$fake/calls.log"
+check "a cancel before continue starts no child" 4 result CANCELED
+[ -s "$fake/calls.log" ] && fail "nothing was asked of the Bridge" || pass "nothing was asked of the Bridge"
+
+prepare_run; ready_clients "$tag"; deploy_result "$run" PASS PASS null "\"$tag\""
+detached="$(python3 -I "$runner" continue --run "$run" --claim-token "$token" --detach 2>"$work/err")"
+code=$?
+for _ in $(seq 100); do [ "$(field "$run/run.json" state)" = finished ] && break; sleep 0.1; done
+if [ "$code" -eq 0 ] && printf '%s' "$detached" | grep -q '"pid"' && [ "$(field "$run/run.json" result)" = PASS ]; then
+    pass "continue --detach returns at once and the run finishes on its own"
+else
+    fail "continue --detach returns at once and the run finishes on its own (exit $code)"; cat "$work/err"
+fi
+python3 -I "$runner" continue --run "$run" --claim-token "$token" --detach > /dev/null 2>&1
+[ $? -eq 3 ] && pass "continue --detach refuses a run that is not prepared" || fail "continue --detach refuses a run that is not prepared"
+
+# --- arguments and places
+python3 -I "$runner" prepare --slots 0,0 --run-root "$root" > /dev/null 2>&1
+[ $? -eq 2 ] && pass "slots must be different" || fail "slots must be different"
+mkdir -p "$work/repo/.git"
+python3 -I "$runner" prepare --slots 0 --run-root "$work/repo/root" > "$work/out" 2>&1
+[ $? -eq 2 ] && grep -q "Git work tree" "$work/out" && pass "a run root inside Git is refused" || fail "a run root inside Git is refused"
+bridge; before_clients; cursor
+python3 -I "$runner" prepare --slots 0,1 --owner-pid $$ --run-root "$root" --expect-clients mode=Reload > "$work/out" 2>&1
+[ $? -eq 3 ] && grep -q declarationMismatch "$work/out" && pass "a declaration that differs from the Bridge stops UNKNOWN" \
+    || fail "a declaration that differs from the Bridge stops UNKNOWN"
+python3 -I "$runner" continue --run "$work" --claim-token "$token" > /dev/null 2>&1
+[ $? -eq 2 ] && pass "continue refuses a folder that is not a run" || fail "continue refuses a folder that is not a run"
+
+# --- secrets: what children see
+rm -f "$fake/env.log"
+prepare_run
+VRC_REMOTE_TEST_TOKEN=sentinel-secret-value python3 -I "$runner" prepare --slots 0,1 --owner-pid $$ --run-root "$root" > /dev/null 2>&1
+if grep -q sentinel-secret-value "$fake/env.log" "$root"/runs/*/run.json 2>/dev/null; then
+    fail "the Unity token variable reaches no child and no record"
+else
+    pass "the Unity token variable reaches no child and no record"
+fi
+rm -f "$root"/locks/*.json
+
+# --- prune
+old="$root/runs/20200101T000000Z-00000000"
+mkdir -p "$old" && printf '{"schema":"vrcrt.run","schemaVersion":1,"state":"finished","createdAtUtc":"2020-01-01T00:00:00+00:00"}' > "$old/run.json"
+ln -s "$work" "$root/runs/20200101T000000Z-11111111"
+kept="$root/runs/20200101T000000Z-22222222"
+mkdir -p "$kept" && printf '{"schema":"vrcrt.run","schemaVersion":1,"state":"finished","createdAtUtc":"2020-01-01T00:00:00+00:00","children":[{"pid":1,"start":"x","pgid":1}]}' > "$kept/run.json"
+python3 -I "$runner" prune --older-than-days 30 --run-root "$root" > /dev/null 2>&1
+[ ! -e "$old" ] && [ -L "$root/runs/20200101T000000Z-11111111" ] && [ -d "$run" ] \
+    && pass "prune removes old finished runs only, never through a link" || fail "prune removes old finished runs only, never through a link"
+[ -d "$kept" ] && pass "prune keeps a run that records a child never confirmed stopped" \
+    || fail "prune keeps a run that records a child never confirmed stopped"
+python3 -I - "$run/run.json" <<'PY'
+import json, sys
+p = sys.argv[1]; r = json.load(open(p)); r.pop("claimKey", None); r["state"] = "prepared"; json.dump(r, open(p, "w"))
+PY
+python3 -I "$runner" continue --run "$run" --claim-token 0123456789abcdef0123456789abcdef > "$work/out" 2>&1
+[ $? -eq 2 ] && grep -q "no claim key" "$work/out" && pass "continue refuses a run without its claim key" \
+    || { fail "continue refuses a run without its claim key"; cat "$work/out"; }
+
+if [ "$failures" -eq 0 ]; then
+    echo "all checks passed"
+else
+    echo "$failures check(s) failed"
+    exit 1
+fi

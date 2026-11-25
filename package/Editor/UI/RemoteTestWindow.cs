@@ -85,7 +85,6 @@ namespace VRCRemoteTest
         private VrchatClients _bridgeClients;
         private double _lastBridgeSectionRead = double.NegativeInfinity;
         [NonSerialized] private double _lastBridgeRepaintTime = double.NegativeInfinity;
-        private static string _packageVersion;
 
         // Longer than ClientLogView.StaleAfter: the Slot rows come and go with the list, and
         // every change moves the controls below them, so a list a few reads late still shows.
@@ -153,6 +152,27 @@ namespace VRCRemoteTest
             window.Show();
         }
 
+        // One run at a time for the whole Editor session; a domain reload rebuilds it from SessionState.
+        private static RemoteRunController _runController;
+        [NonSerialized] private double _lastRunRefresh = double.NegativeInfinity;
+        [SerializeField] private string _runSlots;
+        [SerializeField] private bool _runSlotsEdited;
+        [SerializeField] private bool _runUseLastBuild;
+
+        private static RemoteRunController RunController
+        {
+            get
+            {
+                if (_runController == null)
+                {
+                    _runController = new RemoteRunController();
+                    _runController.Restore();
+                }
+
+                return _runController;
+            }
+        }
+
         private void OnEnable()
         {
             titleContent = new GUIContent("VRC Remote Test");
@@ -188,6 +208,13 @@ namespace VRCRemoteTest
         private void OnEditorUpdate()
         {
             var now = EditorApplication.timeSinceStartup;
+            if (RunController.Active && now - _lastRunRefresh >= 1.0)
+            {
+                _lastRunRefresh = now;
+                RunController.Refresh();
+                Repaint();
+            }
+
             if (_showBridgeSection && now - _lastBridgeRepaintTime >= PreflightCheckIntervalSeconds)
             {
                 _lastBridgeRepaintTime = now;
@@ -229,6 +256,8 @@ namespace VRCRemoteTest
             DrawBuildTargetSection();
             EditorGUILayout.Space();
             DrawActionButtons();
+            EditorGUILayout.Space();
+            DrawRunSection();
             EditorGUILayout.Space();
             DrawProgressSection();
             EditorGUILayout.Space();
@@ -348,7 +377,7 @@ namespace VRCRemoteTest
             EditorGUILayout.LabelField("VRChat Clients", EditorStyles.boldLabel);
             EditorGUILayout.LabelField("Current", _activeClientSettings.Describe());
 
-            var busy = _clientOperationRunning || RemoteBuildCommand.GetCoordinator().IsRunning;
+            var busy = _clientOperationRunning || RunController.Active || RemoteBuildCommand.GetCoordinator().IsRunning;
             using (new EditorGUI.DisabledScope(busy))
             {
                 // A toolbar, not a popup: on the Mac a popup opens a native menu, and the editor
@@ -453,6 +482,8 @@ namespace VRCRemoteTest
                 }
             }
 
+            DrawSlotRows(busy);
+
             if (_shownClientOperationRunning)
             {
                 EditorGUILayout.HelpBox(_shownClientStatus ?? "Working...", MessageType.Info);
@@ -473,6 +504,93 @@ namespace VRCRemoteTest
                 {
                     EditorGUILayout.HelpBox(detail, _shownClientOutcome.Applied ? MessageType.None : MessageType.Warning);
                 }
+            }
+        }
+
+        /// <summary>
+        /// One row per slot the Bridge observes, with Close and Launch for Relaunch. These call the
+        /// Bridge's existing single-client routes: nothing ties the request to the client shown
+        /// here, so the confirmation says so. The list is the one read at the last Layout.
+        /// </summary>
+        private void DrawSlotRows(bool busy)
+        {
+            var clients = _bridgeClients?.Clients;
+            if (clients == null || clients.Count == 0)
+            {
+                return;
+            }
+
+            EditorGUILayout.LabelField("Clients", EditorStyles.miniBoldLabel);
+            var now = DateTimeOffset.UtcNow;
+            string blocked = null;
+            foreach (var entry in clients.Where(c => c != null).OrderBy(c => c.Slot).Take(VrchatClientSettings.MaxClients))
+            {
+                var actions = VrchatClientsView.ActionsFor(entry, _activeClientSettings, _bridgeInfo?.Version,
+                    _bridgeClients.UpdatedAtUtc, now, busy);
+                blocked = blocked ?? actions.Blocked;
+                using (new EditorGUILayout.HorizontalScope())
+                {
+                    EditorGUILayout.LabelField("Slot " + entry.Slot, VrchatClientsView.DescribeSlot(entry));
+                    using (new EditorGUI.DisabledScope(!actions.CanClose))
+                    {
+                        if (GUILayout.Button(new GUIContent("Close", "Close this client only; the others keep running."),
+                                GUILayout.Width(60))
+                            && EditorUtility.DisplayDialog("Close one VRChat client", VrchatClientsView.ConfirmClose(entry),
+                                "Close", "Cancel"))
+                        {
+                            StartSlotOperation(entry.Slot, close: true);
+                        }
+                    }
+
+                    using (new EditorGUI.DisabledScope(!actions.CanLaunch))
+                    {
+                        if (GUILayout.Button(new GUIContent("Launch", "Start this slot again as in the last deploy."),
+                                GUILayout.Width(60))
+                            && EditorUtility.DisplayDialog("Start one VRChat client again", VrchatClientsView.ConfirmLaunch(entry),
+                                "Launch", "Cancel"))
+                        {
+                            StartSlotOperation(entry.Slot, close: false);
+                        }
+                    }
+                }
+            }
+
+            // Always one line, so Layout and Repaint lay out the same controls even when the list
+            // turns stale or an operation ends between the two events.
+            EditorGUILayout.LabelField(blocked != null && !busy ? "Close and Launch are off: " + blocked + "." : " ",
+                EditorStyles.miniLabel);
+        }
+
+        private async void StartSlotOperation(int slot, bool close)
+        {
+            _clientOperationRunning = true;
+            _clientOperationStatus = (close ? "Closing" : "Starting") + " the VRChat client in slot " + slot + "...";
+            _clientOutcome = null;
+            _clientOperationCts = new CancellationTokenSource();
+            var token = _clientOperationCts.Token;
+
+            VrchatClientSettingsOutcome outcome;
+            try
+            {
+                var coordinator = RemoteBuildCommand.GetCoordinator();
+                outcome = close
+                    ? await coordinator.CloseVrchatClientAsync(slot, token)
+                    : await coordinator.LaunchVrchatClientAsync(slot, token);
+            }
+            catch (Exception ex)
+            {
+                outcome = VrchatClientSettingsOutcome.Failure(
+                    "Could not " + (close ? "close" : "launch") + " slot " + slot + ": " + ex.Message);
+            }
+
+            FinishClientOperation(outcome);
+            if (outcome.Applied)
+            {
+                Debug.Log("[VRC Remote Test] " + outcome.Message);
+            }
+            else
+            {
+                Debug.LogWarning("[VRC Remote Test] " + outcome.Message);
             }
         }
 
@@ -703,19 +821,7 @@ namespace VRCRemoteTest
             }
         }
 
-        private static string PackageVersion
-        {
-            get
-            {
-                if (_packageVersion == null)
-                {
-                    var info = UnityEditor.PackageManager.PackageInfo.FindForAssembly(typeof(RemoteTestWindow).Assembly);
-                    _packageVersion = info?.version ?? string.Empty;
-                }
-
-                return _packageVersion;
-            }
-        }
+        private static string PackageVersion => PackageVersionInfo.Current;
 
         /// <summary>"0.8.0+abc123" and "v0.8.0" are both "0.8.0"; null for no version.</summary>
         internal static string CoreVersion(string version)
@@ -1055,7 +1161,7 @@ namespace VRCRemoteTest
 
         private void DrawActionButtons()
         {
-            var running = _bridgeConfigured && RemoteBuildCommand.GetCoordinator().IsRunning;
+            var running = RunController.Active || (_bridgeConfigured && RemoteBuildCommand.GetCoordinator().IsRunning);
 
             using (new EditorGUI.DisabledScope(running || !_bridgeConfigured))
             {
@@ -1087,6 +1193,86 @@ namespace VRCRemoteTest
             }
         }
 
+        /// <summary>
+        /// "Deploy and collect": the packaged runner prepares, this Editor builds and deploys, and
+        /// the runner waits for every listed slot, checks the build tag and collects evidence in
+        /// run.json. Every control is drawn on every event (only enabled or disabled), so the run
+        /// finishing between Layout and Repaint does not change the layout.
+        /// </summary>
+        private void DrawRunSection()
+        {
+            var run = RunController;
+            EditorGUILayout.LabelField("Deploy and Collect", EditorStyles.boldLabel);
+            // Until edited, the slots follow the Bridge's client count, once it is known.
+            if (!_runSlotsEdited && _activeClientSettings != null)
+            {
+                _runSlots = string.Join(",", Enumerable.Range(0, Math.Max(1, Math.Min(_activeClientSettings.Count, VrchatClientSettings.MaxClients))));
+            }
+
+            using (new EditorGUI.DisabledScope(run.Active))
+            {
+                var slots = EditorGUILayout.TextField(new GUIContent("Slots",
+                    "Every slot that must be ready, e.g. 0,1. Not narrowed to the clients that happen to run."), _runSlots ?? string.Empty);
+                if (slots != (_runSlots ?? string.Empty))
+                {
+                    _runSlots = slots;
+                    _runSlotsEdited = true;
+                }
+                using (new EditorGUI.DisabledScope(!_hasLastArtifact))
+                {
+                    _runUseLastBuild = EditorGUILayout.Toggle(new GUIContent("Use the last build",
+                        "Deploy the last artifact again instead of building (its tag is kept only while its bytes are unchanged)."),
+                        _runUseLastBuild && _hasLastArtifact);
+                }
+            }
+
+            var coordinatorBusy = _bridgeConfigured && RemoteBuildCommand.GetCoordinator().IsRunning;
+            using (new EditorGUILayout.HorizontalScope())
+            {
+                using (new EditorGUI.DisabledScope(run.Active || coordinatorBusy || !_bridgeConfigured || _clientOperationRunning
+                                                   || string.IsNullOrWhiteSpace(_runSlots)))
+                {
+                    if (GUILayout.Button(new GUIContent("Run",
+                            "Build (or redeploy), wait until every slot is ready, and collect evidence into a run folder.")))
+                    {
+                        run.Start(_runSlots.Replace(" ", string.Empty), _runUseLastBuild, RemoteTestSettings.BridgeUrl,
+                            RemoteTestSettings.BridgeFingerprint);
+                    }
+                }
+
+                using (new EditorGUI.DisabledScope(!run.Active))
+                {
+                    if (GUILayout.Button(new GUIContent("Cancel", "Stops the build if it is still running and asks the runner to stop.")))
+                    {
+                        run.Cancel();
+                    }
+                }
+
+                using (new EditorGUI.DisabledScope(string.IsNullOrEmpty(run.RunDirectory) || !System.IO.Directory.Exists(run.RunDirectory)))
+                {
+                    if (GUILayout.Button("Open Run Folder"))
+                    {
+                        EditorUtility.RevealInFinder(System.IO.Path.Combine(run.RunDirectory, "run.json"));
+                    }
+                }
+            }
+
+            EditorGUILayout.HelpBox(run.Status ?? "Not run in this Editor session.",
+                run.Summary != null && run.Summary.Finished && run.Summary.Result != "PASS" ? MessageType.Warning : MessageType.None);
+            EditorGUILayout.LabelField(run.Summary == null || run.Summary.Results.Count == 0
+                ? " "
+                : string.Join("   ", run.Summary.Results.Select(p => p.Key + ": " + p.Value)), EditorStyles.miniLabel);
+        }
+
+        /// <summary>A button that cannot be pressed while a Deploy and Collect run holds the pairing it was prepared for.</summary>
+        private static bool GUILayoutButtonUnlessRunning(string label)
+        {
+            using (new EditorGUI.DisabledScope(RunController.Active))
+            {
+                return GUILayout.Button(new GUIContent(label, RunController.Active ? "Not while a Deploy and Collect run is going on." : null));
+            }
+        }
+
         private void DrawSettingsFoldout()
         {
             _settingsFoldout = EditorGUILayout.Foldout(_settingsFoldout, "Settings");
@@ -1103,7 +1289,7 @@ namespace VRCRemoteTest
                 _bridgeUrlInput = EditorGUILayout.DelayedTextField("Bridge URL", _bridgeUrlInput);
                 _fingerprintInput = EditorGUILayout.DelayedTextField("Certificate SHA-256", _fingerprintInput);
                 _tokenInput = EditorGUILayout.PasswordField("Pairing Token", _tokenInput);
-                if (GUILayout.Button("Save Pairing"))
+                if (GUILayoutButtonUnlessRunning("Save Pairing"))
                 {
                     VerifyAndSavePairing(_bridgeUrlInput.Trim(), _fingerprintInput.Trim(), _tokenInput.Trim());
                 }

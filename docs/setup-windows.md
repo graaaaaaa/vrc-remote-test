@@ -90,6 +90,7 @@ Unity の Preflight が `Windows Bridge: Connected` になり、`Remote Build & 
 | `vrcrt.sh close-client <slot>` | Bridge 0.10.0 以降、Relaunch: その slot の台だけを閉じる |
 | `vrcrt.sh launch-client <slot>` | Bridge 0.10.0 以降、Relaunch: その slot の台を、最後の配置と同じ起動の仕方で起動し直す |
 | `vrcrt.sh profiles` | profile ごとに、最後にログインしたアカウント |
+| `vrcrt.sh bridge --json` | 0.11.0 以降: `GET /api/v1/bridge` を JSON で（runner が Bridge の識別と空き容量を見るのに使う） |
 
 台数とアカウント（`VrchatClientMode`、`VrchatClientCount`、`VrchatProfiles`）は、Unity の VRC Remote Test ウィンドウの「VRChat Clients」でも変えられます（パッケージ 0.9.0 以降。Bridge 0.8.0 以降で動くが、版が違うとウィンドウが警告するので、両方を同じ版にそろえる。0.10.0 は Bridge だけの変更だが、版はそろえる）。中で呼んでいるのは同じ `PUT /api/v1/config` です。
 
@@ -104,4 +105,9 @@ Unity の Preflight が `Windows Bridge: Connected` になり、`Remote Build & 
 - `config.json` を書き直すとき、コメントは消えます。元の内容はバックアップに残ります。
 - `VrchatClientMode` を変えるときは、Bridge が起動した VRChat を先に閉じます。Bridge が起動していない VRChat が動いていれば、何も閉じず、設定も変えません。v0.7.1 までに Reload で起動した VRChat には記録が無いので、Windows で閉じてください。
 - 配備や別の操作の最中は、409 busy で断ります。少し待ってからやり直してください。
+- 全文ログの書き出し（`export-log`、Unity の Save Full Log、runner の証拠の回収）は、Windows の `%LOCALAPPDATA%\VRCRemoteTest\state\exports` に1件ずつ残り、Bridge は今は消しません（R1b で自分で消すようにする予定）。runner は Bridge の空きが 5 GiB 未満か、書き出しの合計が 2 GiB を越えると、書き出さずに UNKNOWN で止まり、ここの片付けを案内します。Windows では次で、1日より古い書き出しを消せます（Mac に取り出したあとのもの）。
+
+```powershell
+Get-ChildItem (Join-Path $env:LOCALAPPDATA 'VRCRemoteTest\state\exports') -Filter *.log | Where-Object LastWriteTime -lt (Get-Date).AddDays(-1) | Remove-Item
+```
 - `AutoLaunchVrchat` を直したあとに VRChat を起動するには、Unity の Redeploy で前のワールドを配り直します。

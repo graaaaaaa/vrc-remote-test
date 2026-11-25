@@ -73,6 +73,131 @@ namespace VRCRemoteTest
         internal static bool NeedsLongerTimeout(VrchatClientSettings desired, int resultTimeoutSeconds) =>
             desired != null && desired.Count >= 3 && resultTimeoutSeconds < RecommendedTimeoutSeconds;
 
+        /// <summary>Like scripts/vrcrt.sh: a client list older than this is not acted on.</summary>
+        internal static readonly TimeSpan SlotListFreshFor = TimeSpan.FromSeconds(15);
+
+        private static readonly Version SlotControlVersion = new Version(0, 10, 0);
+
+        /// <summary>Whether a slot's Close and Launch buttons may be pressed, and why not.</summary>
+        internal readonly struct SlotActions
+        {
+            internal SlotActions(bool canClose, bool canLaunch, string blocked)
+            {
+                CanClose = canClose;
+                CanLaunch = canLaunch;
+                Blocked = blocked;
+            }
+
+            internal bool CanClose { get; }
+            internal bool CanLaunch { get; }
+
+            /// <summary>Why neither can be pressed now; null when one can.</summary>
+            internal string Blocked { get; }
+        }
+
+        /// <summary>
+        /// Close needs a running client, Launch one that has exited; both need Relaunch, a Bridge
+        /// from v0.10.0 (an unknown version is allowed: an older one answers 404), a client list
+        /// read in the last 15 s, and no other build or Bridge change.
+        /// </summary>
+        internal static SlotActions ActionsFor(VrchatClientEntry entry, VrchatClientSettings active, string bridgeVersion,
+            DateTimeOffset listUpdatedAtUtc, DateTimeOffset nowUtc, bool busy)
+        {
+            string blocked = null;
+            if (busy)
+            {
+                blocked = "another build or Bridge change is running";
+            }
+            else if (active == null || !active.IsRelaunch)
+            {
+                blocked = "one client at a time needs VrchatClientMode Relaunch";
+            }
+            else if (Version.TryParse(RemoteTestWindow.CoreVersion(bridgeVersion) ?? string.Empty, out var version)
+                     && version < SlotControlVersion)
+            {
+                blocked = "the Bridge is older than v0.10.0";
+            }
+            else if (entry == null || nowUtc - listUpdatedAtUtc > SlotListFreshFor || nowUtc < listUpdatedAtUtc - SlotListFreshFor)
+            {
+                blocked = "the client list is not current";
+            }
+            else if (entry.Running == null)
+            {
+                blocked = "the Bridge cannot tell now whether it runs";
+            }
+
+            return blocked != null
+                ? new SlotActions(false, false, blocked)
+                : new SlotActions(entry.Running == true, entry.Running == false, null);
+        }
+
+        /// <summary>"PID 1234 · profile 0 · joined · local:wrld_… · logged in · gen 1234 · epoch 5", sanitized.</summary>
+        internal static string DescribeSlot(VrchatClientEntry entry)
+        {
+            if (entry == null)
+            {
+                return "no client";
+            }
+
+            var parts = new System.Collections.Generic.List<string>
+            {
+                "PID " + entry.ProcessId.ToString(CultureInfo.InvariantCulture),
+                entry.Profile is int profile ? "profile " + profile.ToString(CultureInfo.InvariantCulture) : "profile ?",
+                entry.Running == true ? Short(entry.State, 16) ?? "running" : entry.Running == false ? "exited" : "unknown",
+            };
+            if (entry.Running == true && !string.IsNullOrEmpty(entry.Instance))
+            {
+                parts.Add(Short(entry.Instance, 28));
+            }
+
+            if (entry.InErrorWorld == true)
+            {
+                parts.Add("ERROR WORLD");
+            }
+
+            if (entry.Running == true)
+            {
+                parts.Add(entry.LoginState == "authenticated" ? "logged in"
+                    : entry.LoginState == "likelyLoggedOut" ? "LIKELY LOGGED OUT"
+                    : Short(entry.LoginState, 16) ?? "login unknown");
+            }
+
+            if (entry.CatchingUp)
+            {
+                parts.Add("catching up");
+            }
+
+            parts.Add("gen " + entry.ClientGeneration.ToString(CultureInfo.InvariantCulture));
+            if (entry.ObservationEpoch is long epoch)
+            {
+                parts.Add("epoch " + epoch.ToString(CultureInfo.InvariantCulture));
+            }
+
+            return string.Join(" · ", parts);
+        }
+
+        internal static string ConfirmClose(VrchatClientEntry entry) =>
+            $"Close slot {entry.Slot} ({DescribeSlot(entry)})?\n\n"
+            + "The Bridge closes the client it has recorded in this slot when the request arrives. If that client "
+            + "changed after this list was read, the request is not stopped: this Bridge has no check for it. "
+            + "The other clients keep running.";
+
+        internal static string ConfirmLaunch(VrchatClientEntry entry) =>
+            $"Start slot {entry.Slot} again ({DescribeSlot(entry)})?\n\n"
+            + "The Bridge starts it with the world, instance, profile and VR setting it used for this slot in the "
+            + "last deploy. If the answer is lost, whether it started is unknown: check the list before trying again.";
+
+        private static string Short(string text, int max)
+        {
+            if (string.IsNullOrEmpty(text))
+            {
+                return null;
+            }
+
+            var clean = BridgeMessages.Sanitize(text, 200);
+            return clean.Length <= max ? clean : clean.Substring(0, max - 1) + "…";
+        }
+
         /// <summary>
         /// A Reload Bridge does not add or remove clients while some run; null when that does
         /// not matter for this change.

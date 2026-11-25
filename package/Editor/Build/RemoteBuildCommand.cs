@@ -36,11 +36,21 @@ namespace VRCRemoteTest
                     RemoteTestSettings.BridgeUrl,
                     RemoteTestSettings.BridgeFingerprint,
                     RemoteTestSettings.BridgeToken);
-                _coordinator = new RemoteBuildCoordinator(sdkAdapter, transport);
+                _coordinator = new RemoteBuildCoordinator(sdkAdapter, transport)
+                {
+                    ResultWriter = DeployResultWriter.CreateDefault(),
+                    PackageVersion = PackageVersionInfo.Current,
+                };
             }
 
             return _coordinator;
         }
+
+        /// <summary>
+        /// The shared coordinator if one exists, without creating it (creating one reads the
+        /// pairing, which throws when the Bridge is not set up).
+        /// </summary>
+        internal static RemoteBuildCoordinator PeekCoordinator() => _coordinator;
 
         /// <summary>
         /// Call after pairing changes so the next build picks up the new
@@ -69,6 +79,10 @@ namespace VRCRemoteTest
         /// Do not pass -quit: the SDK awaits on Unity's synchronization context
         /// while exporting a scene, so blocking this thread deadlocks the build.
         /// RunHeadlessAsync calls EditorApplication.Exit when it has a result.
+        ///
+        /// Optional, from the packaged runner: VRC_REMOTE_TEST_RUN_DIR (the run folder that gets a
+        /// copy of the deploy result) and VRC_REMOTE_TEST_WORLD_BUILD_TAG (see
+        /// RemoteBuildApi.ActiveWorldBuildTag).
         /// </summary>
         public static void ExecuteRemoteBuildHeadless()
         {
@@ -98,7 +112,12 @@ namespace VRCRemoteTest
                 var coordinator = GetCoordinator();
                 if (Application.isBatchMode && coordinator.IsBridgeReachable == false)
                     coordinator.ProbeBridgeForHeadless();
-                var outcome = await coordinator.ExecuteRemoteBuildAsync(progress);
+                var request = new RemoteBuildRequest
+                {
+                    RunDirectory = EnvironmentOrNull("VRC_REMOTE_TEST_RUN_DIR"),
+                    WorldBuildTag = EnvironmentOrNull("VRC_REMOTE_TEST_WORLD_BUILD_TAG"),
+                };
+                var outcome = await coordinator.ExecuteRemoteBuildCoreAsync(request, progress, default);
                 exitCode = outcome.Succeeded ? 0 : 1;
             }
             catch (Exception ex)
@@ -109,6 +128,12 @@ namespace VRCRemoteTest
             {
                 EditorApplication.Exit(exitCode);
             }
+        }
+
+        private static string EnvironmentOrNull(string name)
+        {
+            var value = Environment.GetEnvironmentVariable(name);
+            return string.IsNullOrWhiteSpace(value) ? null : value;
         }
 
         [MenuItem("VRChat SDK/Remote Build")]

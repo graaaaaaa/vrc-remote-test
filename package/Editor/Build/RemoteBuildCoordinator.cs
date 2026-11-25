@@ -326,6 +326,62 @@ namespace VRCRemoteTest
             }
         }
 
+        /// <summary>Close one client: the Bridge confirms the exit within 20 s; same deadline as scripts/vrcrt.sh close-client.</summary>
+        internal TimeSpan SlotCloseTimeout { get; set; } = TimeSpan.FromSeconds(45);
+
+        /// <summary>Launch one client: spacing and the previous client's log can take a minute; as vrcrt.sh launch-client.</summary>
+        internal TimeSpan SlotLaunchTimeout { get; set; } = TimeSpan.FromSeconds(90);
+
+        /// <summary>
+        /// POST /clients/{slot}/close (Bridge v0.10.0 and later, Relaunch). The Bridge closes the
+        /// client it has recorded in that slot when the request arrives: nothing ties the request
+        /// to the client the caller last saw, so a change in between is not caught (no guard
+        /// before Bridge v0.12.0). Holds the build lock; never retried.
+        /// </summary>
+        public Task<VrchatClientSettingsOutcome> CloseVrchatClientAsync(int slot, CancellationToken cancellationToken = default) =>
+            SlotOperationAsync(slot, "close", token => _transport.CloseClientAsync(slot, token), SlotCloseTimeout,
+                SlotOperationReport.ReadClose, cancellationToken);
+
+        /// <summary>
+        /// POST /clients/{slot}/launch (Bridge v0.10.0 and later, Relaunch): starts that slot again
+        /// with the arguments of the last deploy. Never retried: an answer that is lost leaves
+        /// unknown whether it started.
+        /// </summary>
+        public Task<VrchatClientSettingsOutcome> LaunchVrchatClientAsync(int slot, CancellationToken cancellationToken = default) =>
+            SlotOperationAsync(slot, "launch", token => _transport.LaunchClientAsync(slot, token), SlotLaunchTimeout,
+                SlotOperationReport.ReadLaunch, cancellationToken);
+
+        private async Task<VrchatClientSettingsOutcome> SlotOperationAsync(
+            int slot, string what, Func<CancellationToken, Task<BridgeAdminResponse>> call, TimeSpan timeout,
+            Func<int, BridgeAdminResponse, VrchatClientSettingsOutcome> read, CancellationToken cancellationToken)
+        {
+            if (slot < 0 || slot >= VrchatClientSettings.MaxClients)
+            {
+                return VrchatClientSettingsOutcome.Failure($"A client slot is 0 to {VrchatClientSettings.MaxClients - 1}.");
+            }
+
+            if (!_executionLock.Wait(0))
+            {
+                return VrchatClientSettingsOutcome.Failure("A remote build or another Bridge change is in progress.");
+            }
+
+            try
+            {
+                var response = await CallWithin(call, timeout, cancellationToken).ConfigureAwait(false);
+                return read(slot, response);
+            }
+            catch (OperationCanceledException)
+            {
+                return VrchatClientSettingsOutcome.Failure(
+                    $"Stopped waiting: whether slot {slot} was {(what == "close" ? "closed" : "started")} is unknown. "
+                    + "Check the client list before trying again.");
+            }
+            finally
+            {
+                _executionLock.Release();
+            }
+        }
+
         /// <summary>Why a management call gave no usable answer, in one line.</summary>
         internal static string AdminFailure(string what, BridgeAdminResponse response)
         {
@@ -419,29 +475,116 @@ namespace VRCRemoteTest
         /// </summary>
         public BuildArtifact LastArtifact { get; private set; }
 
-        public async Task<RemoteBuildOutcome> ExecuteRemoteBuildAsync(
+        /// <summary>
+        /// Writes each attempt's structured deploy result; null writes nothing (the tests). The
+        /// shared coordinator from RemoteBuildCommand.GetCoordinator sets it, so the menu, the
+        /// window, headless runs and any caller of the public methods all leave a result.
+        /// </summary>
+        internal DeployResultWriter ResultWriter { get; set; }
+
+        /// <summary>Recorded in each deploy result; read on the main thread by GetCoordinator.</summary>
+        internal string PackageVersion { get; set; }
+
+        /// <summary>
+        /// The tag of the build the SDK is running now, for the user's build preprocessing to embed
+        /// (RemoteBuildApi.ActiveWorldBuildTag); null outside an SDK build.
+        /// </summary>
+        internal string ActiveWorldBuildTag => Volatile.Read(ref _activeWorldBuildTag);
+
+        private string _activeWorldBuildTag;
+
+        /// <summary>
+        /// The tag embedded in the last fresh build, with the hash and size of those bytes. In
+        /// memory only, like LastArtifact: a redeploy reuses the tag only while the bytes are the same.
+        /// </summary>
+        private (string Tag, string Sha256, long Size)? _lastBuildTag;
+
+        public Task<RemoteBuildOutcome> ExecuteRemoteBuildAsync(
             IProgress<RemoteBuildProgress> progress = null,
-            CancellationToken cancellationToken = default)
+            CancellationToken cancellationToken = default) =>
+            ExecuteRemoteBuildCoreAsync(null, progress, cancellationToken);
+
+        /// <summary>
+        /// The build behind ExecuteRemoteBuildAsync and RemoteBuildApi.BuildAndDeployAsync. Its own
+        /// name, not an overload: callers find the public methods by name with reflection.
+        /// </summary>
+        internal async Task<RemoteBuildOutcome> ExecuteRemoteBuildCoreAsync(
+            RemoteBuildRequest request,
+            IProgress<RemoteBuildProgress> progress,
+            CancellationToken cancellationToken)
         {
+            var attempt = Attempt.Begin("build");
+            RemoteBuildOutcome outcome;
             if (!_executionLock.Wait(0))
             {
                 var busyMessage = "A remote build is already in progress.";
                 progress?.Report(new RemoteBuildProgress(RemoteBuildStatus.Failed, busyMessage));
-                return RemoteBuildOutcome.Failure(null, ErrorCode.BuildAlreadyRunning, busyMessage);
+                outcome = RemoteBuildOutcome.Failure(null, ErrorCode.BuildAlreadyRunning, busyMessage);
+                return Finish(outcome, attempt, request);
             }
 
             try
             {
-                return await ExecuteInternalAsync(progress, cancellationToken).ConfigureAwait(false);
+                outcome = await ExecuteInternalAsync(request, attempt, progress, cancellationToken).ConfigureAwait(false);
             }
             finally
             {
                 _executionLock.Release();
             }
+
+            return Finish(outcome, attempt, request);
+        }
+
+        /// <summary>What one attempt got to, for its deploy result.</summary>
+        private sealed class Attempt
+        {
+            internal string Id;
+            internal string Kind;
+            internal DateTimeOffset StartedAtUtc;
+            internal string Stage = "preflight";
+            internal string Sha256;
+            internal long? Size;
+            internal string Tag;
+
+            internal static Attempt Begin(string kind) =>
+                new Attempt { Id = BuildIdGenerator.Generate(), Kind = kind, StartedAtUtc = DateTimeOffset.UtcNow };
+        }
+
+        /// <summary>Stamps the attempt's facts on the outcome and saves its deploy result.</summary>
+        private RemoteBuildOutcome Finish(RemoteBuildOutcome outcome, Attempt attempt, RemoteBuildRequest request)
+        {
+            outcome.AttemptId = attempt.Id;
+            outcome.Kind = attempt.Kind;
+            outcome.Stage = attempt.Stage;
+            outcome.ArtifactSha256 = attempt.Sha256;
+            outcome.ArtifactSize = attempt.Size;
+            outcome.WorldBuildTag = attempt.Tag;
+            outcome.StartedAtUtc = attempt.StartedAtUtc;
+            outcome.FinishedAtUtc = DateTimeOffset.UtcNow;
+            var writer = ResultWriter;
+            if (writer != null)
+            {
+                try
+                {
+                    outcome.DeployResultPath = writer.TryWrite(DeployResultWriter.Build(outcome, PackageVersion), request?.RunDirectory);
+                }
+                catch (Exception ex)
+                {
+                    Debug.LogError($"[VRC Remote Test] Could not save the deploy result: {ex.Message}");
+                }
+
+                if (outcome.DeployResultPath != null)
+                {
+                    Debug.Log($"[VRC Remote Test] Deploy result: {outcome.DeployResultPath}");
+                }
+            }
+
+            return outcome;
         }
 
         private async Task<RemoteBuildOutcome> ExecuteInternalAsync(
-            IProgress<RemoteBuildProgress> progress, CancellationToken cancellationToken)
+            RemoteBuildRequest request, Attempt attempt, IProgress<RemoteBuildProgress> progress,
+            CancellationToken cancellationToken)
         {
             string buildId = null;
 
@@ -462,7 +605,19 @@ namespace VRCRemoteTest
 
                 Report(progress, RemoteBuildStatus.Running, "Building Windows world...");
                 cancellationToken.ThrowIfCancellationRequested();
-                var sdkPath = await _sdkAdapter.BuildWindowsWorldAsync();
+                attempt.Stage = "sdkBuild";
+                var tag = RemoteBuildRequest.IsValidTag(request?.WorldBuildTag) ? request.WorldBuildTag : attempt.Id;
+                string sdkPath;
+                Volatile.Write(ref _activeWorldBuildTag, tag);
+                try
+                {
+                    sdkPath = await _sdkAdapter.BuildWindowsWorldAsync();
+                }
+                finally
+                {
+                    Volatile.Write(ref _activeWorldBuildTag, null);
+                }
+
                 cancellationToken.ThrowIfCancellationRequested();
 
                 Report(progress, RemoteBuildStatus.Running, "Resolving build artifact...");
@@ -473,22 +628,31 @@ namespace VRCRemoteTest
                 artifact.Sha256 = Sha256Calculator.ComputeHash(artifact.FullPath);
                 Debug.Log($"[VRC Remote Test] SHA-256: {artifact.Sha256}");
                 LastArtifact = artifact;
+                _lastBuildTag = (tag, artifact.Sha256, artifact.Size);
+                attempt.Sha256 = artifact.Sha256;
+                attempt.Size = artifact.Size;
+                attempt.Tag = tag;
 
-                return await DeployArtifactAsync(artifact, resultTimeout, pollInterval, progress, cancellationToken)
+                return await DeployArtifactAsync(artifact, attempt, resultTimeout, pollInterval, progress, cancellationToken)
                     .ConfigureAwait(false);
             }
             catch (RemoteBuildException ex)
             {
                 Report(progress, RemoteBuildStatus.Failed, ex.Message);
                 Debug.LogError($"[VRC Remote Test] {ex.ErrorCodeValue}: {ex.Message}");
-                return RemoteBuildOutcome.Failure(buildId, ex.ErrorCodeValue, ex.Message);
+                // The transport turns an aborted upload into UploadFailed: still the user's cancellation.
+                var failure = RemoteBuildOutcome.Failure(buildId, ex.ErrorCodeValue, ex.Message);
+                failure.Canceled = cancellationToken.IsCancellationRequested;
+                return failure;
             }
             catch (OperationCanceledException)
             {
                 const string message = "Build cancelled.";
                 Report(progress, RemoteBuildStatus.Failed, message);
                 Debug.LogWarning($"[VRC Remote Test] {message}");
-                return RemoteBuildOutcome.Failure(buildId, ErrorCode.UnknownError, message);
+                return cancellationToken.IsCancellationRequested
+                    ? RemoteBuildOutcome.Cancellation(buildId, message)
+                    : RemoteBuildOutcome.Failure(buildId, ErrorCode.UnknownError, message);
             }
             catch (Exception ex)
             {
@@ -507,6 +671,7 @@ namespace VRCRemoteTest
         /// </summary>
         private async Task<RemoteBuildOutcome> DeployArtifactAsync(
             BuildArtifact artifact,
+            Attempt attempt,
             TimeSpan resultTimeout,
             TimeSpan pollInterval,
             IProgress<RemoteBuildProgress> progress,
@@ -543,10 +708,12 @@ namespace VRCRemoteTest
                 }
 
                 Report(progress, RemoteBuildStatus.Running, "Uploading to Windows Bridge...");
+                attempt.Stage = "upload";
                 await _transport.UploadBuildAsync(artifact, manifest, buildId, cancellationToken).ConfigureAwait(false);
                 Debug.Log($"[VRC Remote Test] Upload complete. Build ID: {buildId}");
 
                 Report(progress, RemoteBuildStatus.Running, "Waiting for Bridge result...");
+                attempt.Stage = "result";
                 var result = await PollForResultAsync(buildId, resultTimeout, pollInterval, cancellationToken)
                     .ConfigureAwait(false);
 
@@ -573,14 +740,19 @@ namespace VRCRemoteTest
             {
                 Report(progress, RemoteBuildStatus.Failed, ex.Message);
                 Debug.LogError($"[VRC Remote Test] {ex.ErrorCodeValue}: {ex.Message}");
-                return RemoteBuildOutcome.Failure(buildId, ex.ErrorCodeValue, ex.Message);
+                // The transport turns an aborted upload into UploadFailed: still the user's cancellation.
+                var failure = RemoteBuildOutcome.Failure(buildId, ex.ErrorCodeValue, ex.Message);
+                failure.Canceled = cancellationToken.IsCancellationRequested;
+                return failure;
             }
             catch (OperationCanceledException)
             {
                 const string message = "Deploy cancelled.";
                 Report(progress, RemoteBuildStatus.Failed, message);
                 Debug.LogWarning($"[VRC Remote Test] {message}");
-                return RemoteBuildOutcome.Failure(buildId, ErrorCode.UnknownError, message);
+                return cancellationToken.IsCancellationRequested
+                    ? RemoteBuildOutcome.Cancellation(buildId, message)
+                    : RemoteBuildOutcome.Failure(buildId, ErrorCode.UnknownError, message);
             }
             catch (Exception ex)
             {
@@ -599,17 +771,41 @@ namespace VRCRemoteTest
         /// plan review Phase 3, confidence 0.93) — a stale hash would just get
         /// rejected by the Bridge as HASH_MISMATCH after a wasted upload.
         /// </summary>
-        public async Task<RemoteBuildOutcome> DeployLastBuildAsync(
+        public Task<RemoteBuildOutcome> DeployLastBuildAsync(
             IProgress<RemoteBuildProgress> progress = null,
-            CancellationToken cancellationToken = default)
+            CancellationToken cancellationToken = default) =>
+            DeployLastBuildCoreAsync(null, progress, cancellationToken);
+
+        /// <summary>The redeploy behind DeployLastBuildAsync and RemoteBuildApi.DeployLastBuildAsync (not an overload, see above).</summary>
+        internal async Task<RemoteBuildOutcome> DeployLastBuildCoreAsync(
+            RemoteBuildRequest request,
+            IProgress<RemoteBuildProgress> progress,
+            CancellationToken cancellationToken)
         {
+            var attempt = Attempt.Begin("redeploy");
             if (!_executionLock.Wait(0))
             {
                 var busyMessage = "A remote build is already in progress.";
                 progress?.Report(new RemoteBuildProgress(RemoteBuildStatus.Failed, busyMessage));
-                return RemoteBuildOutcome.Failure(null, ErrorCode.BuildAlreadyRunning, busyMessage);
+                return Finish(RemoteBuildOutcome.Failure(null, ErrorCode.BuildAlreadyRunning, busyMessage), attempt, request);
             }
 
+            RemoteBuildOutcome outcome;
+            try
+            {
+                outcome = await DeployLastInternalAsync(attempt, progress, cancellationToken).ConfigureAwait(false);
+            }
+            finally
+            {
+                _executionLock.Release();
+            }
+
+            return Finish(outcome, attempt, request);
+        }
+
+        private async Task<RemoteBuildOutcome> DeployLastInternalAsync(
+            Attempt attempt, IProgress<RemoteBuildProgress> progress, CancellationToken cancellationToken)
+        {
             try
             {
                 var artifact = LastArtifact;
@@ -639,36 +835,44 @@ namespace VRCRemoteTest
                     artifact.Size = currentSize;
                 }
 
+                // The tag goes with the bytes: kept only while they are the ones built with it.
+                attempt.Sha256 = artifact.Sha256;
+                attempt.Size = artifact.Size;
+                attempt.Tag = _lastBuildTag is { } built && built.Sha256 == artifact.Sha256 && built.Size == artifact.Size
+                    ? built.Tag
+                    : null;
+
                 Report(progress, RemoteBuildStatus.Running, "Running preflight checks...");
                 await RunPreflightAsync(cancellationToken);
 
                 var resultTimeout = TimeSpan.FromSeconds(RemoteTestSettings.ResultTimeoutSeconds);
                 var pollInterval = TimeSpan.FromSeconds(RemoteTestSettings.PollIntervalSeconds);
-                return await DeployArtifactAsync(artifact, resultTimeout, pollInterval, progress, cancellationToken)
+                return await DeployArtifactAsync(artifact, attempt, resultTimeout, pollInterval, progress, cancellationToken)
                     .ConfigureAwait(false);
             }
             catch (RemoteBuildException ex)
             {
                 Report(progress, RemoteBuildStatus.Failed, ex.Message);
                 Debug.LogError($"[VRC Remote Test] {ex.ErrorCodeValue}: {ex.Message}");
-                return RemoteBuildOutcome.Failure(null, ex.ErrorCodeValue, ex.Message);
+                // The transport turns an aborted upload into UploadFailed: still the user's cancellation.
+                var failure = RemoteBuildOutcome.Failure(null, ex.ErrorCodeValue, ex.Message);
+                failure.Canceled = cancellationToken.IsCancellationRequested;
+                return failure;
             }
             catch (OperationCanceledException)
             {
                 const string message = "Deploy cancelled.";
                 Report(progress, RemoteBuildStatus.Failed, message);
                 Debug.LogWarning($"[VRC Remote Test] {message}");
-                return RemoteBuildOutcome.Failure(null, ErrorCode.UnknownError, message);
+                return cancellationToken.IsCancellationRequested
+                    ? RemoteBuildOutcome.Cancellation(null, message)
+                    : RemoteBuildOutcome.Failure(null, ErrorCode.UnknownError, message);
             }
             catch (Exception ex)
             {
                 Report(progress, RemoteBuildStatus.Failed, ex.Message);
                 Debug.LogError($"[VRC Remote Test] Unexpected error: {ex}");
                 return RemoteBuildOutcome.Failure(null, ErrorCode.UnknownError, ex.Message);
-            }
-            finally
-            {
-                _executionLock.Release();
             }
         }
 
