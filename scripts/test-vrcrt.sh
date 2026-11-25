@@ -93,6 +93,23 @@ expect "export-log rejects a client without a verified log source" 3 "no verifie
     "$vrcrt" export-log 0 "$share"
 expect "a slot is 0 to 3" 2 "a slot is 0 to 3" "$vrcrt" log 4
 expect "markers of one slot" 0 "45	2026.10.18 13:41:45" "$vrcrt" log 0 --markers
+expect "markers as JSON" 0 '"seq": 45' "$vrcrt" log 0 --markers --json
+expect "markers as JSON keep the header" 0 '"clientGeneration": 11' "$vrcrt" log 0 --markers --json
+expect "markers JSON needs one slot" 2 "one slot's markers" "$vrcrt" log all --markers --json
+expect "markers JSON needs --markers" 2 "one slot's markers" "$vrcrt" log 0 --json
+expect "the packaged CLI runs directly" 0 "local:aaaa" bash "$here/../package/Tools~/vrcrt.sh" status
+ln -s "$vrcrt" "$share/linked-vrcrt.sh"
+expect "the scripts/ entry works through a link" 0 "local:aaaa" "$share/linked-vrcrt.sh" status
+expect "the scripts/ entry passes the exit code" 2 "a slot is 0 to 3" "$share/linked-vrcrt.sh" log 9
+expect "the scripts/ entry ignores an inherited CDPATH" 0 "local:aaaa" env CDPATH=. "$vrcrt" status
+expect "export-log by generation refuses another client" 3 "now holds generation 11 epoch 5, not 12 epoch 5" \
+    "$vrcrt" export-log 0 "$share" --generation 12 --epoch 5
+expect "export-log by generation refuses another epoch" 3 "nothing exported" \
+    "$vrcrt" export-log 0 "$share" --generation 11 --epoch 4
+expect "export-log by generation still needs a verified log" 3 "no verified current log source" \
+    "$vrcrt" export-log 0 "$share" --generation 11 --epoch 5
+expect "export-log --generation needs --epoch" 2 "go together" "$vrcrt" export-log 0 "$share" --generation 11
+expect "export-log --generation needs one slot" 2 "need one slot" "$vrcrt" export-log all "$share" --generation 11 --epoch 5
 
 merged="$("$vrcrt" log all --markers)"
 if [ "$(printf '%s\n' "$merged" | cut -f1,2 | tr '\t' ':' | tr '\n' ' ')" = "0:10 1:12 0:45 " ]; then
@@ -126,6 +143,9 @@ expect "a new generation is an error" 3 "--any-generation" \
 expect "--any-generation accepts it" 0 "3	${H}[SPK003] PLAYER_RESTORED" \
     "$vrcrt" wait-marker 0 'RESTORED' 2 --after "$cursor" --any-generation
 
+markers 0 11 5 "" "60	${H}[SPK003] vrcrt.build=abc [truncated]" "61	<line withheld: masking timed out>"
+expect "markers JSON flags a cut record" 0 '"truncated": true' "$vrcrt" log 0 --markers --json
+expect "markers JSON flags a withheld record" 0 '"withheld": true' "$vrcrt" log 0 --markers --json
 markers 0 11 5 ',"droppedThroughSeq":55' "60	${H}[SPK003] PLAYER_RESTORED id=2"
 expect "dropped markers after the cursor are an error" 3 "dropped markers" \
     "$vrcrt" wait-marker 0 'RESTORED' 2 --after "$cursor"
@@ -175,6 +195,9 @@ http GET_api_v1_bridge "$(bridge_info 3 "$(apply_report rolledBack '["VrchatClie
 http GET_api_v1_profiles "$PROFILES"
 printf '2026-10-30 00:00:01 info: started\n2026-10-30 00:00:02 warn: \033[31mred\n' > "$share/http/GET_api_v1_logs_bridge"
 expect "doctor shows the version" 0 "Bridge        0.8.0+abc" "$vrcrt" doctor
+expect "bridge --json" 0 '"hostGeneration": 3' "$vrcrt" bridge --json
+expect "bridge --json keeps the process start" 0 '"processStartedAtUtc": "2026-10-30T00:00:00+00:00"' "$vrcrt" bridge --json
+expect "bridge needs --json" 2 "needs --json" "$vrcrt" bridge
 expect "doctor shows the executable's SHA-256" 0 "Executable    SHA-256 00" "$vrcrt" doctor
 expect "doctor shows the active configuration" 0 "  VrchatProfiles = [0, 1]" "$vrcrt" doctor
 expect "doctor escapes the active configuration" 0 '  VrchatClientMode = Relaunch\x1b' "$vrcrt" doctor
