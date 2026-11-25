@@ -182,6 +182,25 @@ clients "__NOW__" "$(client 0 111 7 9 joined false authenticated)" "$(client 1 2
 markers 0 111 7 "$(tagged "$tag")"; markers 1 222 8 "$(tagged "$tag")"
 check "without joinAttemptSeq only lines after the join count" 0 results.worldBuildMatch UNKNOWN
 
+# --world-build-wait: 0 looks once; out of range is a usage error.
+prepare_run --world-build-wait 0; ready_clients "$tag"; deploy_result "$run" PASS PASS null "\"$tag\""
+check "--world-build-wait 0 still matches a tag that is already there" 0 results.worldBuildMatch PASS
+[ "$(field "$run/run.json" procedure.parameters.worldBuildWaitSeconds)" = "0" ] && pass "the wait is recorded with the procedure" \
+    || fail "the wait is recorded with the procedure"
+prepare_run --world-build-wait 0; ready_clients "$tag"; markers 0 111 7 "[]"; markers 1 222 8 "[]"
+deploy_result "$run" PASS PASS null "\"$tag\""
+check "--world-build-wait 0 without a tag leaves the match unknown" 0 results.worldBuildMatch UNKNOWN
+python3 -I -c '
+import json, sys
+from datetime import datetime
+op = [o for o in json.load(open(sys.argv[1]))["operations"] if o["name"] == "waitWorldBuild"][0]
+span = datetime.fromisoformat(op["finishedAtUtc"]) - datetime.fromisoformat(op["startedAtUtc"])
+sys.exit(0 if span.total_seconds() < 0.5 else 1)' "$run/run.json" \
+    && pass "--world-build-wait 0 does not wait" || fail "--world-build-wait 0 does not wait"
+rm -f "$root"/locks/*.json
+python3 -I "$runner" prepare --slots 0,1 --owner-pid $$ --run-root "$root" --world-build-wait 601 > "$work/out" 2>&1
+[ $? -eq 2 ] && pass "--world-build-wait over 600 is refused" || { fail "--world-build-wait over 600 is refused"; cat "$work/out"; }
+
 prepare_run; ready_clients "$tag"; markers 0 111 7 "$(tagged "$tag" true)"; deploy_result "$run" PASS PASS null "\"$tag\""
 check "a cut tag line proves nothing" 0 results.worldBuildMatch UNKNOWN
 

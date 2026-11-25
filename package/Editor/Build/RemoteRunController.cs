@@ -102,7 +102,8 @@ namespace VRCRemoteTest
             Refresh();
         }
 
-        internal async void Start(string slots, bool useLastBuild, string bridgeUrl, string fingerprint)
+        /// <param name="waitForTag">false: look for the build tag once instead of waiting up to 120 s, for worlds that log none.</param>
+        internal async void Start(string slots, bool useLastBuild, string bridgeUrl, string fingerprint, bool waitForTag = true)
         {
             if (Active)
             {
@@ -148,9 +149,14 @@ namespace VRCRemoteTest
                 }
 
                 Status = "Saving the state before the deploy...";
-                prepared = await Task.Run(() => RunnerProcess.Run(python,
-                    new[] { "-I", runner, "prepare", "--slots", slots, "--owner-pid", owner.ToString() },
-                    environment, TimeSpan.FromSeconds(90)));
+                var arguments = new List<string> { "-I", runner, "prepare", "--slots", slots, "--owner-pid", owner.ToString() };
+                if (!waitForTag)
+                {
+                    arguments.Add("--world-build-wait");
+                    arguments.Add("0");
+                }
+
+                prepared = await Task.Run(() => RunnerProcess.Run(python, arguments.ToArray(), environment, TimeSpan.FromSeconds(90)));
             }
             catch (Exception ex)
             {

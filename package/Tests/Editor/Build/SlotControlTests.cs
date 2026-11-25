@@ -179,6 +179,23 @@ namespace VRCRemoteTest.Tests
             var exited = VrchatClientsView.ActionsFor(Entry(false), Relaunch, "0.11.0", now, now, busy: false);
             Assert.IsFalse(exited.CanClose);
             Assert.IsTrue(exited.CanLaunch);
+            Assert.IsNull(exited.LaunchOff);
+        }
+
+        [Test]
+        public void Launch_is_off_for_a_slot_past_the_configured_profiles()
+        {
+            var now = DateTimeOffset.UtcNow;
+            var leftOver = new VrchatClientEntry { Slot = 2, ProcessId = 11, Running = false, State = "left", ClientGeneration = 8 };
+            var actions = VrchatClientsView.ActionsFor(leftOver, Relaunch, "0.11.0", now, now, busy: false);
+            Assert.IsFalse(actions.CanLaunch);
+            Assert.IsFalse(actions.CanClose);
+            Assert.IsNull(actions.Blocked, "only this slot's Launch is off, not the whole table");
+            StringAssert.Contains("slot 2", actions.LaunchOff);
+
+            var running = new VrchatClientEntry { Slot = 2, ProcessId = 11, Running = true, State = "joined", ClientGeneration = 8 };
+            Assert.IsTrue(VrchatClientsView.ActionsFor(running, Relaunch, "0.11.0", now, now, busy: false).CanClose,
+                "a running client of such a slot can still be closed");
         }
 
         [Test]

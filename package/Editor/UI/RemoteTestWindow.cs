@@ -158,6 +158,7 @@ namespace VRCRemoteTest
         [SerializeField] private string _runSlots;
         [SerializeField] private bool _runSlotsEdited;
         [SerializeField] private bool _runUseLastBuild;
+        [SerializeField] private bool _runWaitForTag = true;
 
         private static RemoteRunController RunController
         {
@@ -544,7 +545,9 @@ namespace VRCRemoteTest
 
                     using (new EditorGUI.DisabledScope(!actions.CanLaunch))
                     {
-                        if (GUILayout.Button(new GUIContent("Launch", "Start this slot again as in the last deploy."),
+                        if (GUILayout.Button(new GUIContent("Launch", actions.LaunchOff != null
+                                    ? "Off: " + actions.LaunchOff + "; the Bridge would refuse it."
+                                    : "Start this slot again as in the last deploy."),
                                 GUILayout.Width(60))
                             && EditorUtility.DisplayDialog("Start one VRChat client again", VrchatClientsView.ConfirmLaunch(entry),
                                 "Launch", "Cancel"))
@@ -1224,6 +1227,10 @@ namespace VRCRemoteTest
                         "Deploy the last artifact again instead of building (its tag is kept only while its bytes are unchanged)."),
                         _runUseLastBuild && _hasLastArtifact);
                 }
+
+                _runWaitForTag = EditorGUILayout.Toggle(new GUIContent("Wait for the build tag",
+                    "Wait up to 120 s for each client to log vrcrt.build=<tag>. Off: look once, for worlds that log no tag " +
+                    "(their world build match stays UNKNOWN either way)."), _runWaitForTag);
             }
 
             var coordinatorBusy = _bridgeConfigured && RemoteBuildCommand.GetCoordinator().IsRunning;
@@ -1236,7 +1243,7 @@ namespace VRCRemoteTest
                             "Build (or redeploy), wait until every slot is ready, and collect evidence into a run folder.")))
                     {
                         run.Start(_runSlots.Replace(" ", string.Empty), _runUseLastBuild, RemoteTestSettings.BridgeUrl,
-                            RemoteTestSettings.BridgeFingerprint);
+                            RemoteTestSettings.BridgeFingerprint, _runWaitForTag);
                     }
                 }
 
