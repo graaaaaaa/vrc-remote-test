@@ -393,9 +393,9 @@ internal static class BridgeAdminApi
         {
             var closer = context.RequestServices.GetRequiredService<OwnedClientCloser>();
             var closed = await closer.CloseAsync(requireNoOthers: true, context.RequestAborted);
-            if (!closed.Refused)
+            if (closed.Closed + closed.NotConfirmed > 0)
             {
-                // Clients were closed, or may have been; a refusal before closing changes nothing.
+                // Clients were closed, or may have been; closing nothing changes nothing.
                 runtime.Gate.Bump();
             }
 
@@ -480,7 +480,7 @@ internal static class BridgeAdminApi
 
         var closer = context.RequestServices.GetRequiredService<OwnedClientCloser>();
         var report = await closer.CloseAsync(requireNoOthers: false, context.RequestAborted);
-        if (!report.Refused)
+        if (report.Closed + report.NotConfirmed > 0)
         {
             runtime.Gate.Bump();
         }
@@ -519,11 +519,10 @@ internal static class BridgeAdminApi
         }
 
         var control = context.RequestServices.GetRequiredService<ClientSlotControl>();
-        var result = await control.CloseAsync(slot, context.RequestAborted, precondition?.ClientGeneration);
-        if (result.Attempted)
-        {
-            runtime.Gate.Bump();
-        }
+        // The revision moves right before the client is asked to exit, so no /bridge read during
+        // the close can show the value from before it.
+        var result = await control.CloseAsync(slot, context.RequestAborted, precondition?.ClientGeneration,
+            () => runtime.Gate.Bump());
 
         if (result.Refusal == SlotRefusal.PreconditionFailed)
         {
@@ -583,17 +582,13 @@ internal static class BridgeAdminApi
         SlotLaunchResult result;
         try
         {
-            result = await control.LaunchAsync(slot, context.RequestAborted, precondition?.ClientGeneration);
+            result = await control.LaunchAsync(slot, context.RequestAborted, precondition?.ClientGeneration,
+                () => runtime.Gate.Bump());
         }
         catch (OperationCanceledException) when (context.RequestAborted.IsCancellationRequested)
         {
             // Stopped before anything was started; nobody is listening for the answer.
             return Results.Empty;
-        }
-
-        if (result.Attempted)
-        {
-            runtime.Gate.Bump();
         }
 
         if (result.Refusal == SlotRefusal.PreconditionFailed)

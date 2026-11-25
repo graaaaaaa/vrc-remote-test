@@ -131,7 +131,9 @@ public sealed class ClientSlotControl
     /// From the request's precondition: the generation of the client the caller means to close.
     /// When the client found differs, nothing is closed (PreconditionFailed). Null: the old request.
     /// </param>
-    public async Task<SlotCloseResult> CloseAsync(int slot, CancellationToken cancellationToken, long? expectedGeneration = null)
+    /// <param name="beforeSideEffect">Called once right before the client is asked to exit (the LAN API moves the operation revision there).</param>
+    public async Task<SlotCloseResult> CloseAsync(
+        int slot, CancellationToken cancellationToken, long? expectedGeneration = null, Action? beforeSideEffect = null)
     {
         if (CheckSlotAndMode(slot) is { } refusal)
         {
@@ -183,6 +185,7 @@ public sealed class ClientSlotControl
                 [$"Slot {slot} runs generation {generation}, not the expected {expected}."], generation);
         }
 
+        beforeSideEffect?.Invoke();
         var result = await _terminator.CloseAsync([handle], cancellationToken).ConfigureAwait(false);
         var problems = new List<string>();
         var exited = result.NotConfirmed.Count == 0;
@@ -220,7 +223,9 @@ public sealed class ClientSlotControl
     /// or the recorded (no longer running) client of the slot. Otherwise nothing is started
     /// (PreconditionFailed). Null: the old request.
     /// </param>
-    public async Task<SlotLaunchResult> LaunchAsync(int slot, CancellationToken cancellationToken, long? expectedGeneration = null)
+    /// <param name="beforeSideEffect">Called once right before VRChat is asked to start (the LAN API moves the operation revision there).</param>
+    public async Task<SlotLaunchResult> LaunchAsync(
+        int slot, CancellationToken cancellationToken, long? expectedGeneration = null, Action? beforeSideEffect = null)
     {
         if (CheckSlotAndMode(slot) is { } refusal)
         {
@@ -299,6 +304,7 @@ public sealed class ClientSlotControl
         var filesBefore = _pacer.ListPaths();
         var startedUtc = _utcNow();
         LaunchResult result;
+        beforeSideEffect?.Invoke();
         try
         {
             var task = _launcher.LaunchAsync(request);

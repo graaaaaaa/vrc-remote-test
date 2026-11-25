@@ -774,6 +774,10 @@ def check_guard(info, guard, when):
     still current, and no operation since the one this run last saw (its own close or launch)."""
     if not slot_preconditions(info) or info.get("bridgeInstanceId") != guard["bridgeInstanceId"]:
         raise Stop("UNKNOWN", "bridgeChanged", when)
+    # An operation still in the gate (someone else's close, a deploy, a restart) may not have
+    # shown in the revision or the clients yet: not a state to pass on.
+    if info.get("busy") is not None or info.get("restartPending") is True:
+        raise Stop("UNKNOWN", "bridgeBusy", "%s: the Bridge is busy with %s" % (when, info.get("busy") or "a restart"))
     batch = current_batch(info)
     if batch is None or batch.get("buildId") != guard["buildId"]:
         raise Stop("UNKNOWN", "batchChanged", "%s: the Bridge's launch plan is not this deploy's" % when)

@@ -493,6 +493,11 @@ FEATURE=1 prepare_run; ready_clients "$tag"; deploy_result "$run" PASS PASS null
 FEATURE=1 BRIDGE_OUT=bridge-then.json bridge
 FEATURE=1 REV=18 BRIDGE_OUT=bridge-later.json bridge
 check "with the feature, a revision that moves after the clients are ready is UNKNOWN" 3 reason revisionChanged
+FEATURE=1 prepare_run; ready_clients "$tag"; deploy_result "$run" PASS PASS null "\"$tag\""
+FEATURE=1 BRIDGE_OUT=bridge-then.json bridge
+FEATURE=1 BRIDGE_OUT=bridge-later.json bridge
+python3 -I -c 'import json,sys; p=sys.argv[1]; b=json.load(open(p)); b["busy"]="close-client"; json.dump(b, open(p,"w"))' "$fake/bridge-later.json"
+check "with the feature, a Bridge busy with someone else's operation is UNKNOWN" 3 reason bridgeBusy
 BRIDGE_MODE=Reload FEATURE=1 prepare_run; deploy_result "$run" PASS PASS null null
 BRIDGE_MODE=Reload FEATURE=1 BATCH=20261126T000002000Z-55556666 bridge
 clients "__NOW__" "$(client 0 11 5 60 joined false authenticated)" "$(client 1 22 6 60 joined false authenticated)"

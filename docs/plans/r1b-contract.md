@@ -84,8 +84,9 @@ close の 200 と 409（確かめられなかった）、launch の 200 と 500�
 
 ### 1.5 revision の増え方（close／launch）
 
-- close は、台を閉じる処理（terminator）を呼んだときにちょうど 1 増える。閉じたと確かめられなくても増える。
-- launch は、プロセスを起動しようとしたときにちょうど 1 増える。起動に失敗しても増える。
+- close は、台に終了を頼む**直前**にちょうど 1 増える。閉じたと確かめられなくても増える。
+- launch は、プロセスを起動しようとする**直前**にちょうど 1 増える。起動に失敗しても増える。
+- 操作の最中の `/bridge` は `busy` に操作の名前を出す。runner は、busy のときの照合を UNKNOWN（`bridgeBusy`）にする。
 - 断り・400・412・409 busy では増えない。
 - よって、ほかに何も起きていなければ、200 の `operationRevision` は、送った `expect.operationRevision` + 1 になる。
 
@@ -159,5 +160,5 @@ vrcrt.sh launch-client <slot> [--expect @FILE] [--operation-id ID] [--json]
 
 ## 6. 分かっている限界
 
-- leave-rejoin の `--remaining-marker` は、close を送る直前に読んだ位置より後の目印を数える。その位置を読んでから close が届くまでのごく短い間に出た目印も数えうるので、正規表現は退出のときだけ出る目印に当てる。
+- leave-rejoin の `--remaining-marker` は、close を送る直前に読んだ位置より後の目印を数える。Bridge の観測は遅れることがある（台の一覧で約10〜15秒）ので、close の前に出た目印も数えうる。正規表現は、退出のときだけ出る目印に当てる。目印が close のあとに出たことの証明にはならない。
 - 前提条件は、Bridge と台が一覧を読んだときから変わっていないことを確かめるだけで、認証の代わりではない。トークンが漏れれば、その持ち主は前提なしの close／launch もできる。

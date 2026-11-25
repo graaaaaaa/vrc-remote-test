@@ -657,6 +657,20 @@ public sealed class BridgeHostTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task A_close_all_that_closes_nothing_leaves_the_revision()
+    {
+        var (slot0, slot1) = await StartRelaunchAsync();
+        slot0.Exit();
+        slot1.Exit();
+        var revision = (await BridgeInfoAsync())["operationRevision"]!.GetValue<long>();
+
+        var response = await _client!.PostAsync("clients/close", null);
+
+        Assert.Equal(0, JsonNode.Parse(await response.Content.ReadAsStringAsync())!["closed"]!.GetValue<int>());
+        Assert.Equal(revision, (await BridgeInfoAsync())["operationRevision"]!.GetValue<long>());
+    }
+
+    [Fact]
     public async Task A_close_without_a_body_also_reports_the_revision_and_the_Bridge()
     {
         await StartRelaunchAsync();
