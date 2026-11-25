@@ -63,20 +63,30 @@ python3 package/Tools~/vrcrt_runner.py run --build headless --unity /Application
 
 ## 記録
 
-### （日付、パッケージの commit、Bridge の版と SHA-256）
+### 2026-11-25（UTC）、パッケージ 1ceb5f3、Bridge 0.10.0+7dbd10bc
+
+Mac のエージェントが CLI だけで確かめた。Windows で人がしたことは無い。Unity の画面（Run ボタン・Cancel・台の表の Close／Launch）は触っていない。
 
 | 項目 | 結果 |
 |---|---|
-| 環境（Windows、VRChat の版、Bridge の版と SHA-256、パッケージの commit、Unity の版） | |
-| 1. ボタン1つで Relaunch 2台: results、所要時間（`run.json` の createdAtUtc〜finishedAtUtc） | |
-| 1. 証拠のハッシュと大きさ、権限 | |
-| 2. tag の照合（新しいビルド／同じ bytes の再配置） | |
-| 3. Reload で同じ bytes（joinedSeq・epoch・目印の再出力） | |
-| 4. 1台ずつ Close／Launch（PID・世代・EPOCH の変わり方） | |
-| 5. Cancel、Editor を閉じたあとの継続、次の Run | |
-| 6. CLI の headless、Editor を開いたままの断り | |
+| 環境（Windows、VRChat の版、Bridge の版と SHA-256、パッケージの commit、Unity の版） | VRChat `2026.4.2-1953-d52354d5be-Release`。Bridge `0.10.0+7dbd10bc62d3e88f06c5ee9903cf681fa49b8eaa`、exe SHA-256 `c056e50571964746cb4362257bb37d11c8dc7c7788b9c530460f60875ef464d7`。パッケージ commit `1ceb5f3`（0.11.0）。Unity 2022.3.22f1（Mac）。Python 3.12.4。Relaunch profiles `[0,1]`、Desktop |
+| 1. ボタン1つで Relaunch 2台: results、所要時間（`run.json` の createdAtUtc〜finishedAtUtc） | ボタンは未確認（画面を触っていない）。同じ runner の流れを 6 の CLI で通した（下） |
+| 1. 証拠のハッシュと大きさ、権限 | 6 の run で確かめた。`run.json` の evidence の sha256・大きさが全ファイルと一致。run・evidence・deploy-results のフォルダーは 700、`run.json`・`deploy-result.json`・`markers.json`・全文ログ・`deploy-results/<buildId>.json` は 600 |
+| 2. tag の照合（新しいビルド／同じ bytes の再配置） | 未確認（シーン B が無い） |
+| 3. Reload で同じ bytes（joinedSeq・epoch・目印の再出力） | 未確認（同じ bytes の再配置は画面の `Use the last build` が要る。headless は毎回ビルドする） |
+| 4. 1台ずつ Close／Launch（PID・世代・EPOCH の変わり方） | 画面のボタンは未確認。同じ API を CLI で: `close-client 1` は 2 s で `closed slot 1 (PID 36212)`、終了コード 0。slot 0（PID 18568、世代 4184232016852734、epoch 1795628236126）は変わらず。直後の `status` はまだ slot 1 を running と出し、約10 s 後に running false・left（台の一覧の更新の間隔ぶん遅れる）。`launch-client 1` は即座に `launched slot 1 (profile 1, PID 32176, generation 6715527127308562)`、終了コード 0。13 s で `wait-same-instance 120 --slots 0,1` が通り、slot 1 は新しい epoch 1795628570191 で slot 0 と同じインスタンスに joined、authenticated、inErrorWorld false |
+| 5. Cancel、Editor を閉じたあとの継続、次の Run | 未確認（画面の操作が要る）。runner の側の取り消し・中断・claim の引き継ぎは fixture の試験だけ |
+| 6. CLI の headless、Editor を開いたままの断り | **PASS**。run `20261125T173619Z-687e11db`、build `20261125T173712079Z-742b0ef1`、シーン A（`VRCDefaultWorldScene`）、slots 0,1。終了コード 0。results: deploy PASS、launch PASS、clientReadiness PASS、worldBuildMatch UNKNOWN（noTagMarker）、evidence PASS、testVerdict notJudged。17:36:19〜17:39:40（3分22秒）。内訳: prepare 0.5 s、headless のビルドと配備 60 s、台の準備 17 s、目印の待ち 121 s（上限 120 s まで待って UNKNOWN）、照らし直し・回収・最後の判定 2 s。2台とも同じインスタンス。runner の子は残らず、claim も消えた。<br>その前の1回（`20261125T173421Z-6658865b`）は、試験用のプロジェクトに ProjectSettings が足りず SDK のビルドが失敗し、FAIL `deploy:SDK_BUILD_FAILED` を正しく記録した（Bridge には何も送っていない）。<br>Editor を開いたまま（commander-world を開いた Unity に対して）同じコマンド: 終了コード 3、result UNKNOWN、reason `editorOpen`。Unity は起動せず、claim は残らない。macOS の Unity 2022.3.22f1 は `Temp/UnityLockfile` に flock を取っていた（`requires_validation` が解けた。錠だけで見分けられる） |
 | 4台（Windows の空き次第） | 未確認 |
 
 ## 気づいたこと
 
+- 目印を出さないワールドでは、worldBuildMatch の待ちで上限の 120 s を毎回使い切る。run の所要時間の6割がこれ。tag を使わないワールドのために、待ちを省く引数（例 `--world-build-timeout 0`）を足すかを、次の段で決める。
+- close の直後の `status` は、Bridge の台の一覧が更新されるまで（今回は約10 s）閉じる前の状態を出す。Close の応答そのものは正しい（`closed`）。runner は close/launch をしない（R1a）ので影響は無いが、R1b の leave-rejoin は一覧の時刻（`updatedAtUtc`）が操作より後になるまで待つ必要がある。
+- 試験用の Unity プロジェクトから、利用者のプロジェクト（`~/Documents/VRChatProjects/Vrc-remote-test`）の SDK パッケージを `file:` で参照すると、SDK がそこにサンプルなどのファイルを作る。試験用のプロジェクトには SDK を写して入れること。
+
 ## 結論
+
+R1a の runner の流れ（prepare → headless のビルドと配備 → 台の準備 → 証拠の回収 → `run.json`）は、本物の Bridge 0.10.0 と VRChat 2台で PASS。結果ファイル・証拠・権限・claim の片付けも期待どおり。1台ずつの close/launch の API は CLI で期待どおり。Editor が開いているときの断りは macOS の Unity の錠で確かに効く。
+
+まだ見ていないのは、Unity の画面からの操作（Run・Cancel・Editor を閉じたあとの継続・台の表の Close／Launch）、tag を埋めたシーン B、Reload で同じ bytes、4台。画面の確かめは、Unity を computer use で動かせる回にまとめて行う。
