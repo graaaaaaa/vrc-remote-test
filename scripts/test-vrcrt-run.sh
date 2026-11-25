@@ -38,8 +38,9 @@ cat > "$work/unity" <<EOF
 while [ "\$#" -gt 0 ]; do [ "\$1" = "-logFile" ] && log="\$2"; shift; done
 printf '[VRC Remote Test] Upload complete. Build ID: %s\n' "$BUILD" > "\$log"
 if [ "\${MODE:-new}" = new ]; then
-    printf '{"schema":"vrcrt.deploy-result","schemaVersion":1,"buildId":"%s"}' "$BUILD" > "$work/result.json"
-    printf '[VRC Remote Test] Deploy result: %s\n' "$work/result.json" >> "\$log"
+    mkdir -p "$work/Application Support"
+    printf '{"schema":"vrcrt.deploy-result","schemaVersion":1,"buildId":"%s"}' "$BUILD" > "$work/Application Support/result.json"
+    printf '[VRC Remote Test] Deploy result: %s\n' "$work/Application Support/result.json" >> "\$log"
 fi
 exit "\${UNITY_EXIT:-0}"
 EOF
@@ -60,6 +61,8 @@ run() {
 }
 
 run "a deploy succeeds and names its build" 0 "Deployed build $BUILD" "$work/out1"
+grep -q "read from the log" "$work/out" && fail "the build ID comes from the deploy result, even under a folder with a space" \
+    || pass "the build ID comes from the deploy result, even under a folder with a space"
 for file in unity-editor.log unity-console.log build-result.json clients.json; do
     [ -f "$work/out1/$file" ] && pass "keeps $file" || fail "keeps $file"
 done

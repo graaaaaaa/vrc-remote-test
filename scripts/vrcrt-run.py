@@ -43,7 +43,8 @@ def build_id_from(editor_log):
     """The build ID of the deploy result Unity saved, or, from a package before v0.11.0, the
     build ID it logged (with a warning). None when neither is there exactly once."""
     text = editor_log.read_text(encoding="utf-8", errors="replace")
-    paths = re.findall(r"\[VRC Remote Test\] Deploy result: (/\S+\.json)", text)
+    # To the end of the line: the default folder, ~/Library/Application Support, has a space.
+    paths = re.findall(r"^.*?\[VRC Remote Test\] Deploy result: (/[^\r\n]*\.json)[ \t]*$", text, re.MULTILINE)
     if len(paths) == 1:
         try:
             with open(paths[0], encoding="utf-8") as stream:

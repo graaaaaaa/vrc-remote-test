@@ -1,5 +1,33 @@
 # Changelog
 
+## [0.11.0] - 2026-11-26
+
+Deploy, wait until every listed VRChat client is ready, and collect the evidence with one button in the Unity window (or one command), with a structured record of what happened. The Bridge has no changes, but the Remote Test window warns while their versions differ, so **update both the Unity package and the Windows Bridge** (`docs/setup-windows.md`, step 1, "版を入れ替える"). An existing `config.json` and pairing keep working. Not yet checked on Windows: `docs/validation/runner-deploy-collect.md` is the procedure. The plan behind this release is `docs/plans/r1-automation.md` (R1a).
+
+### Added (Unity)
+
+- Every build and redeploy saves a deploy result, `~/Library/Application Support/VRCRemoteTest/deploy-results/<buildId>.json` (`attempt-<id>.json` when it stopped before a build ID), owner-only and never replaced. It keeps "deployed" and "launched" apart: deployed with a partial, failed or unreached launch, counts that disagree with the outcome, a missing launch report or a hash or build ID that differs are UNKNOWN; a real partial start is FAIL; a refusal before the commit is FAIL; a lost answer after sending is UNKNOWN; cancelling is CANCELED (after sending, not a withdrawal).
+- `RemoteBuildApi.BuildAndDeployAsync` / `DeployLastBuildAsync` return the outcome through the shared coordinator, with an optional run folder and world build tag; `RemoteBuildApi.ActiveWorldBuildTag` is the tag a project's build preprocessing can embed so that the world logs `vrcrt.build=<tag>`. The tag of a fresh build follows its bytes to Deploy Last Build and is dropped when they change. The existing `RemoteBuildCommand`/`RemoteBuildCoordinator` members and log lines are unchanged.
+- VRChat Clients lists each slot (PID, profile, state, instance, login, error world, generation, epoch) with Close and Launch (Bridge 0.10.0 and later, Relaunch), read like `vrcrt.sh close-client`/`launch-client` and never retried. The Bridge acts on the client it has recorded in the slot when the request arrives; a change after the list was read is not caught (the confirmation says so).
+- Deploy and Collect: Run prepares with the packaged runner, builds (or redeploys) in this Editor, and hands the run to the runner, which, once it has taken the run over (run.json `running`), finishes even if the Editor closes. Cancel, a pairing change after prepare, and a script reload are all recorded. Results: deploy, launch, client readiness, world build match, evidence; the test itself is never judged.
+
+### Added (Mac scripts)
+
+- `package/Tools~/vrcrt_runner.py` (Python 3.9+, standard library only): `prepare`, `continue [--detach]`, `run --build headless`, `recover`, `prune`. The procedure deploy-collect waits until every listed slot is ready (Relaunch: a new generation; Reload: a join after the cursor in the same epoch; log read through, joined in one instance, not in the error world, logged in; a likely logged-out profile is named), checks this build's tag after each client's join, and saves markers and full logs per slot, generation and epoch with their sizes and hashes in `run.json`. PASS, FAIL, UNKNOWN or CANCELED; a missing or stale observation is never success. Runs live in `~/Library/Application Support/VRCRemoteTest/runs/` (0700); Git, iCloud, `~/Documents` and `~/Desktop` are refused. One run at a time per Bridge among runners on this Mac that use the same run root and the same Bridge URL and certificate pin; children run in their own process groups and are always stopped.
+- `vrcrt.sh` now lives in `package/Tools~/` so that the package carries it; `scripts/vrcrt.sh` passes everything through unchanged. New, read-only: `bridge --json`, `log <slot> --markers --json` (cut and withheld records flagged), `export-log <slot> <dir> --generation G --epoch E`. The regular-expression child no longer inherits the environment (it gets only `PYTHONIOENCODING=utf-8`).
+
+### Changed (Mac scripts)
+
+- `scripts/vrcrt-run.py` reads the build ID from Unity's deploy result (older packages: from the log, with a warning) and refuses an `--output-dir` inside a Git work tree or iCloud. Otherwise unchanged.
+
+### Tests
+
+- Unity EditMode: 249 tests (classification, result files, attempts and cancellation, single-client control, the runner process). `scripts/test-vrcrt.sh` now also runs `test-vrcrt-runner.sh` (62 checks: readiness, tags, claims, cancellation, Ctrl-C, stubborn descendants, recovery, prune) and `test-vrcrt-run.sh` (16 checks of the old interface).
+
+### Not included
+
+- A guard that ties a single-client close or launch to the client last seen, and the automatic leave-and-rejoin procedure: R1b, which needs a Bridge change.
+
 ## [0.10.0] - 2026-11-24
 
 Closing one VRChat client and starting it again from the Mac, for tests where one player leaves and rejoins the same instance while the others stay (Relaunch mode). The Unity package has no functional changes, but the Remote Test window warns while their versions differ, so **update both the Windows Bridge** (`docs/setup-windows.md`, step 1, "版を入れ替える") **and the Unity package**. An existing `config.json` and pairing keep working. Checked on Windows on 2026-11-24 with two Relaunch clients on separate accounts: `close-client 0` closed only slot 0, and `launch-client 0` about a minute later started the same profile again, which rejoined the same instance with a new generation, observation epoch and its own log (`docs/validation/slot-close-relaunch.md`).

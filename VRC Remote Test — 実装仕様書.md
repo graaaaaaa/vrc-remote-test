@@ -40,6 +40,16 @@ Windows の前に人がいなくても日々の管理ができるよう、次の
 - `GET /api/v1/profiles`: Relaunch の profile ごとに、最後にログインしたアカウント。`/clients` の各台にも `loginState` と `account` が付きます。usr_ の ID は出さず、Windows の外に出ない鍵による HMAC の先頭12文字（`idDigest`）で、同じアカウントかだけを比べます。
 - 配備の結果には任意の `launch`（VRChat をどう起動したか）と `warnings` が付きます。413 には何が大きすぎたかと上限を JSON で返します。protocol の版は上げません。
 
+## 配備の結果と runner（v0.11.0）
+
+Bridge は変えず、Mac の側だけで足します。計画は `docs/plans/r1-automation.md`（R1a）。
+
+- 配備の結果: Unity は試み1回ごとに `~/Library/Application Support/VRCRemoteTest/deploy-results/<buildId>.json`（buildId の前に止まれば `attempt-<attemptId>.json`）を書きます（schema `vrcrt.deploy-result` v1、フォルダー 0700・ファイル 0600、`link(2)` で置き、終わった結果は上書きしない）。「配備できた」（deploy）と「起動できた」（launch）を分けて書き、準備と試験の合否は書きません。Bridge は一部だけの起動を `failed`＋`partial` で返すので、`deployed` に `partial`・`failed`・`notReached` が付く組、数の食い違い、launch の欠け、成果物と違う sha256 や buildId は UNKNOWN です。commit の前に断られたものは FAIL、送ったあとに答えが無いものは UNKNOWN、取り消しは CANCELED（送ったあとなら撤回ではない）。
+- 公開の入口 `RemoteBuildApi` は共有の coordinator を通します。`RemoteBuildRequest` で run のフォルダーと tag を渡し、SDK のビルド中だけ `ActiveWorldBuildTag` が tag を示します。ワールドが `vrcrt.build=<tag>` を目印に出せば、runner がこの回のビルドかを照らせます。tag は成果物の bytes に付き、Deploy Last Build で bytes が変わっていれば外れます。
+- runner（`package/Tools~/vrcrt_runner.py`、Python 3.9 以上・標準ライブラリだけ）は `vrcrt.sh` を子として呼ぶだけで、HTTP を自分では持ちません。prepare が配備の前のカーソルと Bridge の識別を `runs/<runId>/run.json` に残し、continue が配備の結果を読んで、明示した全 slot の準備（Relaunch は新しい世代、Reload は同じ世代・epoch でカーソルの後の join。ログを読み終え、同じインスタンスに joined、エラーワールドでない、ログイン済み）と tag を待ち、slot・世代・epoch ごとに目印と全文ログの snapshot を集めます。結果は PASS・FAIL・UNKNOWN・CANCELED で、観測の欠けは成功に数えず、試験の合否は判定しません。目印は観測と待ちにだけ使い、対象・保存先・次の手順を決めません。目印による一致は、ワールドが目印を偽らない前提です。
+- 同じ Mac で、同じ run の根を使い、同じ Bridge の URL と証明書の指紋を使う runner のあいだでは、同時に走る run は1つだけです（`locks/` の claim を flock で直列にし、token で照らし、持ち主が消えるか期限を過ぎ、記録した子がすべて止まったと確かめられたときだけ引き継ぐ）。子は自分のプロセスグループで動かし、取り消し・期限・出力の大きさを見張り、どう終わっても止めて回収します。別の Mac、別の run の根、古い CLI からの配備は、R1a では見分けられません。
+- Unity のウィンドウの1台ずつの Close／Launch は、v0.10.0 の経路を本文なしで呼びます。Bridge は要求が届いた時点で記録にある台に働きかけるので、一覧を読んだあとの変化は止められません（R1b で前提条件を足す）。
+
 配備、設定の変更、閉じる操作（全台と1台）、1台の起動、起動し直しは、1つの操作の門を通り、同時には1つだけです。門は、host が起動し終えるまで閉じています。起動し直しを予約してから新しい host が立つまでは、新しい commit も 409 で断ります。管理の操作の最中に受けた commit は待ち行列に残り、門が空いてから配備します。
 
 ## 安全の範囲
@@ -47,7 +57,7 @@ Windows の前に人がいなくても日々の管理ができるよう、次の
 - 任意のコマンドの実行、自由なパスの受け付け、待ち受けのアドレス・ポート・状態のフォルダー・Worlds のフォルダー・ペアリングの変更は、API に含めません。`VrchatExecutable` は、Steam のライブラリで見つけた `VRChat.exe` の候補からしか選べません。
 - Bridge の自己更新は入れません。Bridge は自分の実行体を取得も入れ替えもせず、`.vrcw` 以外を実行しない決まりを保ちます。版の入れ替えは Windows で人が行います。
 - Bridge が起動していない VRChat は、今までどおり閉じません。mode の切り替えは、記録の無い VRChat が動いていれば行いません（以前の「全部手で閉じてから切り替える」を置き換えます）。
-- トークンを持つ人が新しくできること: Bridge の記録にある VRChat を閉じ、配備で起動する。起動し直しで Bridge を短く止める（再起動は10秒に1回まで）。アップロードの上限を 2 GiB まで上げる。`RetainBuilds` を下げて古いワールドを消させる（消したものは設定を戻しても戻りません）。ログの印の範囲を変える。HMD を使う台を変える。表示名と、伏せたパスを読む。
+- トークンを持つ人が新しくできること: Bridge の記録にある VRChat を閉じ、配備で起動する。起動し直しで Bridge を短く止める（再起動は10秒に1回まで）。アップロードの上限を 2 GiB まで上げる。`RetainBuilds` を下げて古いワールドを消させる（消したものは設定を戻しても戻りません）。ログの印の範囲を変える。HMD を使う台を変える。表示名と、伏せたパスを読む。v0.10.0 から: Relaunch で、記録にある1台だけを閉じ、その台を最後の配置と同じ引数で起動し直す。v0.11.0 は Bridge を変えないので、増えることはありません（Mac の側の runner が、すでにできる操作を順に呼ぶだけです）。トークンが漏れれば、その持ち主はこれらをすべて行えます。
 
 ## 検証の境界
 
