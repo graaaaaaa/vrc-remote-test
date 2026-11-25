@@ -168,16 +168,47 @@ namespace VRCRemoteTest.Tests
 
         public List<string> SlotRequests { get; } = new List<string>();
 
-        public Task<BridgeAdminResponse> CloseClientAsync(int slot, CancellationToken cancellationToken = default)
+        /// <summary>The body each single-client request carried, in order; null for none.</summary>
+        public List<string> SlotBodies { get; } = new List<string>();
+
+        public List<SlotPrecondition> SlotPreconditions { get; } = new List<SlotPrecondition>();
+
+        public Task<BridgeAdminResponse> CloseClientAsync(int slot, CancellationToken cancellationToken = default) =>
+            CloseClientAsync(slot, null, null, cancellationToken);
+
+        public Task<BridgeAdminResponse> LaunchClientAsync(int slot, CancellationToken cancellationToken = default) =>
+            LaunchClientAsync(slot, null, null, cancellationToken);
+
+        public Task<BridgeAdminResponse> CloseClientAsync(int slot, SlotPrecondition precondition, string operationId,
+            CancellationToken cancellationToken = default)
         {
-            SlotRequests.Add("close " + slot);
+            Record("close " + slot, precondition, operationId);
             return SlotHandler != null ? SlotHandler(cancellationToken) : Answer(CloseClientResponse);
         }
 
-        public Task<BridgeAdminResponse> LaunchClientAsync(int slot, CancellationToken cancellationToken = default)
+        public Task<BridgeAdminResponse> LaunchClientAsync(int slot, SlotPrecondition precondition, string operationId,
+            CancellationToken cancellationToken = default)
         {
-            SlotRequests.Add("launch " + slot);
+            Record("launch " + slot, precondition, operationId);
             return SlotHandler != null ? SlotHandler(cancellationToken) : Answer(LaunchClientResponse);
+        }
+
+        private void Record(string request, SlotPrecondition precondition, string operationId)
+        {
+            SlotRequests.Add(request);
+            SlotPreconditions.Add(precondition);
+            SlotBodies.Add(precondition?.ToRequestJson(operationId));
+        }
+
+        /// <summary>What GET /capabilities answers; null (the default) is a Bridge whose capabilities could not be read.</summary>
+        public BridgeCapabilities CapabilitiesToReturn { get; set; }
+
+        public int CapabilitiesCalls { get; private set; }
+
+        public Task<BridgeCapabilities> GetCapabilitiesAsync(CancellationToken cancellationToken = default)
+        {
+            CapabilitiesCalls++;
+            return Task.FromResult(CapabilitiesToReturn);
         }
     }
 }

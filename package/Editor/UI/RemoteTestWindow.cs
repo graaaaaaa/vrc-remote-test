@@ -117,6 +117,15 @@ namespace VRCRemoteTest
         [NonSerialized] private bool _shownClientOperationRunning;
         private VrchatClientSettings _awaitingAppliedSettings;
 
+        // Whether the Bridge reports slotPreconditions.v1 (Bridge v0.12.0), read every
+        // SlotGuardRefreshSeconds while it runs Relaunch. It only picks the confirmation's text:
+        // the operation reads the capabilities again before it sends anything.
+        private const double SlotGuardRefreshSeconds = 15.0;
+        [NonSerialized] private bool _loadedSlotGuard;
+        [NonSerialized] private bool _slotGuard;
+        [NonSerialized] private bool _slotGuardLoading;
+        [NonSerialized] private double _lastSlotGuardRead = double.NegativeInfinity;
+
         private bool _bridgeConfigured;
         private bool _bridgeReachable;
         private bool _sdkAvailable;
@@ -509,9 +518,11 @@ namespace VRCRemoteTest
         }
 
         /// <summary>
-        /// One row per slot the Bridge observes, with Close and Launch for Relaunch. These call the
-        /// Bridge's existing single-client routes: nothing ties the request to the client shown
-        /// here, so the confirmation says so. The list is the one read at the last Layout.
+        /// One row per slot the Bridge observes, with Close and Launch for Relaunch. With a Bridge
+        /// that reports slotPreconditions.v1 (v0.12.0), the request carries the row's client
+        /// generation and the Bridge's state as a precondition, and the Bridge does nothing when
+        /// either changed; without it, nothing ties the request to the client shown here, and the
+        /// confirmation says so. The list is the one read at the last Layout.
         /// </summary>
         private void DrawSlotRows(bool busy)
         {
@@ -536,10 +547,10 @@ namespace VRCRemoteTest
                     {
                         if (GUILayout.Button(new GUIContent("Close", "Close this client only; the others keep running."),
                                 GUILayout.Width(60))
-                            && EditorUtility.DisplayDialog("Close one VRChat client", VrchatClientsView.ConfirmClose(entry),
-                                "Close", "Cancel"))
+                            && EditorUtility.DisplayDialog("Close one VRChat client",
+                                VrchatClientsView.ConfirmClose(entry, _slotGuard), "Close", "Cancel"))
                         {
-                            StartSlotOperation(entry.Slot, close: true);
+                            StartSlotOperation(entry.Slot, entry.ClientGeneration, close: true, _slotGuard, _bridgeInfo);
                         }
                     }
 
@@ -549,10 +560,10 @@ namespace VRCRemoteTest
                                     ? "Off: " + actions.LaunchOff + "; the Bridge would refuse it."
                                     : "Start this slot again as in the last deploy."),
                                 GUILayout.Width(60))
-                            && EditorUtility.DisplayDialog("Start one VRChat client again", VrchatClientsView.ConfirmLaunch(entry),
-                                "Launch", "Cancel"))
+                            && EditorUtility.DisplayDialog("Start one VRChat client again",
+                                VrchatClientsView.ConfirmLaunch(entry, _slotGuard), "Launch", "Cancel"))
                         {
-                            StartSlotOperation(entry.Slot, close: false);
+                            StartSlotOperation(entry.Slot, entry.ClientGeneration, close: false, _slotGuard, _bridgeInfo);
                         }
                     }
                 }
@@ -564,7 +575,11 @@ namespace VRCRemoteTest
                 EditorStyles.miniLabel);
         }
 
-        private async void StartSlotOperation(int slot, bool close)
+        /// <param name="clientGeneration">The generation in the row the user confirmed.</param>
+        /// <param name="confirmedGuarded">Whether the confirmation said the Bridge checks the request.</param>
+        /// <param name="shownBridge">The GET /bridge answer shown with the list; read again when older than 15 s.</param>
+        private async void StartSlotOperation(int slot, long clientGeneration, bool close, bool confirmedGuarded,
+            BridgeInfo shownBridge)
         {
             _clientOperationRunning = true;
             _clientOperationStatus = (close ? "Closing" : "Starting") + " the VRChat client in slot " + slot + "...";
@@ -576,9 +591,25 @@ namespace VRCRemoteTest
             try
             {
                 var coordinator = RemoteBuildCommand.GetCoordinator();
-                outcome = close
-                    ? await coordinator.CloseVrchatClientAsync(slot, token)
-                    : await coordinator.LaunchVrchatClientAsync(slot, token);
+                var guard = await coordinator.ResolveSlotGuardAsync(confirmedGuarded, clientGeneration, shownBridge, token);
+                if (guard.Kind == SlotGuardKind.Refused)
+                {
+                    outcome = VrchatClientSettingsOutcome.Failure(
+                        "Did not " + (close ? "close" : "launch") + " slot " + slot + ": " + guard.Problem + ".");
+                }
+                else
+                {
+                    // Unguarded: the body-less request of R1a (precondition null).
+                    outcome = close
+                        ? await coordinator.CloseVrchatClientAsync(slot, guard.Precondition, null, token)
+                        : await coordinator.LaunchVrchatClientAsync(slot, guard.Precondition, null, token);
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                // Only the reads before the request can end here; the request itself reports its own stop.
+                outcome = VrchatClientSettingsOutcome.Failure(
+                    "Stopped before " + (close ? "closing" : "launching") + " slot " + slot + "; nothing was sent.");
             }
             catch (Exception ex)
             {
@@ -647,6 +678,34 @@ namespace VRCRemoteTest
                 _lastProfilesRead = now;
                 StartLoadProfiles();
             }
+
+            if (_activeClientSettings != null && _activeClientSettings.IsRelaunch && !_slotGuardLoading
+                && now - _lastSlotGuardRead >= SlotGuardRefreshSeconds)
+            {
+                _lastSlotGuardRead = now;
+                StartLoadSlotGuard();
+            }
+        }
+
+        /// <summary>Reads whether the Bridge checks a close or launch; an unreadable answer counts as no (contract §1.1).</summary>
+        private async void StartLoadSlotGuard()
+        {
+            _slotGuardLoading = true;
+            try
+            {
+                var capabilities = await RemoteBuildCommand.GetCoordinator().ReadBridgeCapabilitiesAsync();
+                _loadedSlotGuard = capabilities != null && capabilities.SupportsSlotPreconditions;
+            }
+            catch (Exception ex)
+            {
+                _loadedSlotGuard = false;
+                Debug.LogWarning("[VRC Remote Test] Could not read the Bridge's capabilities: " + ex.Message);
+            }
+            finally
+            {
+                _slotGuardLoading = false;
+                Repaint();
+            }
         }
 
         private void MarkClientFieldsEdited()
@@ -661,6 +720,7 @@ namespace VRCRemoteTest
             _shownClientStatus = _clientOperationStatus;
             _shownClientOutcome = _clientOutcome;
             _profiles = _loadedProfiles;
+            _slotGuard = _loadedSlotGuard;
         }
 
         private async void StartLoadProfiles()

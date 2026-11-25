@@ -64,6 +64,48 @@ namespace VRCRemoteTest
         /// <summary>Plain-language notes about the active configuration; untrusted text.</summary>
         [JsonProperty("configNotes")]
         public List<string> ConfigNotes { get; set; }
+
+        /// <summary>
+        /// A random value per Bridge process, 32 lowercase hex digits (Bridge v0.12.0 and later);
+        /// null from an older Bridge.
+        /// </summary>
+        [JsonProperty("bridgeInstanceId")]
+        public string BridgeInstanceId { get; set; }
+
+        /// <summary>
+        /// Goes up whenever something on Windows changed or may have changed (a deploy, a close or
+        /// launch attempt, a config write, a host start); never goes down within a process. Bridge
+        /// v0.12.0 and later; null from an older Bridge.
+        /// </summary>
+        [JsonProperty("operationRevision")]
+        public long? OperationRevision { get; set; }
+
+        /// <summary>
+        /// The current Relaunch launch plan (Bridge v0.12.0 and later); null when there is none
+        /// (after a Reload deploy, a failed deploy or a host restart) or from an older Bridge.
+        /// </summary>
+        [JsonProperty("currentBatch")]
+        public BridgeBatch CurrentBatch { get; set; }
+
+        /// <summary>
+        /// When this package asked for this answer (UTC); null when unknown. Set by the transport
+        /// and the coordinator, not part of the wire format.
+        /// </summary>
+        [JsonIgnore]
+        public DateTimeOffset? ReadAtUtc { get; set; }
+    }
+
+    /// <summary>The Bridge's current Relaunch launch plan (GET /bridge currentBatch, Bridge v0.12.0 and later).</summary>
+    [Serializable]
+    public sealed class BridgeBatch
+    {
+        /// <summary>The build ID of the deploy that made this plan; untrusted text.</summary>
+        [JsonProperty("buildId")]
+        public string BuildId { get; set; }
+
+        /// <summary>The slots that can be started again one at a time.</summary>
+        [JsonProperty("launchedSlots")]
+        public List<int> LaunchedSlots { get; set; }
     }
 
     [Serializable]

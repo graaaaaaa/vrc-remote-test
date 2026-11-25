@@ -41,10 +41,22 @@ namespace VRCRemoteTest
         {
             public DateTime LastStarted;
             public string Value;
+
+            /// <summary>When the request that gave <see cref="Value"/> was sent.</summary>
+            public DateTime ValueAskedAtUtc;
             public bool Loading;
         }
 
         public LanRemoteTransport(string url, string fingerprint, string token)
+            : this(url, fingerprint, token, null)
+        {
+        }
+
+        /// <summary>
+        /// For the tests: <paramref name="handler"/> replaces the pinned HTTPS handler (null keeps
+        /// it), so a request can be inspected without a network.
+        /// </summary>
+        internal LanRemoteTransport(string url, string fingerprint, string token, HttpMessageHandler handler)
         {
             if (!Uri.TryCreate(url, UriKind.Absolute, out var uri) || uri.Scheme != "https"
                 || uri.UserInfo.Length != 0 || uri.Query.Length != 0 || uri.Fragment.Length != 0
@@ -61,9 +73,14 @@ namespace VRCRemoteTest
             _mainContext = SynchronizationContext.Current;
             _isBatchMode = Application.isBatchMode;
 
-            var handler = new HttpClientHandler { AllowAutoRedirect = false, UseProxy = false };
-            handler.ServerCertificateCustomValidationCallback = (request, cert, chain, errors) =>
-                cert != null && Sha256(cert.RawData) == _fingerprint;
+            if (handler == null)
+            {
+                var pinned = new HttpClientHandler { AllowAutoRedirect = false, UseProxy = false };
+                pinned.ServerCertificateCustomValidationCallback = (request, cert, chain, errors) =>
+                    cert != null && Sha256(cert.RawData) == _fingerprint;
+                handler = pinned;
+            }
+
             _http = new HttpClient(handler) { Timeout = TimeSpan.FromMinutes(10) };
             _http.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", _token);
         }
@@ -127,6 +144,19 @@ namespace VRCRemoteTest
             {
                 var capabilities = await ReadCapabilitiesAsync(cancellationToken).ConfigureAwait(false);
                 return BridgeMessages.ByteCount(capabilities["maxArtifactSizeBytes"]);
+            }
+            catch (Exception ex) when (ex is RemoteBuildException or HttpRequestException or JsonException
+                || (ex is TaskCanceledException && !cancellationToken.IsCancellationRequested))
+            {
+                return null;
+            }
+        }
+
+        public async Task<BridgeCapabilities> GetCapabilitiesAsync(CancellationToken cancellationToken = default)
+        {
+            try
+            {
+                return BridgeCapabilities.From(await ReadCapabilitiesAsync(cancellationToken).ConfigureAwait(false));
             }
             catch (Exception ex) when (ex is RemoteBuildException or HttpRequestException or JsonException
                 || (ex is TaskCanceledException && !cancellationToken.IsCancellationRequested))
@@ -313,7 +343,17 @@ namespace VRCRemoteTest
         public VrchatClients PollVrchatClients() => Parse<VrchatClients>(GetCached("/clients", 5));
         public string PollClientLog(int slot) => SlotText("/logs/clients/", slot);
         public string PollClientMarkers(int slot) => SlotText("/markers/clients/", slot);
-        public BridgeInfo PollBridgeInfo() => Parse<BridgeInfo>(GetCached("/bridge", 10));
+        public BridgeInfo PollBridgeInfo()
+        {
+            var text = GetCached("/bridge", 10, out var askedAtUtc);
+            var info = Parse<BridgeInfo>(text);
+            if (info != null)
+            {
+                info.ReadAtUtc = askedAtUtc;
+            }
+
+            return info;
+        }
 
         public Task<BridgeAdminResponse> GetBridgeInfoAsync(CancellationToken cancellationToken = default) =>
             SendAdminAsync(HttpMethod.Get, "/bridge", null, null, cancellationToken);
@@ -342,10 +382,36 @@ namespace VRCRemoteTest
             SendAdminAsync(HttpMethod.Post, "/clients/close", null, null, cancellationToken);
 
         public Task<BridgeAdminResponse> CloseClientAsync(int slot, CancellationToken cancellationToken = default) =>
-            SendAdminAsync(HttpMethod.Post, "/clients/" + CheckedSlot(slot) + "/close", null, null, cancellationToken);
+            CloseClientAsync(slot, null, null, cancellationToken);
 
         public Task<BridgeAdminResponse> LaunchClientAsync(int slot, CancellationToken cancellationToken = default) =>
-            SendAdminAsync(HttpMethod.Post, "/clients/" + CheckedSlot(slot) + "/launch", null, null, cancellationToken);
+            LaunchClientAsync(slot, null, null, cancellationToken);
+
+        public Task<BridgeAdminResponse> CloseClientAsync(int slot, SlotPrecondition precondition, string operationId,
+            CancellationToken cancellationToken = default) =>
+            SendAdminAsync(HttpMethod.Post, "/clients/" + CheckedSlot(slot) + "/close",
+                SlotBody(precondition, operationId), null, cancellationToken);
+
+        public Task<BridgeAdminResponse> LaunchClientAsync(int slot, SlotPrecondition precondition, string operationId,
+            CancellationToken cancellationToken = default) =>
+            SendAdminAsync(HttpMethod.Post, "/clients/" + CheckedSlot(slot) + "/launch",
+                SlotBody(precondition, operationId), null, cancellationToken);
+
+        /// <summary>
+        /// Null (no body at all, as before Bridge v0.12.0) without a precondition; an operation ID
+        /// alone is not sent, since the Bridge reads one only next to "expect".
+        /// </summary>
+        private static string SlotBody(SlotPrecondition precondition, string operationId)
+        {
+            if (precondition == null)
+            {
+                if (operationId != null)
+                    throw new ArgumentException("An operation ID is sent only with a precondition.", nameof(operationId));
+                return null;
+            }
+
+            return precondition.ToRequestJson(operationId);
+        }
 
         private static string CheckedSlot(int slot)
         {
@@ -474,7 +540,9 @@ namespace VRCRemoteTest
         private string SlotText(string prefix, int slot) =>
             slot < 0 || slot >= SlotCount ? null : GetCached(prefix + slot, 5);
 
-        private string GetCached(string path, int refreshSeconds)
+        private string GetCached(string path, int refreshSeconds) => GetCached(path, refreshSeconds, out _);
+
+        private string GetCached(string path, int refreshSeconds, out DateTimeOffset? valueAskedAtUtc)
         {
             lock (_cacheGate)
             {
@@ -489,12 +557,16 @@ namespace VRCRemoteTest
                     entry.LastStarted = DateTime.UtcNow;
                     _ = RefreshAsync(path, entry);
                 }
+                valueAskedAtUtc = entry.Value == null
+                    ? (DateTimeOffset?)null
+                    : new DateTimeOffset(DateTime.SpecifyKind(entry.ValueAskedAtUtc, DateTimeKind.Utc));
                 return entry.Value;
             }
         }
 
         private async Task RefreshAsync(string path, CacheEntry entry)
         {
+            var askedAtUtc = DateTime.UtcNow;
             try
             {
                 using (var response = await _http.GetAsync(Url(path)).ConfigureAwait(false))
@@ -506,7 +578,11 @@ namespace VRCRemoteTest
                     else if (response.IsSuccessStatusCode)
                     {
                         var value = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
-                        lock (_cacheGate) entry.Value = value;
+                        lock (_cacheGate)
+                        {
+                            entry.Value = value;
+                            entry.ValueAskedAtUtc = askedAtUtc;
+                        }
                     }
                 }
             }
