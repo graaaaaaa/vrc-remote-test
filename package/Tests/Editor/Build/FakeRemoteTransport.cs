@@ -158,5 +158,26 @@ namespace VRCRemoteTest.Tests
         public Task<BridgeAdminResponse> RestartBridgeAsync(CancellationToken cancellationToken = default) => NotSupported();
 
         public Task<BridgeAdminResponse> CloseClientsAsync(CancellationToken cancellationToken = default) => Answer(CloseResponse);
+
+        public BridgeAdminResponse CloseClientResponse { get; set; }
+
+        public BridgeAdminResponse LaunchClientResponse { get; set; }
+
+        /// <summary>Replaces the single-client answers, e.g. with <see cref="NeverAnswers"/>.</summary>
+        public Func<CancellationToken, Task<BridgeAdminResponse>> SlotHandler { get; set; }
+
+        public List<string> SlotRequests { get; } = new List<string>();
+
+        public Task<BridgeAdminResponse> CloseClientAsync(int slot, CancellationToken cancellationToken = default)
+        {
+            SlotRequests.Add("close " + slot);
+            return SlotHandler != null ? SlotHandler(cancellationToken) : Answer(CloseClientResponse);
+        }
+
+        public Task<BridgeAdminResponse> LaunchClientAsync(int slot, CancellationToken cancellationToken = default)
+        {
+            SlotRequests.Add("launch " + slot);
+            return SlotHandler != null ? SlotHandler(cancellationToken) : Answer(LaunchClientResponse);
+        }
     }
 }

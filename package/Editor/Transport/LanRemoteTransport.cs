@@ -341,6 +341,19 @@ namespace VRCRemoteTest
         public Task<BridgeAdminResponse> CloseClientsAsync(CancellationToken cancellationToken = default) =>
             SendAdminAsync(HttpMethod.Post, "/clients/close", null, null, cancellationToken);
 
+        public Task<BridgeAdminResponse> CloseClientAsync(int slot, CancellationToken cancellationToken = default) =>
+            SendAdminAsync(HttpMethod.Post, "/clients/" + CheckedSlot(slot) + "/close", null, null, cancellationToken);
+
+        public Task<BridgeAdminResponse> LaunchClientAsync(int slot, CancellationToken cancellationToken = default) =>
+            SendAdminAsync(HttpMethod.Post, "/clients/" + CheckedSlot(slot) + "/launch", null, null, cancellationToken);
+
+        private static string CheckedSlot(int slot)
+        {
+            if (slot < 0 || slot >= VrchatClientSettings.MaxClients)
+                throw new ArgumentOutOfRangeException(nameof(slot), "A client slot is 0 to " + (VrchatClientSettings.MaxClients - 1) + ".");
+            return slot.ToString(System.Globalization.CultureInfo.InvariantCulture);
+        }
+
         private async Task<BridgeAdminResponse> SendAdminAsync(HttpMethod method, string path, string json,
             string ifMatch, CancellationToken cancellationToken)
         {

@@ -230,6 +230,18 @@ namespace VRCRemoteTest
                 }
             }
 
+            // Both the path as given and the one it resolves to: a link in an ancestor may lead into a work tree.
+            var real = UnixLike ? RealPath(folder) : folder;
+            if (real == null)
+            {
+                return "a path that cannot be resolved";
+            }
+
+            return GitWorkTreeAbove(real) ?? GitWorkTreeAbove(folder);
+        }
+
+        private static string GitWorkTreeAbove(string folder)
+        {
             for (var current = folder; !string.IsNullOrEmpty(current); current = Path.GetDirectoryName(current))
             {
                 var git = Path.Combine(current, ".git");
@@ -241,6 +253,9 @@ namespace VRCRemoteTest
 
             return null;
         }
+
+        private static bool UnixLike =>
+            Application.platform == RuntimePlatform.OSXEditor || Application.platform == RuntimePlatform.LinuxEditor;
 
         private static bool IsInside(string path, string folder) =>
             string.Equals(path, folder, StringComparison.Ordinal)

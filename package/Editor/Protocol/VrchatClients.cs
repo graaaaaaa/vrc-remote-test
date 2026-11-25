@@ -49,6 +49,10 @@ namespace VRCRemoteTest
         [JsonProperty("processId")]
         public int ProcessId { get; set; }
 
+        /// <summary>The process's creation time: with the PID, which client this is.</summary>
+        [JsonProperty("creationTimeUtc")]
+        public DateTimeOffset? CreationTimeUtc { get; set; }
+
         /// <summary>True while running, false once its exit is confirmed, null when the Bridge cannot tell now.</summary>
         [JsonProperty("running")]
         public bool? Running { get; set; }

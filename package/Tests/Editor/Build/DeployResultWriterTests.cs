@@ -120,6 +120,27 @@ namespace VRCRemoteTest.Tests
         }
 
         [Test]
+        public void A_link_in_an_ancestor_does_not_hide_a_git_work_tree()
+        {
+            if (Application.platform != RuntimePlatform.OSXEditor)
+            {
+                Assert.Ignore("resolved with realpath on macOS");
+            }
+
+            var repo = Path.Combine(_root, "repo");
+            Directory.CreateDirectory(Path.Combine(repo, ".git"));
+            Directory.CreateDirectory(Path.Combine(repo, "inside"));
+            var alias = Path.Combine(_root, "alias");
+            Run("/bin/ln", "-s", Path.Combine(repo, "inside"), alias);
+            var run = Path.Combine(alias, "runs", RunId);
+            Directory.CreateDirectory(run);
+            File.WriteAllText(Path.Combine(run, "run.json"), "{}");
+
+            LogAssert.Expect(LogType.Error, new Regex("Git work tree"));
+            Assert.IsNull(new DeployResultWriter(_root).TryWrite(Result(), run));
+        }
+
+        [Test]
         public void Synced_home_folders_are_named_as_such()
         {
             var home = Environment.GetEnvironmentVariable("HOME");
@@ -131,7 +152,7 @@ namespace VRCRemoteTest.Tests
             StringAssert.Contains("Documents", DeployResultWriter.SyncedOrTrackedLocation(Path.Combine(home, "Documents", "x", "runs", RunId)));
             StringAssert.Contains("Mobile Documents",
                 DeployResultWriter.SyncedOrTrackedLocation(Path.Combine(home, "Library", "Mobile Documents", "runs", RunId)));
-            Assert.IsNull(DeployResultWriter.SyncedOrTrackedLocation(Path.Combine(_root, "runs", RunId)));
+            Assert.IsNull(DeployResultWriter.SyncedOrTrackedLocation(MakeRun()));
         }
 
         [Test]

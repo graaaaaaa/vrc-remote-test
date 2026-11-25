@@ -107,5 +107,15 @@ namespace VRCRemoteTest
 
         /// <summary>POST /clients/close: closes the VRChat clients the Bridge launched.</summary>
         Task<BridgeAdminResponse> CloseClientsAsync(CancellationToken cancellationToken = default);
+
+        /// <summary>
+        /// POST /clients/{slot}/close (Bridge v0.10.0 and later, Relaunch): closes the one client
+        /// the Bridge recorded in that slot. No body is sent, so the Bridge closes whatever it has
+        /// recorded there when the request arrives.
+        /// </summary>
+        Task<BridgeAdminResponse> CloseClientAsync(int slot, CancellationToken cancellationToken = default);
+
+        /// <summary>POST /clients/{slot}/launch (Bridge v0.10.0 and later, Relaunch): starts that slot again with the last deploy's arguments.</summary>
+        Task<BridgeAdminResponse> LaunchClientAsync(int slot, CancellationToken cancellationToken = default);
     }
 }

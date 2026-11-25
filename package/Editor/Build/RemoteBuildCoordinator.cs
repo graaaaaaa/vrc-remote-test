@@ -326,6 +326,62 @@ namespace VRCRemoteTest
             }
         }
 
+        /// <summary>Close one client: the Bridge confirms the exit within 20 s; same deadline as scripts/vrcrt.sh close-client.</summary>
+        internal TimeSpan SlotCloseTimeout { get; set; } = TimeSpan.FromSeconds(45);
+
+        /// <summary>Launch one client: spacing and the previous client's log can take a minute; as vrcrt.sh launch-client.</summary>
+        internal TimeSpan SlotLaunchTimeout { get; set; } = TimeSpan.FromSeconds(90);
+
+        /// <summary>
+        /// POST /clients/{slot}/close (Bridge v0.10.0 and later, Relaunch). The Bridge closes the
+        /// client it has recorded in that slot when the request arrives: nothing ties the request
+        /// to the client the caller last saw, so a change in between is not caught (no guard
+        /// before Bridge v0.12.0). Holds the build lock; never retried.
+        /// </summary>
+        public Task<VrchatClientSettingsOutcome> CloseVrchatClientAsync(int slot, CancellationToken cancellationToken = default) =>
+            SlotOperationAsync(slot, "close", token => _transport.CloseClientAsync(slot, token), SlotCloseTimeout,
+                SlotOperationReport.ReadClose, cancellationToken);
+
+        /// <summary>
+        /// POST /clients/{slot}/launch (Bridge v0.10.0 and later, Relaunch): starts that slot again
+        /// with the arguments of the last deploy. Never retried: an answer that is lost leaves
+        /// unknown whether it started.
+        /// </summary>
+        public Task<VrchatClientSettingsOutcome> LaunchVrchatClientAsync(int slot, CancellationToken cancellationToken = default) =>
+            SlotOperationAsync(slot, "launch", token => _transport.LaunchClientAsync(slot, token), SlotLaunchTimeout,
+                SlotOperationReport.ReadLaunch, cancellationToken);
+
+        private async Task<VrchatClientSettingsOutcome> SlotOperationAsync(
+            int slot, string what, Func<CancellationToken, Task<BridgeAdminResponse>> call, TimeSpan timeout,
+            Func<int, BridgeAdminResponse, VrchatClientSettingsOutcome> read, CancellationToken cancellationToken)
+        {
+            if (slot < 0 || slot >= VrchatClientSettings.MaxClients)
+            {
+                return VrchatClientSettingsOutcome.Failure($"A client slot is 0 to {VrchatClientSettings.MaxClients - 1}.");
+            }
+
+            if (!_executionLock.Wait(0))
+            {
+                return VrchatClientSettingsOutcome.Failure("A remote build or another Bridge change is in progress.");
+            }
+
+            try
+            {
+                var response = await CallWithin(call, timeout, cancellationToken).ConfigureAwait(false);
+                return read(slot, response);
+            }
+            catch (OperationCanceledException)
+            {
+                return VrchatClientSettingsOutcome.Failure(
+                    $"Stopped waiting: whether slot {slot} was {(what == "close" ? "closed" : "started")} is unknown. "
+                    + "Check the client list before trying again.");
+            }
+            finally
+            {
+                _executionLock.Release();
+            }
+        }
+
         /// <summary>Why a management call gave no usable answer, in one line.</summary>
         internal static string AdminFailure(string what, BridgeAdminResponse response)
         {

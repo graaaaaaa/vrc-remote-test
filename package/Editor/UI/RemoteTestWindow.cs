@@ -452,6 +452,8 @@ namespace VRCRemoteTest
                 }
             }
 
+            DrawSlotRows(busy);
+
             if (_shownClientOperationRunning)
             {
                 EditorGUILayout.HelpBox(_shownClientStatus ?? "Working...", MessageType.Info);
@@ -472,6 +474,93 @@ namespace VRCRemoteTest
                 {
                     EditorGUILayout.HelpBox(detail, _shownClientOutcome.Applied ? MessageType.None : MessageType.Warning);
                 }
+            }
+        }
+
+        /// <summary>
+        /// One row per slot the Bridge observes, with Close and Launch for Relaunch. These call the
+        /// Bridge's existing single-client routes: nothing ties the request to the client shown
+        /// here, so the confirmation says so. The list is the one read at the last Layout.
+        /// </summary>
+        private void DrawSlotRows(bool busy)
+        {
+            var clients = _bridgeClients?.Clients;
+            if (clients == null || clients.Count == 0)
+            {
+                return;
+            }
+
+            EditorGUILayout.LabelField("Clients", EditorStyles.miniBoldLabel);
+            var now = DateTimeOffset.UtcNow;
+            string blocked = null;
+            foreach (var entry in clients.Where(c => c != null).OrderBy(c => c.Slot).Take(VrchatClientSettings.MaxClients))
+            {
+                var actions = VrchatClientsView.ActionsFor(entry, _activeClientSettings, _bridgeInfo?.Version,
+                    _bridgeClients.UpdatedAtUtc, now, busy);
+                blocked = blocked ?? actions.Blocked;
+                using (new EditorGUILayout.HorizontalScope())
+                {
+                    EditorGUILayout.LabelField("Slot " + entry.Slot, VrchatClientsView.DescribeSlot(entry));
+                    using (new EditorGUI.DisabledScope(!actions.CanClose))
+                    {
+                        if (GUILayout.Button(new GUIContent("Close", "Close this client only; the others keep running."),
+                                GUILayout.Width(60))
+                            && EditorUtility.DisplayDialog("Close one VRChat client", VrchatClientsView.ConfirmClose(entry),
+                                "Close", "Cancel"))
+                        {
+                            StartSlotOperation(entry.Slot, close: true);
+                        }
+                    }
+
+                    using (new EditorGUI.DisabledScope(!actions.CanLaunch))
+                    {
+                        if (GUILayout.Button(new GUIContent("Launch", "Start this slot again as in the last deploy."),
+                                GUILayout.Width(60))
+                            && EditorUtility.DisplayDialog("Start one VRChat client again", VrchatClientsView.ConfirmLaunch(entry),
+                                "Launch", "Cancel"))
+                        {
+                            StartSlotOperation(entry.Slot, close: false);
+                        }
+                    }
+                }
+            }
+
+            // Always one line, so Layout and Repaint lay out the same controls even when the list
+            // turns stale or an operation ends between the two events.
+            EditorGUILayout.LabelField(blocked != null && !busy ? "Close and Launch are off: " + blocked + "." : " ",
+                EditorStyles.miniLabel);
+        }
+
+        private async void StartSlotOperation(int slot, bool close)
+        {
+            _clientOperationRunning = true;
+            _clientOperationStatus = (close ? "Closing" : "Starting") + " the VRChat client in slot " + slot + "...";
+            _clientOutcome = null;
+            _clientOperationCts = new CancellationTokenSource();
+            var token = _clientOperationCts.Token;
+
+            VrchatClientSettingsOutcome outcome;
+            try
+            {
+                var coordinator = RemoteBuildCommand.GetCoordinator();
+                outcome = close
+                    ? await coordinator.CloseVrchatClientAsync(slot, token)
+                    : await coordinator.LaunchVrchatClientAsync(slot, token);
+            }
+            catch (Exception ex)
+            {
+                outcome = VrchatClientSettingsOutcome.Failure(
+                    "Could not " + (close ? "close" : "launch") + " slot " + slot + ": " + ex.Message);
+            }
+
+            FinishClientOperation(outcome);
+            if (outcome.Applied)
+            {
+                Debug.Log("[VRC Remote Test] " + outcome.Message);
+            }
+            else
+            {
+                Debug.LogWarning("[VRC Remote Test] " + outcome.Message);
             }
         }
 
