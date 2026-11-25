@@ -105,7 +105,7 @@ Unity の Preflight が `Windows Bridge: Connected` になり、`Remote Build & 
 - `config.json` を書き直すとき、コメントは消えます。元の内容はバックアップに残ります。
 - `VrchatClientMode` を変えるときは、Bridge が起動した VRChat を先に閉じます。Bridge が起動していない VRChat が動いていれば、何も閉じず、設定も変えません。v0.7.1 までに Reload で起動した VRChat には記録が無いので、Windows で閉じてください。
 - 配備や別の操作の最中は、409 busy で断ります。少し待ってからやり直してください。
-- 全文ログの書き出し（`export-log`、Unity の Save Full Log、runner の証拠の回収）は、Windows の `%LOCALAPPDATA%\VRCRemoteTest\state\exports` に1件ずつ残り、Bridge は今は消しません（R1b で自分で消すようにする予定）。runner は Bridge の空きが 5 GiB 未満か、書き出しの合計が 2 GiB を越えると、書き出さずに UNKNOWN で止まり、ここの片付けを案内します。Windows では次で、1日より古い書き出しを消せます（Mac に取り出したあとのもの）。
+- 全文ログの書き出し（`export-log`、Unity の Save Full Log、runner の証拠の回収）は、Windows の `%LOCALAPPDATA%\VRCRemoteTest\state\exports` に1件ずつ残ります。v0.12.0 から、Bridge は自分が書いた書き出し（`<32桁の16進>.log` と `.part`）のうち、作ってから24時間を過ぎたものを、起動時と1時間ごとに消します。Mac に取り出す前に1日たったものは消えます（CLI と runner は頼んですぐ取り出します）。runner は Bridge の空きが 5 GiB 未満か、書き出しの合計が 2 GiB を越えると、書き出さずに UNKNOWN で止まり、ここの片付けを案内します。v0.11.0 以前の Bridge では、次で1日より古い書き出しを消せます（Mac に取り出したあとのもの）。
 
 ```powershell
 Get-ChildItem (Join-Path $env:LOCALAPPDATA 'VRCRemoteTest\state\exports') -Filter *.log | Where-Object LastWriteTime -lt (Get-Date).AddDays(-1) | Remove-Item

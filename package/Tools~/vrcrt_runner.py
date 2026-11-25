@@ -1,14 +1,23 @@
 #!/usr/bin/env python3
 """VRC Remote Test runner: fixed test procedures on top of vrcrt.sh.
 
-R1a has one procedure, deploy-collect: save the state before a deploy, read Unity's deploy
-result, wait until every declared client is ready (and, for worlds that log one, until each
-client shows this build's tag), collect evidence per client generation, and write the whole run
-to run.json. It never closes or launches a client. Whether a test passed is not decided here.
+deploy-collect: save the state before a deploy, read Unity's deploy result, wait until every
+declared client is ready (and, for worlds that log one, until each client shows this build's
+tag), collect evidence per client generation, and write the whole run to run.json. It never
+closes or launches a client. Whether a test passed is not decided here.
 
-    vrcrt_runner.py prepare --slots 0,1 [--expect-clients ...] [--world-build-wait S] [--owner-pid PID] [--run-root DIR]
+leave-rejoin (R1b, not validated yet: only with --unvalidated): deploy-collect, then, in the same
+continue, close the declared --target-slot with a precondition (Bridge 0.12.0 and later,
+slotPreconditions.v1, Relaunch), wait until it has left while the other slots stay as they were
+(and, with --remaining-marker, until one of them logs a marker matching that regular expression),
+launch it again with a precondition, wait until the new client is back in the same instance, and
+collect evidence before the close, after the close and after the rejoin. Nothing is sent again.
+
+    vrcrt_runner.py prepare --slots 0,1 [--procedure deploy-collect|leave-rejoin] [--target-slot N --unvalidated
+                    [--remaining-marker REGEX]] [--expect-clients ...] [--world-build-wait S] [--owner-pid PID] [--run-root DIR]
     vrcrt_runner.py continue --run DIR --claim-token TOKEN
-    vrcrt_runner.py run --build headless --project DIR --scene Assets/... --slots 0,1 [--world-build-wait S] [--unity PATH]
+    vrcrt_runner.py run --build headless --project DIR --scene Assets/... --slots 0,1 [--procedure ... --target-slot N
+                    --unvalidated [--remaining-marker REGEX]] [--world-build-wait S] [--unity PATH]
     vrcrt_runner.py recover --run DIR
     vrcrt_runner.py prune --older-than-days N [--run-root DIR]
 
@@ -17,6 +26,7 @@ with RemoteBuildApi in its open Editor, passing runDir and worldBuildTag, and ca
 `run` does the three steps itself with a headless Unity, refusing when the project is open.
 --world-build-wait (0-600 s, default 120) is how long to wait for the build tag after the clients
 are ready; 0 looks once, for worlds that log no tag (their match stays UNKNOWN either way).
+--remaining-marker is the caller's own expression; marker lines are only matched against it.
 
 Results are PASS, FAIL, UNKNOWN or CANCELED, also the exit codes 0, 1, 3 and 4 (2: usage). A
 missing or stale observation, a full disk or a lost answer is never counted as success.
@@ -25,6 +35,7 @@ compared with what this run expects, never used to pick a target, a path or a ne
 """
 
 import argparse
+import contextlib
 import fcntl
 import hashlib
 import json
@@ -43,7 +54,7 @@ if sys.version_info < (3, 9):
     sys.stderr.write("vrcrt_runner: Python 3.9 or later is needed (this is %d.%d)\n" % sys.version_info[:2])
     sys.exit(2)
 
-RUNNER_VERSION = "0.11.0"
+RUNNER_VERSION = "0.12.0"
 RUN_SCHEMA = "vrcrt.run"
 HERE = os.path.dirname(os.path.realpath(__file__))
 FIXTURE_DIR = os.environ.get("VRCRT_FIXTURE_DIR", "")
@@ -58,6 +69,14 @@ TOKEN = re.compile(r"[0-9a-f]{32}")
 TAG = re.compile(r"[A-Za-z0-9_-]{8,64}")
 SHA256 = re.compile(r"[0-9a-f]{64}")
 BUILD_ID = re.compile(r"\d{8}T\d{9}Z-[0-9a-f]{8}")
+INSTANCE_ID = re.compile(r"[0-9a-f]{32}")
+EXPECT_BUILD_ID = re.compile(r"[0-9A-Za-z_-]{1,128}")
+OPERATION_ID = re.compile(r"[A-Za-z0-9_-]{1,64}")
+
+# Procedures that were checked on real Windows clients, with the runner version that was checked.
+# A procedure missing here runs only with --unvalidated (docs/plans/r1-automation.md §5.5).
+VALIDATED_PROCEDURES = {"deploy-collect": "0.11.0"}
+PROCEDURES = ("deploy-collect", "leave-rejoin")
 
 
 def test_setting(name, default, low, high):
@@ -93,6 +112,14 @@ MIN_MAC_FREE = int(test_setting("VRCRT_RUNNER_TEST_MAC_FREE", str(2 * 1024 ** 3)
 MIN_WINDOWS_FREE = 5 * 1024 ** 3
 MAX_WINDOWS_EXPORTS = 2 * 1024 ** 3
 MAX_JSON_BYTES = 1024 * 1024
+# leave-rejoin (R1b), also `proposed`.
+LEAVE_SECONDS = test_setting("VRCRT_RUNNER_TEST_LEAVE", "120", 0.5, 120)  # the close seen, the remaining marker
+REJOIN_SECONDS = test_setting("VRCRT_RUNNER_TEST_REJOIN", "300", 0.5, 300)  # the new client ready again
+CLOSE_CLI_SECONDS = 60  # vrcrt.sh close-client gives the Bridge 45 s
+LAUNCH_CLI_SECONDS = 120  # vrcrt.sh launch-client gives the Bridge 90 s
+REGEX_SECONDS = 2  # one --remaining-marker match over the new marker lines, in a child that is killed
+MAX_REGEX_CHARS = 256
+MAX_MARKER_TEXT = 4096
 
 
 class Stop(Exception):
@@ -374,8 +401,31 @@ class Run:
             if operation.get("inProgress"):
                 operation.update({"inProgress": False, "finishedAtUtc": iso(), "result": "UNKNOWN",
                                   "reason": operation.get("reason") or reason})
+        # A leave-rejoin that ended before its own verdict (not started, stopped, interrupted) is
+        # never PASS: CANCELED when the run was, otherwise UNKNOWN.
+        procedure = self.record.get("procedure") if isinstance(self.record.get("procedure"), dict) else {}
+        results = self.record.get("results")
+        if procedure.get("name") == "leave-rejoin" and isinstance(results, dict) and results.get("leaveRejoin") is None:
+            results["leaveRejoin"] = "CANCELED" if result == "CANCELED" else "UNKNOWN"
+            if not isinstance(self.record.get("leaveRejoin"), dict):
+                self.record["leaveRejoin"] = {"state": "notStarted"}
         self.save()
         self.progress("finished", result, reason=reason)
+
+
+@contextlib.contextmanager
+def step(run, name, **fields):
+    """One recorded operation: begun (saved) before its body, ended PASS unless the body ended it
+    itself; a Stop ends it with the Stop's word and reason and goes on up."""
+    operation = run.begin(name, **fields)
+    try:
+        yield operation
+    except Stop as stop:
+        if operation.get("inProgress"):
+            run.end(operation, stop.result, stop.reason, detail=stop.detail)
+        raise
+    if operation.get("inProgress"):
+        run.end(operation, "PASS")
 
 
 # === Children ===
@@ -672,17 +722,64 @@ def bridge_now(run, timeout=CLI_SECONDS):
     return cli_json(run, "bridge", "--json", what="bridge", timeout=timeout)
 
 
+def is_count(value, low=0, high=2 ** 63 - 1):
+    return type(value) is int and low <= value <= high
+
+
+def current_batch(info):
+    """/bridge's currentBatch as {buildId, launchedSlots}, None when there is no plan, or False when
+    it is missing or not that shape."""
+    batch = info.get("currentBatch", False)
+    if batch is None:
+        return None
+    if not isinstance(batch, dict):
+        return False
+    build_id, launched = batch.get("buildId"), batch.get("launchedSlots")
+    if not (build_id is None or isinstance(build_id, str)) or not isinstance(launched, list) \
+            or not all(is_count(slot, 0, 3) for slot in launched) or len(launched) > 4:
+        return False
+    return {"buildId": build_id, "launchedSlots": launched}
+
+
+def slot_preconditions(info):
+    """Whether this Bridge takes preconditioned close/launch (slotPreconditions.v1, Bridge 0.12.0).
+    vrcrt.sh offers no way to read /capabilities, so the sign is /bridge's fields of the same
+    release: bridgeInstanceId, operationRevision and currentBatch, all present and well formed.
+    vrcrt.sh close-client/launch-client --expect still read /capabilities themselves and send
+    nothing (exit 3) without the feature."""
+    instance = info.get("bridgeInstanceId")
+    return (isinstance(instance, str) and INSTANCE_ID.fullmatch(instance) is not None
+            and is_count(info.get("operationRevision")) and current_batch(info) is not False)
+
+
 def bridge_identity(info):
     active = info.get("activeConfig") if isinstance(info.get("activeConfig"), dict) else {}
     identity = {name: info.get(name) for name in ("version", "exeSha256", "processStartedAtUtc", "hostGeneration",
                                                   "activeConfigEtag", "savedConfigEtag")}
     identity["mode"] = active.get("VrchatClientMode")
+    identity["slotPreconditions"] = slot_preconditions(info)
+    if identity["slotPreconditions"]:
+        identity.update({"bridgeInstanceId": info["bridgeInstanceId"], "operationRevision": info["operationRevision"],
+                         "currentBatch": current_batch(info)})
     return identity
 
 
 def same_bridge(before, now):
-    keys = ("processStartedAtUtc", "hostGeneration", "activeConfigEtag", "savedConfigEtag")
+    keys = ("processStartedAtUtc", "hostGeneration", "activeConfigEtag", "savedConfigEtag", "bridgeInstanceId")
     return all(before.get(k) == now.get(k) for k in keys)
+
+
+def check_guard(info, guard, when):
+    """With slotPreconditions.v1 in Relaunch: the same Bridge process, the deploy's launch plan
+    still current, and no operation since the one this run last saw (its own close or launch)."""
+    if not slot_preconditions(info) or info.get("bridgeInstanceId") != guard["bridgeInstanceId"]:
+        raise Stop("UNKNOWN", "bridgeChanged", when)
+    batch = current_batch(info)
+    if batch is None or batch.get("buildId") != guard["buildId"]:
+        raise Stop("UNKNOWN", "batchChanged", "%s: the Bridge's launch plan is not this deploy's" % when)
+    if info.get("operationRevision") != guard["operationRevision"]:
+        raise Stop("UNKNOWN", "revisionChanged", "%s: operationRevision %s, this run expected %s"
+                   % (when, info.get("operationRevision"), guard["operationRevision"]))
 
 
 def entry_of(clients, slot):
@@ -789,29 +886,37 @@ def wait_ready(run, slots, cursor, mode):
         run.wait(POLL_SECONDS)
 
 
-def recheck(run, slots, fixed, bridge_before, when):
+def check_unchanged(entry, want, slot, when):
+    """One slot as it was when it became ready (or rejoined), its log read through."""
+    if entry is None or entry.get("running") is not True:
+        raise Stop("UNKNOWN", "unexpectedLeave", "slot %d %s" % (slot, when))
+    if entry.get("catchingUp"):
+        raise Stop("UNKNOWN", "observationIncomplete", "slot %d %s" % (slot, when))
+    for name in ("clientGeneration", "observationEpoch", "joinedSeq", "instance"):
+        if entry.get(name) != want[name]:
+            raise Stop("UNKNOWN", "unexpectedChange", "slot %d %s changed %s" % (slot, name, when))
+    if want["joinAttemptSeq"] is not None and entry.get("joinAttemptSeq") != want["joinAttemptSeq"]:
+        raise Stop("UNKNOWN", "unexpectedChange", "slot %d joinAttemptSeq changed %s" % (slot, when))
+    if entry.get("inErrorWorld") is not False or entry.get("loginState") != "authenticated":
+        raise Stop("UNKNOWN", "unexpectedChange", "slot %d %s" % (slot, when))
+
+
+def recheck(run, slots, fixed, bridge_before, when, guard=None):
     """All declared slots as they were when they became ready, on the same Bridge host, with
-    their logs read through."""
+    their logs read through; with a guard (slotPreconditions.v1 in Relaunch) also the same launch
+    plan and operation revision. Returns the /bridge and /clients it read."""
     run.check()
-    if not same_bridge(bridge_before, bridge_identity(bridge_now(run))):
+    info = bridge_now(run)
+    if not same_bridge(bridge_before, bridge_identity(info)):
         raise Stop("UNKNOWN", "bridgeChanged", when)
+    if guard:
+        check_guard(info, guard, when)
     clients = clients_now(run)
     if not list_fresh(clients):
         raise Stop("UNKNOWN", "observationStale", when)
     for slot in slots:
-        entry, want = entry_of(clients, slot), fixed[slot]
-        if entry is None or entry.get("running") is not True:
-            raise Stop("UNKNOWN", "unexpectedLeave", "slot %d %s" % (slot, when))
-        if entry.get("catchingUp"):
-            raise Stop("UNKNOWN", "observationIncomplete", "slot %d %s" % (slot, when))
-        for name in ("clientGeneration", "observationEpoch", "joinedSeq", "instance"):
-            if entry.get(name) != want[name]:
-                raise Stop("UNKNOWN", "unexpectedChange", "slot %d %s changed %s" % (slot, name, when))
-        if want["joinAttemptSeq"] is not None and entry.get("joinAttemptSeq") != want["joinAttemptSeq"]:
-            raise Stop("UNKNOWN", "unexpectedChange", "slot %d joinAttemptSeq changed %s" % (slot, when))
-        if entry.get("inErrorWorld") is not False or entry.get("loginState") != "authenticated":
-            raise Stop("UNKNOWN", "unexpectedChange", "slot %d %s" % (slot, when))
-    return clients
+        check_unchanged(entry_of(clients, slot), fixed[slot], slot, when)
+    return info, clients
 
 
 def build_tags(text):
@@ -948,6 +1053,65 @@ def declaration_problems(expect, info):
     return problems
 
 
+def valid_regex(text):
+    """--remaining-marker: the caller's own expression, bounded, and one Python compiles."""
+    if not isinstance(text, str) or not 1 <= len(text) <= MAX_REGEX_CHARS or "\x00" in text:
+        return False
+    try:
+        re.compile(text)
+    except (re.error, RecursionError, OverflowError, ValueError):
+        return False
+    return True
+
+
+def procedure_parameters(args, slots, expect, wait):
+    """The procedure's name and parameters from the command line (all recorded and hashed).
+    deploy-collect keeps exactly R1a's parameters."""
+    name = getattr(args, "procedure", None) or "deploy-collect"
+    target = getattr(args, "target_slot", None)
+    marker = getattr(args, "remaining_marker", None)
+    parameters = {"slots": slots, "expectClients": expect, "worldBuildWaitSeconds": wait}
+    if name == "deploy-collect":
+        if target is not None or marker is not None:
+            raise Usage("--target-slot and --remaining-marker belong to --procedure leave-rejoin")
+        return name, parameters
+    if name not in VALIDATED_PROCEDURES and not getattr(args, "unvalidated", False):
+        raise Usage("%s has not been validated on real clients yet; add --unvalidated to run it anyway" % name)
+    if target is None or target not in slots:
+        raise Usage("leave-rejoin needs --target-slot N, one of the --slots")
+    if len(slots) < 2:
+        raise Usage("leave-rejoin needs at least one slot besides --target-slot that stays")
+    if marker is not None and not valid_regex(marker):
+        raise Usage("--remaining-marker must be a regular expression of 1 to %d characters" % MAX_REGEX_CHARS)
+    parameters.update({"targetSlot": target, "remainingMarker": marker,
+                       "unvalidated": name not in VALIDATED_PROCEDURES,
+                       "leaveWaitSeconds": LEAVE_SECONDS, "rejoinWaitSeconds": REJOIN_SECONDS})
+    return name, parameters
+
+
+def procedure_of(record):
+    """The procedure run.json names, checked again before continue acts on it."""
+    procedure = record.get("procedure") if isinstance(record.get("procedure"), dict) else {}
+    name, parameters = procedure.get("name"), procedure.get("parameters")
+    if name == "deploy-collect":
+        return name, parameters
+    slots = record.get("slots")
+    if name == "leave-rejoin" and isinstance(parameters, dict) and isinstance(slots, list) and len(slots) >= 2:
+        target, marker = parameters.get("targetSlot"), parameters.get("remainingMarker")
+        if (is_count(target, 0, 3) and target in slots
+                and (name in VALIDATED_PROCEDURES or parameters.get("unvalidated") is True)
+                and (marker is None or valid_regex(marker))):
+            return name, parameters
+    raise Stop("UNKNOWN", "procedureInvalid", "run.json names no procedure this runner can run")
+
+
+def procedure_seconds(parameters, name, default):
+    value = parameters.get(name)
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 < value <= default:
+        return default
+    return value
+
+
 def procedure_hash(name, parameters):
     canonical = json.dumps({"procedure": name, "version": RUNNER_VERSION, "parameters": parameters}, sort_keys=True)
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
@@ -973,26 +1137,34 @@ def prepare(args, owner_pid):
     root = checked_root(args.run_root)
     slots = parse_slots(args.slots)
     expect = parse_expect(args.expect_clients)
+    wait = TAG_SECONDS if args.world_build_wait is None else args.world_build_wait
+    if not 0 <= wait <= MAX_TAG_WAIT:
+        raise Usage("--world-build-wait takes 0 to %d seconds" % MAX_TAG_WAIT)
+    name, parameters = procedure_parameters(args, slots, expect, wait)
     created = utc_now()
     run_id = created.strftime("%Y%m%dT%H%M%SZ") + "-" + secrets.token_hex(4)
     deadline_utc = iso(created + timedelta(seconds=RUN_SECONDS))
     directory = os.path.join(root, "runs", run_id)
     os.mkdir(directory, 0o700)
-    wait = TAG_SECONDS if args.world_build_wait is None else args.world_build_wait
-    if not 0 <= wait <= MAX_TAG_WAIT:
-        raise Usage("--world-build-wait takes 0 to %d seconds" % MAX_TAG_WAIT)
-    parameters = {"slots": slots, "expectClients": expect, "worldBuildWaitSeconds": wait}
     run = Run(directory)
+    results = {"deploy": None, "launch": None, "clientReadiness": None, "worldBuildMatch": None,
+               "evidence": None, "testVerdict": "notJudged"}
+    notes = ["PASS means prepared and collected; the test itself is not judged by the runner.",
+             "A world build match from markers assumes the world does not fake them."]
+    procedure = {"name": name, "version": RUNNER_VERSION, "parameters": parameters,
+                 "sha256": procedure_hash(name, parameters)}
+    if name == "leave-rejoin":
+        results["leaveRejoin"] = None
+        procedure["validated"] = name in VALIDATED_PROCEDURES
+        notes.append("leave-rejoin PASS means the declared slot left and came back as declared; "
+                     "who owns what in the world is not judged by the runner.")
     run.record = {"schema": RUN_SCHEMA, "schemaVersion": 1, "runId": run_id, "createdAtUtc": iso(created),
                   "deadlineUtc": deadline_utc, "state": "preparing",
-                  "procedure": {"name": "deploy-collect", "version": RUNNER_VERSION, "parameters": parameters,
-                                "sha256": procedure_hash("deploy-collect", parameters)},
+                  "procedure": procedure,
                   "tools": tool_versions(), "slots": slots, "worldBuildTag": run_id, "operations": [], "evidence": [],
                   "children": [],
-                  "results": {"deploy": None, "launch": None, "clientReadiness": None, "worldBuildMatch": None,
-                              "evidence": None, "testVerdict": "notJudged"},
-                  "notes": ["PASS means prepared and collected; the test itself is not judged by the runner.",
-                            "A world build match from markers assumes the world does not fake them."]}
+                  "results": results,
+                  "notes": notes}
     run.save()
     claim = Claim(root)
     token = None
@@ -1016,6 +1188,13 @@ def prepare(args, owner_pid):
         problems = declaration_problems(expect, info)
         if problems:
             raise Stop("UNKNOWN", "declarationMismatch", "; ".join(problems))
+        if name == "leave-rejoin":
+            # Refused before the deploy: a Bridge without the feature never gets a preconditioned request.
+            if not run.record["bridgeBefore"]["slotPreconditions"]:
+                raise Stop("UNKNOWN", "slotPreconditionsUnsupported",
+                           "the Bridge does not take preconditioned close/launch (0.12.0 and later); nothing was sent")
+            if run.record["bridgeBefore"]["mode"] != "Relaunch":
+                raise Stop("UNKNOWN", "notRelaunch", "leave-rejoin needs VrchatClientMode Relaunch")
         clients = clients_now(run, timeout=remaining())
         if not list_fresh(clients):
             raise Stop("UNKNOWN", "observationStale", "before the deploy")
@@ -1061,7 +1240,10 @@ def continue_run(directory, token):
     with claim:
         claim.start_continue(token, run)
     try:
-        result = deploy_collect(run)
+        name, _ = procedure_of(run.record)
+        result, fixed, guard = deploy_collect(run)
+        if name == "leave-rejoin" and result == "PASS":
+            result = leave_rejoin(run, fixed, guard)
         run.finish(result, run.record.get("reason") if result != "PASS" else None)
         return result
     except Stop as stop:
@@ -1112,9 +1294,20 @@ def deploy_collect(run):
     run.end(operation, "PASS")
 
     operation = run.begin("checkBridge")
-    if not same_bridge(bridge_before, bridge_identity(bridge_now(run))):
+    info = bridge_now(run)
+    identity = bridge_identity(info)
+    if not same_bridge(bridge_before, identity) or identity["slotPreconditions"] != bridge_before.get("slotPreconditions", False):
         run.end(operation, "UNKNOWN", "bridgeChanged")
         raise Stop("UNKNOWN", "bridgeChanged", "between prepare and the deploy result")
+    # R1b: with slotPreconditions.v1 in Relaunch, the launch plan must be this deploy's when the
+    # clients are fixed, and the operation revision read then must not move at any later recheck.
+    # The revision is taken then, not here: the Bridge moves it once more as the deploy ends,
+    # which can be just after Unity has read the result. Without the feature (Bridge 0.11 and
+    # earlier) nothing here changes R1a's procedure.
+    guard = None
+    if identity["slotPreconditions"] and bridge_before.get("mode") == "Relaunch":
+        guard = {"bridgeInstanceId": identity["bridgeInstanceId"], "operationRevision": None,
+                 "buildId": record.get("buildId")}
     run.end(operation, "PASS")
 
     operation = run.begin("waitClientsReady")
@@ -1128,6 +1321,22 @@ def deploy_collect(run):
     record["ready"] = {str(k): v for k, v in fixed.items()}
     run.end(operation, "PASS")
 
+    if guard:
+        operation = run.begin("checkLaunchPlan")
+        try:
+            info = bridge_now(run)
+            if not same_bridge(bridge_before, bridge_identity(info)):
+                raise Stop("UNKNOWN", "bridgeChanged", "when the clients were ready")
+            revision = info.get("operationRevision")
+            guard["operationRevision"] = revision if isinstance(revision, int) and not isinstance(revision, bool) else -1
+            check_guard(info, guard, "when the clients were ready")
+            record["guard"] = dict(guard, establishedAtUtc=iso())
+        except Stop as stop:
+            results["clientReadiness"] = "UNKNOWN"
+            run.end(operation, stop.result, stop.reason, detail=stop.detail)
+            raise
+        run.end(operation, "PASS")
+
     operation = run.begin("waitWorldBuild")
     parameters = (record.get("procedure") or {}).get("parameters")
     wait = parameters.get("worldBuildWaitSeconds", TAG_SECONDS) if isinstance(parameters, dict) else TAG_SECONDS
@@ -1139,7 +1348,7 @@ def deploy_collect(run):
 
     operation = run.begin("recheckReady")
     try:
-        recheck(run, slots, fixed, bridge_before, "after readiness")
+        recheck(run, slots, fixed, bridge_before, "after readiness", guard)
     except Stop as stop:
         results["clientReadiness"] = "UNKNOWN"
         run.end(operation, stop.result, stop.reason, detail=stop.detail)
@@ -1158,7 +1367,7 @@ def deploy_collect(run):
 
     operation = run.begin("finalCheck")
     try:
-        recheck(run, slots, fixed, bridge_before, "at the end")
+        recheck(run, slots, fixed, bridge_before, "at the end", guard)
     except Stop as stop:
         run.end(operation, stop.result, stop.reason, detail=stop.detail)
         raise
@@ -1167,8 +1376,8 @@ def deploy_collect(run):
     # in worldBuildMatch only, so worlds without markers can still be prepared and collected.
     if match == "FAIL":
         record["reason"] = "otherBuildTag"
-        return "FAIL"
-    return "PASS"
+        return "FAIL", fixed, guard
+    return "PASS", fixed, guard
 
 
 def add_evidence(run, path, **fields):
@@ -1181,50 +1390,532 @@ def add_evidence(run, path, **fields):
     run.save()
 
 
-def collect_evidence(run, slots, fixed):
-    info = bridge_now(run)
+def check_windows_disk(info):
     free, exports = info.get("freeDiskBytes"), info.get("stateExportsBytes")
     if not isinstance(free, int) or not isinstance(exports, int):
         raise Stop("UNKNOWN", "windowsDiskUnknown")
     if free < MIN_WINDOWS_FREE or exports > MAX_WINDOWS_EXPORTS:
         raise Stop("UNKNOWN", "windowsDiskLow", "clear %%LOCALAPPDATA%%\\VRCRemoteTest\\state\\exports on Windows "
                                                 "(free %d bytes, exports %d bytes)" % (free, exports))
+
+
+def marker_cut(markers):
+    records = markers.get("records") or []
+    return max([r.get("seq", 0) for r in records if isinstance(r, dict) and isinstance(r.get("seq"), int)] or [0])
+
+
+def save_markers(run, base, slot, want, markers, phase=None):
+    """markers.json of one client generation and epoch under base/slot-<n>/g<gen>-e<epoch>/."""
+    folder = os.path.join(base, "slot-%d" % slot, "g%d-e%d" % (want["clientGeneration"], want["observationEpoch"]))
+    private_directory(os.path.dirname(folder))
+    private_directory(folder)
+    path = os.path.join(folder, "markers.json")
+    write_new(path, json.dumps(markers, indent=2, ensure_ascii=True).encode("utf-8"))
+    extra = {"phase": phase} if phase else {}
+    add_evidence(run, path, kind="markers", slot=slot, clientGeneration=want["clientGeneration"],
+                 observationEpoch=want["observationEpoch"], cutAtSeq=marker_cut(markers), **extra)
+    return folder
+
+
+def collect_slot(run, base, slot, want, phase=None):
+    """One running client's markers and full log, of the generation and epoch in `want`.
+    Returns the markers read."""
+    check_mac_disk(run)
+    markers = cli_json(run, "log", str(slot), "--markers", "--json", what="markers")
+    header = markers.get("header") or {}
+    if header.get("clientGeneration") != want["clientGeneration"] or header.get("observationEpoch") != want["observationEpoch"]:
+        raise Stop("UNKNOWN", "markersChanged", "slot %d" % slot)
+    folder = save_markers(run, base, slot, want, markers, phase)
+    code, out, err = cli(run, "export-log", str(slot), folder, "--generation", str(want["clientGeneration"]),
+                         "--epoch", str(want["observationEpoch"]), timeout=EXPORT_SECONDS)
+    if code != 0:
+        raise Stop("UNKNOWN", "exportFailed", "slot %d: %s" % (slot, err.strip()[-300:]))
+    lines = [line.strip() for line in out.splitlines() if line.strip()]
+    if not lines:
+        raise Stop("UNKNOWN", "exportFailed", "slot %d: nothing exported" % slot)
+    extra = {"phase": phase} if phase else {}
+    for line in lines:
+        real = os.path.realpath(line)
+        if os.path.dirname(real) != os.path.realpath(folder) or os.path.islink(line) or not os.path.isfile(real):
+            raise Stop("UNKNOWN", "exportFailed", "slot %d: unexpected output" % slot)
+        add_evidence(run, real, kind="fullLog", slot=slot, clientGeneration=want["clientGeneration"],
+                     observationEpoch=want["observationEpoch"],
+                     note="a snapshot up to when it was taken, not necessarily the client's last line", **extra)
+    return markers
+
+
+def save_lists(run, base, clients, info, phase=None):
+    extra = {"phase": phase} if phase else {}
+    for name, value in (("clients.json", clients), ("bridge.json", info)):
+        path = os.path.join(base, name)
+        write_new(path, json.dumps(value, indent=2, ensure_ascii=True).encode("utf-8"))
+        add_evidence(run, path, kind=name.split(".")[0], **extra)
+
+
+def collect_evidence(run, slots, fixed):
+    check_windows_disk(bridge_now(run))
     evidence = os.path.join(run.directory, "evidence")
     private_directory(evidence)
     for slot in slots:
-        check_mac_disk(run)
+        collect_slot(run, evidence, slot, fixed[slot])
+    save_lists(run, evidence, clients_now(run), bridge_now(run))
+
+
+# === leave-rejoin (R1b) ===
+
+REGEX_CHILD = (
+    "import json, re, sys\n"
+    "pattern = re.compile(sys.argv[1])\n"
+    "texts = json.loads(sys.stdin.buffer.read().decode('utf-8'))\n"
+    "sys.stdout.write('1' if any(pattern.search(text) for text in texts) else '0')\n")
+
+
+def regex_matches(pattern, texts):
+    """Whether any of the (untrusted) lines matches the caller's --remaining-marker, decided in a
+    child with an empty environment that is killed after REGEX_SECONDS, so a crafted line cannot
+    hang the runner. None when it could not tell."""
+    try:
+        result = subprocess.run([sys.executable, "-I", "-c", REGEX_CHILD, pattern],
+                                input=json.dumps(texts, ensure_ascii=True).encode("utf-8"), capture_output=True,
+                                timeout=REGEX_SECONDS, env={}, start_new_session=True)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0 or result.stdout not in (b"0", b"1"):
+        return None
+    return result.stdout == b"1"
+
+
+def new_remaining_markers(run, remaining, fixed, cursor):
+    """The marker lines after the cursor on the slots that stay, in their fixed generation and
+    epoch, read through and with nothing dropped past the cursor. Cut, withheld or overlong
+    lines never count. Returns (texts, complete)."""
+    texts, complete = [], True
+    for slot in remaining:
         want = fixed[slot]
-        folder = os.path.join(evidence, "slot-%d" % slot, "g%d-e%d" % (want["clientGeneration"], want["observationEpoch"]))
-        private_directory(os.path.dirname(folder))
-        private_directory(folder)
         markers = cli_json(run, "log", str(slot), "--markers", "--json", what="markers")
-        header = markers.get("header") or {}
-        if header.get("clientGeneration") != want["clientGeneration"] or header.get("observationEpoch") != want["observationEpoch"]:
-            raise Stop("UNKNOWN", "markersChanged", "slot %d" % slot)
-        path = os.path.join(folder, "markers.json")
-        write_new(path, json.dumps(markers, indent=2, ensure_ascii=True).encode("utf-8"))
-        records = markers.get("records") or []
-        add_evidence(run, path, kind="markers", slot=slot, clientGeneration=want["clientGeneration"],
-                     observationEpoch=want["observationEpoch"],
-                     cutAtSeq=max([r.get("seq", 0) for r in records if isinstance(r, dict)] or [0]))
-        code, out, err = cli(run, "export-log", str(slot), folder, "--generation", str(want["clientGeneration"]),
-                             "--epoch", str(want["observationEpoch"]), timeout=EXPORT_SECONDS)
+        header = markers.get("header") if isinstance(markers.get("header"), dict) else {}
+        if (header.get("clientGeneration") != want["clientGeneration"]
+                or header.get("observationEpoch") != want["observationEpoch"] or header.get("catchingUp") is not False):
+            complete = False
+            continue
+        dropped = header.get("droppedThroughSeq") or 0
+        if not isinstance(dropped, int) or dropped > cursor[slot]:
+            raise Stop("UNKNOWN", "markersDropped", "slot %d, after the close" % slot)
+        for record in markers.get("records") or []:
+            if (not isinstance(record, dict) or not isinstance(record.get("seq"), int) or record["seq"] <= cursor[slot]
+                    or record.get("truncated") is not False or record.get("withheld") is not False):
+                continue
+            text = record.get("text")
+            if not isinstance(text, str) or len(text) > MAX_MARKER_TEXT:
+                complete = False
+                continue
+            texts.append(text)
+    return texts, complete
+
+
+def expect_from(info, generation):
+    """The precondition for one close or launch (docs/plans/r1b-contract.md §1.3), from the
+    /bridge just read and the client generation this run fixed. Checked before it is written."""
+    batch = current_batch(info) or {}
+    expect = {"bridgeInstanceId": info.get("bridgeInstanceId"), "hostGeneration": info.get("hostGeneration"),
+              "activeConfigEtag": info.get("activeConfigEtag"), "savedConfigEtag": info.get("savedConfigEtag"),
+              "operationRevision": info.get("operationRevision"), "buildId": batch.get("buildId"),
+              "clientGeneration": generation}
+    problems = []
+    if not (isinstance(expect["bridgeInstanceId"], str) and INSTANCE_ID.fullmatch(expect["bridgeInstanceId"])):
+        problems.append("bridgeInstanceId")
+    if not is_count(expect["hostGeneration"], 1):
+        problems.append("hostGeneration")
+    for key in ("activeConfigEtag", "savedConfigEtag"):
+        if not (expect[key] is None or (isinstance(expect[key], str) and len(expect[key]) <= 128)):
+            problems.append(key)
+    if not is_count(expect["operationRevision"]):
+        problems.append("operationRevision")
+    if not (expect["buildId"] is None or (isinstance(expect["buildId"], str) and EXPECT_BUILD_ID.fullmatch(expect["buildId"]))):
+        problems.append("buildId")
+    if not is_count(generation, 1):
+        problems.append("clientGeneration")
+    if problems:
+        raise Stop("UNKNOWN", "expectInvalid", "cannot state the precondition: " + ", ".join(problems))
+    return expect
+
+
+def answer_summary(answer):
+    """The scalar fields of a close/launch answer (and a 412's), bounded, for run.json."""
+    def scalar(value):
+        if value is None or isinstance(value, (bool, int)):
+            return value
+        return str(value)[:128]
+    summary = {}
+    for key in ("slot", "processId", "profile", "closed", "notConfirmed", "recordUpdated", "launched", "recorded",
+                "operationRevision", "bridgeInstanceId", "operationId", "clientGeneration", "error"):
+        if key in answer:
+            summary[key] = scalar(answer[key])
+    if isinstance(answer.get("mismatched"), list):
+        summary["mismatched"] = [str(item)[:64] for item in answer["mismatched"][:7]]
+    if isinstance(answer.get("current"), dict):
+        summary["current"] = {str(k)[:64]: scalar(v) for k, v in list(answer["current"].items())[:7]}
+    return summary
+
+
+def reread(run, entry):
+    """After a close or launch that did not end as expected: what the Bridge shows now, into
+    run.json. Never followed by another request."""
+    observed = {"atUtc": iso()}
+    for name, read in (("bridge", bridge_now), ("clients", clients_now)):
+        try:
+            observed[name] = read(run)
+        except Stop as stop:
+            observed[name + "Unavailable"] = stop.reason
+    entry["reread"] = observed
+    run.save()
+
+
+def send_slot_operation(run, state, kind, slot, expect):
+    """One preconditioned close or launch, sent once: the intent (operationId, expect) is in
+    run.json and expect-<kind>.json before the request. Only exit 0 with the Bridge's answer to
+    exactly this request (operationRevision = expect + 1; close: the expected generation; launch:
+    a new one) is accepted. Anything else, a lost answer or a cancel is recorded with a re-read of
+    /bridge and /clients and stops the procedure: never sent again. Returns (answer, answered)."""
+    operation_id = "%s-%s" % (run.record["runId"], kind)
+    if not OPERATION_ID.fullmatch(operation_id):
+        raise Stop("UNKNOWN", "operationIdInvalid")
+    path = os.path.join(run.directory, "expect-%s.json" % kind)
+    entry = state[kind] = {"operationId": operation_id, "expect": expect, "expectFile": os.path.basename(path),
+                           "outcome": "notSent"}
+    write_new(path, json.dumps(expect, indent=2, ensure_ascii=True).encode("utf-8"))
+    run.check()
+    # From here the request may reach the Bridge: a crash or a cancel leaves this on record.
+    entry["outcome"] = "unknown"
+    state["clientMayBeLeftClosed"] = True
+    timeout = CLOSE_CLI_SECONDS if kind == "close" else LAUNCH_CLI_SECONDS
+    with step(run, kind + "Client", slot=slot, operationId=operation_id):
+        try:
+            code, out, err = supervise(run, ["/bin/bash", CLI, kind + "-client", str(slot), "--expect", "@" + path,
+                                             "--operation-id", operation_id, "--json"], timeout, writes=True)
+        except Stop as stop:
+            entry["note"] = "the request may have reached the Bridge; it was not sent again"
+            if stop.result != "CANCELED":
+                reread(run, entry)
+            raise Stop(stop.result, kind + ("Canceled" if stop.result == "CANCELED" else "NoAnswer"),
+                       "slot %d (%s): whether the Bridge did it is unknown; it was not sent again" % (slot, stop.reason))
+        answered = utc_now()
+        entry.update({"answeredAtUtc": iso(answered), "exitCode": code})
+        try:
+            answer = json.loads(out) if out.strip() else None
+        except (ValueError, RecursionError):
+            answer = None
+        if isinstance(answer, dict):
+            entry["answer"] = answer_summary(answer)
         if code != 0:
-            raise Stop("UNKNOWN", "exportFailed", "slot %d: %s" % (slot, err.strip()[-300:]))
-        lines = [line.strip() for line in out.splitlines() if line.strip()]
-        if not lines:
-            raise Stop("UNKNOWN", "exportFailed", "slot %d: nothing exported" % slot)
-        for line in lines:
-            real = os.path.realpath(line)
-            if os.path.dirname(real) != os.path.realpath(folder) or os.path.islink(line) or not os.path.isfile(real):
-                raise Stop("UNKNOWN", "exportFailed", "slot %d: unexpected output" % slot)
-            add_evidence(run, real, kind="fullLog", slot=slot, clientGeneration=want["clientGeneration"],
-                         observationEpoch=want["observationEpoch"],
-                         note="a snapshot up to when it was taken, not necessarily the client's last line")
-    for name, value in (("clients.json", clients_now(run)), ("bridge.json", bridge_now(run))):
-        path = os.path.join(evidence, name)
-        write_new(path, json.dumps(value, indent=2, ensure_ascii=True).encode("utf-8"))
-        add_evidence(run, path, kind=name.split(".")[0])
+            precondition = code == 1 and isinstance(answer, dict) and answer.get("error") == "preconditionFailed"
+            if precondition:
+                reason, entry["outcome"] = kind + "PreconditionFailed", "preconditionFailed"
+            else:
+                reason = kind + {1: "NotDone", 2: "Refused", 3: "Unavailable"}.get(code, "Failed")
+                entry["outcome"] = "refused" if code == 2 else "unknown"
+            if kind == "close" and (precondition or code == 2):
+                state["clientMayBeLeftClosed"] = False  # refused before anything was done
+            reread(run, entry)
+            raise Stop("UNKNOWN", reason, "slot %d: vrcrt.sh exit %d: %s; not sent again" % (slot, code, err.strip()[-300:]))
+        problems = []
+        if not isinstance(answer, dict):
+            problems.append("no JSON answer")
+        else:
+            revision, generation = answer.get("operationRevision"), answer.get("clientGeneration")
+            if not is_count(answer.get("slot"), 0, 3) or answer.get("slot") != slot:
+                problems.append("slot")
+            if not is_count(revision) or revision != expect["operationRevision"] + 1:
+                problems.append("operationRevision %s, expected %d" % (revision, expect["operationRevision"] + 1))
+            if answer.get("bridgeInstanceId") != expect["bridgeInstanceId"]:
+                problems.append("bridgeInstanceId")
+            if answer.get("operationId") != operation_id:
+                problems.append("operationId")
+            if kind == "close" and (not is_count(generation, 1) or generation != expect["clientGeneration"]):
+                problems.append("closed generation %s, expected %d" % (generation, expect["clientGeneration"]))
+            if kind == "launch" and (not is_count(generation, 1) or generation == expect["clientGeneration"]):
+                problems.append("launched generation %s is not a new one" % generation)
+        if problems:
+            entry["outcome"] = "unexpectedAnswer"
+            reread(run, entry)
+            raise Stop("UNKNOWN", kind + "AnswerUnexpected", "slot %d: %s; not sent again" % (slot, "; ".join(problems)))
+        entry["outcome"] = "done"
+        if kind == "launch":
+            state["clientMayBeLeftClosed"] = False
+    return answer, answered
+
+
+def observe_left(run, target, remaining, fixed, closed_generation, answered, guard, bridge_before, when):
+    """One look after the close: the same Bridge, launch plan and revision (no operation but this
+    run's close), a list updated after the close's answer, the slots that stay exactly as fixed,
+    and the target slot's closed client. Returns (left, reasons, complete, /bridge, /clients)."""
+    run.check()
+    info = bridge_now(run)
+    if not same_bridge(bridge_before, bridge_identity(info)):
+        raise Stop("UNKNOWN", "bridgeChanged", when)
+    check_guard(info, guard, when)
+    clients = clients_now(run)
+    reasons, complete = {}, list_fresh(clients)
+    if not complete:
+        reasons["observation"] = "stale"
+    updated = parse_utc(clients.get("updatedAtUtc"))
+    if updated is None or updated <= answered:
+        reasons["list"] = "notUpdatedSinceClose"  # the Bridge's list can be about 10 s behind
+        complete = False
+    for slot in remaining:
+        check_unchanged(entry_of(clients, slot), fixed[slot], slot, when)
+    entry, left = entry_of(clients, target), False
+    if entry is None:
+        reasons[str(target)] = "noClient"
+        complete = False
+    elif entry.get("clientGeneration") != closed_generation:
+        raise Stop("UNKNOWN", "unexpectedChange", "slot %d holds generation %s %s" % (target, entry.get("clientGeneration"), when))
+    elif entry.get("running") is False:
+        left = True
+    elif entry.get("running") is True:
+        reasons[str(target)] = "stillRunning"
+    else:
+        reasons[str(target)] = "runningUnknown"
+        complete = False
+    return left, reasons, complete, info, clients
+
+
+def wait_left(run, target, remaining, fixed, closed_generation, answered, guard, bridge_before, pattern, cursor, seconds):
+    """Until the closed client shows not running and, with --remaining-marker, a slot that stays
+    has logged a matching marker after the cursor. FAIL only when every look was complete."""
+    end = time.monotonic() + seconds
+    seen = pattern is None
+    when = "while slot %d leaves" % target
+    while True:
+        left, reasons, complete, info, clients = observe_left(run, target, remaining, fixed, closed_generation,
+                                                              answered, guard, bridge_before, when)
+        if not seen:
+            texts, readable = new_remaining_markers(run, remaining, fixed, cursor)
+            matched = regex_matches(pattern, texts) if texts else False
+            seen = matched is True
+            if not seen:
+                readable = readable and matched is not None
+                reasons["remainingMarker"] = "notSeen" if readable else "notReadable"
+                complete = complete and readable
+        if left and seen and complete:
+            return info, clients
+        if time.monotonic() >= end:
+            detail = ", ".join("%s=%s" % item for item in sorted(reasons.items()))
+            if not complete:
+                raise Stop("UNKNOWN", "leaveNotObserved", detail)
+            raise Stop("FAIL", "remainingMarkerMissing" if left else "targetNotClosed", detail)
+        run.progress("wait", "waiting for slot %d to leave" % target, reasons=reasons)
+        run.wait(POLL_SECONDS)
+
+
+def wait_rejoined(run, target, remaining, fixed, closed_generation, new_generation, guard, bridge_before, seconds):
+    """Until the launched generation is ready in the target slot (joined after its start, not in
+    the error world, logged in) in the instance of the slots that stayed, which stay as fixed."""
+    end = time.monotonic() + seconds
+    instance = fixed[remaining[0]]["instance"]
+    when = "while slot %d rejoins" % target
+    while True:
+        run.check()
+        info = bridge_now(run)
+        if not same_bridge(bridge_before, bridge_identity(info)):
+            raise Stop("UNKNOWN", "bridgeChanged", when)
+        check_guard(info, guard, when)
+        clients = clients_now(run)
+        reasons, complete = {}, list_fresh(clients)
+        if not complete:
+            reasons["observation"] = "stale"
+        for slot in remaining:
+            check_unchanged(entry_of(clients, slot), fixed[slot], slot, when)
+        entry = entry_of(clients, target)
+        generation = entry.get("clientGeneration") if entry else None
+        if entry is None:
+            reasons[str(target)] = "noClient"
+            complete = False
+        elif generation not in (closed_generation, new_generation):
+            raise Stop("UNKNOWN", "unexpectedChange", "slot %d holds generation %s, not the launched %d"
+                       % (target, generation, new_generation))
+        elif generation == closed_generation:
+            reasons[str(target)] = "launchNotListedYet"
+        else:
+            state = slot_state(entry, {"clientGeneration": closed_generation}, "Relaunch")
+            if state[0] == "stop":
+                raise Stop(state[1], state[2], "slot %d after the launch" % target)
+            if state[0] == "wait":
+                reasons[str(target)] = state[1]
+                complete = complete and not state[2]
+            elif state[1]["instance"] != instance:
+                reasons[str(target)] = "otherInstance"
+            elif complete:
+                return state[1], info, clients
+        if time.monotonic() >= end:
+            detail = ", ".join("%s=%s" % item for item in sorted(reasons.items()))
+            raise Stop("FAIL" if complete else "UNKNOWN", "notRejoined", detail)
+        run.progress("wait", "waiting for slot %d to rejoin" % target, reasons=reasons)
+        run.wait(POLL_SECONDS)
+
+
+def previous_markers(run, slot, want):
+    """The closed client's markers, when the Bridge still shows that generation read through;
+    None otherwise (the evidence is then missing and leave-rejoin cannot PASS)."""
+    try:
+        markers = cli_json(run, "log", str(slot), "--markers", "--json", what="markers")
+    except Stop as stop:
+        if stop.reason in ("markersUnavailable", "markersInvalid"):
+            return None
+        raise
+    header = markers.get("header") if isinstance(markers.get("header"), dict) else {}
+    if (header.get("clientGeneration") != want["clientGeneration"]
+            or header.get("observationEpoch") != want["observationEpoch"] or header.get("catchingUp") is not False):
+        return None
+    return markers
+
+
+def phase_folder(run, state, key, name):
+    """evidence/leave-rejoin/<name>/, recorded in run.json's leaveRejoin.evidence."""
+    base = os.path.join(run.directory, "evidence", "leave-rejoin")
+    private_directory(os.path.dirname(base))
+    private_directory(base)
+    folder = os.path.join(base, name)
+    private_directory(folder)
+    state["evidence"][key] = os.path.relpath(folder, run.directory)
+    return folder
+
+
+def leave_rejoin(run, fixed, guard):
+    """r1-automation.md §5.4 steps 1-8, after deploy-collect passed in the same continue."""
+    record = run.record
+    parameters = record["procedure"]["parameters"]
+    target = parameters["targetSlot"]
+    remaining = [slot for slot in record["slots"] if slot != target]
+    state = record["leaveRejoin"] = {"state": "started", "targetSlot": target, "remainingSlots": remaining,
+                                     "remainingMarker": parameters.get("remainingMarker"),
+                                     "clientMayBeLeftClosed": False, "evidence": {}, "evidenceGaps": []}
+    try:
+        word, reason = leave_rejoin_steps(run, state, fixed, guard, target, remaining, parameters)
+    except (Stop, KeyboardInterrupt) as error:
+        record["results"]["leaveRejoin"] = error.result if isinstance(error, Stop) else "CANCELED"
+        state["state"] = "stopped"
+        if state["clientMayBeLeftClosed"]:
+            state["note"] = ("slot %d may be left closed (or a client may have started): check `vrcrt.sh status` and "
+                             "use Close/Launch to go on; nothing was sent again" % target)
+            if isinstance(error, Stop) and error.result != "CANCELED":
+                reread(run, state)  # what the Bridge shows where the procedure stopped
+        raise
+    record["results"]["leaveRejoin"] = word
+    state["state"] = "finished"
+    if reason:
+        record["reason"] = reason
+    return word
+
+
+def leave_rejoin_steps(run, state, fixed, guard, target, remaining, parameters):
+    record = run.record
+    slots = record["slots"]
+    bridge_before = record["bridgeBefore"]
+    pattern = parameters.get("remainingMarker")
+
+    # 1. The feature, the launch plan and every slot as fixed; nothing is sent without them.
+    with step(run, "leaveRejoinPreconditions"):
+        if guard is None:
+            raise Stop("UNKNOWN", "slotPreconditionsUnsupported",
+                       "the Bridge does not take preconditioned close/launch in Relaunch; nothing was sent")
+        info, clients = recheck(run, slots, fixed, bridge_before, "before the close", guard)
+        if target not in ((current_batch(info) or {}).get("launchedSlots") or []):
+            raise Stop("UNKNOWN", "targetNotRelaunchable", "slot %d is not in the Bridge's launch plan; nothing was sent" % target)
+        check_windows_disk(info)
+
+    # 2. Before the close: every slot's markers and full log, then /bridge and /clients once more;
+    # the precondition comes from that /bridge, the marker cursor from those snapshots.
+    with step(run, "snapshotBeforeClose"):
+        folder = phase_folder(run, state, "beforeClose", "before-close")
+        markers = {slot: collect_slot(run, folder, slot, fixed[slot], "beforeClose") for slot in slots}
+        info, clients = recheck(run, slots, fixed, bridge_before, "after the snapshot before the close", guard)
+        save_lists(run, folder, clients, info, "beforeClose")
+        cursor = {}
+        for slot in remaining:
+            if (markers[slot].get("header") or {}).get("catchingUp") is not False:
+                raise Stop("UNKNOWN", "observationIncomplete", "slot %d markers before the close" % slot)
+            through = (entry_of(clients, slot) or {}).get("observedThroughSeq")
+            cursor[slot] = max(marker_cut(markers[slot]), through if is_count(through) else 0)
+        state["markerCursor"] = {str(slot): seq for slot, seq in cursor.items()}
+        closed_generation = fixed[target]["clientGeneration"]
+        expect = expect_from(info, closed_generation)
+
+    # 3. Close, once.
+    answer, answered = send_slot_operation(run, state, "close", target, expect)
+    state["closedGeneration"] = closed_generation
+    guard = dict(guard, operationRevision=answer["operationRevision"])
+
+    # 4. The target has left; the others stay; the caller's marker, if any, on a slot that stays.
+    with step(run, "waitTargetLeft"):
+        info, clients = wait_left(run, target, remaining, fixed, closed_generation, answered, guard, bridge_before,
+                                  pattern, cursor, procedure_seconds(parameters, "leaveWaitSeconds", LEAVE_SECONDS))
+
+    # 5. After the close: the others' markers, the closed client's last markers, the lists.
+    with step(run, "snapshotAfterClose"):
+        folder = phase_folder(run, state, "afterClose", "after-close")
+        for slot in remaining:
+            markers = cli_json(run, "log", str(slot), "--markers", "--json", what="markers")
+            header = markers.get("header") if isinstance(markers.get("header"), dict) else {}
+            if (header.get("clientGeneration") != fixed[slot]["clientGeneration"]
+                    or header.get("observationEpoch") != fixed[slot]["observationEpoch"]):
+                raise Stop("UNKNOWN", "markersChanged", "slot %d after the close" % slot)
+            save_markers(run, folder, slot, fixed[slot], markers, "afterClose")
+        previous = previous_markers(run, target, fixed[target])
+        if previous is None:
+            state["evidenceGaps"].append("slot %d: the closed client's markers after the close" % target)
+        else:
+            save_markers(run, folder, target, fixed[target], previous, "afterClose")
+        save_lists(run, folder, clients, info, "afterClose")
+
+    # 6. Launch, once, from what the Bridge shows right now.
+    with step(run, "checkBeforeLaunch"):
+        left, reasons, complete, info, clients = observe_left(run, target, remaining, fixed, closed_generation, answered,
+                                                              guard, bridge_before, "before the launch")
+        if not (left and complete):
+            raise Stop("UNKNOWN", "observationIncomplete" if not complete else "unexpectedChange",
+                       "before the launch: " + ", ".join("%s=%s" % item for item in sorted(reasons.items())))
+        expect = expect_from(info, closed_generation)
+    answer, _ = send_slot_operation(run, state, "launch", target, expect)
+    new_generation = answer["clientGeneration"]
+    state["newGeneration"] = new_generation
+    guard = dict(guard, operationRevision=answer["operationRevision"])
+
+    # 7. The new generation ready in the same instance (and showing this build's tag, when it did).
+    with step(run, "waitTargetRejoined"):
+        rejoined, info, clients = wait_rejoined(run, target, remaining, fixed, closed_generation, new_generation, guard,
+                                                bridge_before, procedure_seconds(parameters, "rejoinWaitSeconds", REJOIN_SECONDS))
+    final = dict(fixed)
+    final[target] = rejoined
+    state["rejoined"] = rejoined
+    match = None
+    if record["results"].get("worldBuildMatch") == "PASS":
+        with step(run, "waitWorldBuildRejoined") as operation:
+            wait = parameters.get("worldBuildWaitSeconds", TAG_SECONDS)
+            if isinstance(wait, bool) or not isinstance(wait, (int, float)) or not 0 <= wait <= MAX_TAG_WAIT:
+                wait = TAG_SECONDS
+            match, why = wait_world_build(run, [target], final, record.get("effectiveWorldBuildTag"), wait)
+            state["worldBuildMatch"] = match
+            run.end(operation, match, why)
+
+    # 8. The new generation's evidence apart from the earlier ones, then every slot once more.
+    with step(run, "recheckRejoined"):
+        info, clients = recheck(run, record["slots"], final, bridge_before, "after the rejoin", guard)
+        check_windows_disk(info)
+    with step(run, "snapshotAfterRejoin"):
+        folder = phase_folder(run, state, "afterRejoin", "after-rejoin")
+        for slot in slots:
+            collect_slot(run, folder, slot, final[slot], "afterRejoin")
+        save_lists(run, folder, clients_now(run), bridge_now(run), "afterRejoin")
+    with step(run, "leaveRejoinFinalCheck"):
+        recheck(run, slots, final, bridge_before, "at the end of leave-rejoin", guard)
+    if match == "FAIL":
+        return "FAIL", "otherBuildTagAfterRejoin"
+    if match == "UNKNOWN":
+        return "UNKNOWN", "buildTagAfterRejoinUnknown"
+    if state["evidenceGaps"]:
+        return "UNKNOWN", "evidenceIncomplete"
+    return "PASS", None
 
 
 def recover(directory):
@@ -1417,8 +2108,18 @@ def main(argv):
     signal.signal(signal.SIGINT, interrupt)
     parser = argparse.ArgumentParser(prog="vrcrt_runner.py", description=__doc__.split("\n")[0])
     sub = parser.add_subparsers(dest="command", required=True)
+
+    def procedure_arguments(p):
+        p.add_argument("--procedure", choices=PROCEDURES, default="deploy-collect")
+        p.add_argument("--target-slot", type=int, help="leave-rejoin: the declared slot to close and launch again")
+        p.add_argument("--remaining-marker", help="leave-rejoin: a regular expression a slot that stays must log "
+                                                  "after the close (optional)")
+        p.add_argument("--unvalidated", action="store_true",
+                       help="run a procedure that has not been validated on real clients yet")
+
     p = sub.add_parser("prepare")
     p.add_argument("--slots", required=True)
+    procedure_arguments(p)
     p.add_argument("--expect-clients", nargs="*")
     p.add_argument("--world-build-wait", type=int, help="seconds to wait for the build tag (0-600, default 120; 0 looks once)")
     p.add_argument("--owner-pid", type=int)
@@ -1433,6 +2134,7 @@ def main(argv):
     p.add_argument("--project", required=True)
     p.add_argument("--scene", required=True)
     p.add_argument("--slots", required=True)
+    procedure_arguments(p)
     p.add_argument("--expect-clients", nargs="*")
     p.add_argument("--world-build-wait", type=int, help="seconds to wait for the build tag (0-600, default 120; 0 looks once)")
     p.add_argument("--unity")

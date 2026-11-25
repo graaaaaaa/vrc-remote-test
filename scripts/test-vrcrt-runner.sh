@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Checks package/Tools~/vrcrt_runner.py with a stand-in for vrcrt.sh: a small program that
-# answers status, bridge, cursor, log --markers --json and export-log from files under
-# $VRCRT_FIXTURE_DIR/fake, which each check writes. Run from anywhere: bash scripts/test-vrcrt-runner.sh
+# answers status, bridge, cursor, log --markers --json, export-log, close-client and
+# launch-client from files under $VRCRT_FIXTURE_DIR/fake, which each check writes, and logs every
+# call. Run from anywhere: bash scripts/test-vrcrt-runner.sh
 set -u
 
 here="$(CDPATH= cd -P -- "$(dirname -- "$0")" && pwd)"
@@ -13,6 +14,8 @@ export VRCRT_RUNNER_TEST_CLI="$work/fake-cli.sh"
 export VRCRT_RUNNER_TEST_POLL=0.05
 export VRCRT_RUNNER_TEST_READY=2
 export VRCRT_RUNNER_TEST_TAG=1
+export VRCRT_RUNNER_TEST_LEAVE=2
+export VRCRT_RUNNER_TEST_REJOIN=2
 export VRCRT_BRIDGE_URL="https://192.0.2.1:38443"
 export VRCRT_CERT_SHA256="$(printf 'a%.0s' $(seq 64))"
 fake="$VRCRT_FIXTURE_DIR/fake"
@@ -31,22 +34,45 @@ with open(os.path.join(d, "calls.log"), "a") as log:
     log.write(" ".join(args) + "\n")
 with open(os.path.join(d, "env.log"), "a") as log:
     log.write(json.dumps(dict(os.environ)) + "\n")
-def answer(name):
+opid = args[args.index("--operation-id") + 1] if "--operation-id" in args else ""
+def fill(data):
+    return data.replace("__NOW__", datetime.now(timezone.utc).isoformat()).replace("__OPID__", opid)
+# answer(name[, then]): prints the file (SLEEP s / EXIT n first lines: wait, or exit n with the
+# first line on stderr and the rest on stdout); `then`, when it exists, replaces the file afterwards.
+def answer(name, then=None):
     path = os.path.join(d, name)
     if not os.path.exists(path):
         sys.stderr.write("fake: no " + name + "\n"); sys.exit(3)
     data = open(path).read()
+    if then and os.path.exists(os.path.join(d, then)):
+        os.replace(os.path.join(d, then), path)
     if data.startswith("SLEEP "):
         time.sleep(float(data.split()[1])); data = data.split("\n", 1)[1]
     if data.startswith("EXIT "):
-        sys.stderr.write(data); sys.exit(int(data.split()[1]))
-    sys.stdout.write(data.replace("__NOW__", datetime.now(timezone.utc).isoformat()))
+        first, _, rest = data.partition("\n")
+        sys.stderr.write(first + "\n"); sys.stdout.write(fill(rest)); sys.exit(int(first.split()[1]))
+    sys.stdout.write(fill(data))
     sys.exit(0)
 command = args[0]
 if command == "status":
     answer("clients.json")
 elif command == "bridge":
-    answer("bridge.json")
+    # A third answer: once bridge-then.json is used up, bridge-later.json becomes the next one.
+    later, then = os.path.join(d, "bridge-later.json"), os.path.join(d, "bridge-then.json")
+    if os.path.exists(later) and not os.path.exists(then):
+        os.replace(later, then)
+    answer("bridge.json", "bridge-then.json")
+elif command in ("close-client", "launch-client"):
+    # Keeps what --expect named, moves the staged <name>-after-<kind>.json files in, then answers <kind>.json.
+    kind = command.split("-")[0]
+    if "--expect" in args:
+        with open(args[args.index("--expect") + 1][1:]) as source, open(os.path.join(d, "expect-%s.seen" % kind), "w") as out:
+            out.write(source.read())
+    for name in ("clients", "bridge", "markers-0", "markers-1"):
+        staged = os.path.join(d, "%s-after-%s.json" % (name, kind))
+        if os.path.exists(staged):
+            os.replace(staged, os.path.join(d, name + ".json"))
+    answer(kind + ".json")
 elif command == "cursor":
     answer("cursor.json")
 elif command == "log":
@@ -63,33 +89,38 @@ FAKE
 printf '#!/usr/bin/env bash\nexec python3 -I "%s" "$@"\n' "$work/fake.py" > "$work/fake-cli.sh"
 
 # bridge <processStartedAtUtc> [freeDiskBytes] [mode]
+# FEATURE=1 adds the 0.12 fields (slotPreconditions.v1): bridgeInstanceId, operationRevision REV
+# (default 17) and currentBatch with buildId BATCH; BRIDGE_OUT names another file to write.
 bridge() {
     {
         printf '{"version":"0.11.0","exeSha256":"%s","processStartedAtUtc":"%s","hostGeneration":2,"activeConfigEtag":"e1","savedConfigEtag":"e1",' \
             "$(printf 'b%.0s' $(seq 64))" "${1:-2026-11-26T00:00:00+00:00}"
+        [ -n "${FEATURE:-}" ] && printf '"bridgeInstanceId":"%s","operationRevision":%s,"currentBatch":{"buildId":"%s","launchedSlots":[0,1]},' \
+            "$instance_id" "${REV:-17}" "${BATCH:-20261126T000001000Z-33334444}"
         printf '"activeConfig":{"VrchatClientMode":"%s","VrchatProfiles":[0,1],"VrchatMode":"Desktop"},"freeDiskBytes":%s,"stateExportsBytes":1024}' \
             "${3:-${BRIDGE_MODE:-Relaunch}}" "${2:-53687091200}"
-    } > "$fake/bridge.json"
+    } > "$fake/${BRIDGE_OUT:-bridge.json}"
 }
+instance_id=0123456789abcdef0123456789abcdef
 # client <slot> <generation> <epoch> <joinedSeq> <state> <inErrorWorld> <loginState> [instance]
 # JOIN_ATTEMPT=<seq> adds joinAttemptSeq (the join's Joining line); without it the field is absent.
 client() {
-    printf '{"slot":%s,"clientGeneration":%s,"observationEpoch":%s,"processId":%s,"running":true,"profile":%s,"state":"%s",' \
-        "$1" "$2" "$3" "$((100 + $1))" "$1" "$5"
+    printf '{"slot":%s,"clientGeneration":%s,"observationEpoch":%s,"processId":%s,"running":%s,"profile":%s,"state":"%s",' \
+        "$1" "$2" "$3" "$((100 + $1))" "${RUNNING:-true}" "$1" "$5"
     [ -n "${JOIN_ATTEMPT:-}" ] && printf '"joinAttemptSeq":%s,' "$JOIN_ATTEMPT"
     printf '"instance":"%s","inErrorWorld":%s,"loggingLevel":"full","logStatus":"shown","loginState":"%s","joinedSeq":%s,"observedThroughSeq":50,"catchingUp":false}' \
         "${8:-local:inst}" "$6" "$7" "$4"
 }
 # clients <updatedAtUtc> <entry> <entry>
 clients() {
-    printf '{"schemaVersion":1,"processListReadable":true,"clients":[%s,%s],"updatedAtUtc":"%s"}' "$2" "$3" "$1" > "$fake/clients.json"
+    printf '{"schemaVersion":1,"processListReadable":true,"clients":[%s,%s],"updatedAtUtc":"%s"}' "$2" "$3" "$1" > "$fake/${CLIENTS_OUT:-clients.json}"
 }
 cursor() { printf '{"schemaVersion":1,"slots":{"0":{"clientGeneration":11,"observationEpoch":%s,"seq":%s,"running":true},"1":{"clientGeneration":22,"observationEpoch":6,"seq":50,"running":true}}}' \
     "${CURSOR_EPOCH0:-5}" "${CURSOR_SEQ0:-50}" > "$fake/cursor.json"; }
 # markers <slot> <generation> <epoch> <records JSON> [droppedThroughSeq]
 markers() {
     printf '{"schemaVersion":1,"slot":%s,"header":{"clientGeneration":%s,"observationEpoch":%s,"catchingUp":false,"droppedThroughSeq":%s},"records":%s}' \
-        "$1" "$2" "$3" "${5:-0}" "$4" > "$fake/markers-$1.json"
+        "$1" "$2" "$3" "${5:-0}" "$4" > "$fake/${MARKERS_OUT:-markers-$1.json}"
 }
 tagged() { printf '[{"seq":5,"text":"2026.11.26 00:00:00 Debug - [VRCRT] PRT001 vrcrt.build=%s ev=LOAD","truncated":%s,"withheld":false}]' "$1" "${2:-false}"; }
 
@@ -114,7 +145,8 @@ print(v)' "$1" "$2"; }
 root="$work/root"
 # prepare_run [extra prepare args...]: sets $run and $token
 prepare_run() {
-    rm -f "$root"/locks/*.json
+    rm -f "$root"/locks/*.json "$fake"/*-after-*.json "$fake"/bridge-then.json "$fake"/bridge-later.json "$fake"/close.json "$fake"/launch.json \
+        "$fake"/expect-*.seen
     bridge; before_clients; cursor
     local line
     line="$(python3 -I "$runner" prepare --slots 0,1 --owner-pid $$ --run-root "$root" "$@")" || return $?
@@ -445,6 +477,164 @@ PY
 python3 -I "$runner" continue --run "$run" --claim-token 0123456789abcdef0123456789abcdef > "$work/out" 2>&1
 [ $? -eq 2 ] && grep -q "no claim key" "$work/out" && pass "continue refuses a run without its claim key" \
     || { fail "continue refuses a run without its claim key"; cat "$work/out"; }
+
+# --- deploy-collect on a Bridge with slotPreconditions.v1 (R1b)
+FEATURE=1 prepare_run; ready_clients "$tag"; deploy_result "$run" PASS PASS null "\"$tag\""
+check "with the feature, the deploy's launch plan and an unmoved revision pass" 0 result PASS
+[ "$(field "$run/run.json" guard.operationRevision)" = 17 ] && pass "the revision after the deploy is recorded" \
+    || fail "the revision after the deploy is recorded"
+FEATURE=1 prepare_run; ready_clients "$tag"; deploy_result "$run" PASS PASS null "\"$tag\""
+FEATURE=1 BATCH=20261126T000002000Z-55556666 bridge
+check "with the feature, another deploy's launch plan is UNKNOWN" 3 reason batchChanged
+FEATURE=1 prepare_run; ready_clients "$tag"; deploy_result "$run" PASS PASS null "\"$tag\""
+FEATURE=1 REV=18 BRIDGE_OUT=bridge-then.json bridge
+check "with the feature, the deploy's own last revision move is not a change" 0 result PASS
+[ "$(field "$run/run.json" guard.operationRevision)" = 18 ] && pass "the revision is taken when the clients are ready" \
+    || fail "the revision is taken when the clients are ready"
+FEATURE=1 prepare_run; ready_clients "$tag"; deploy_result "$run" PASS PASS null "\"$tag\""
+FEATURE=1 BRIDGE_OUT=bridge-then.json bridge
+FEATURE=1 REV=18 BRIDGE_OUT=bridge-later.json bridge
+check "with the feature, a revision that moves after the clients are ready is UNKNOWN" 3 reason revisionChanged
+BRIDGE_MODE=Reload FEATURE=1 prepare_run; deploy_result "$run" PASS PASS null null
+BRIDGE_MODE=Reload FEATURE=1 BATCH=20261126T000002000Z-55556666 bridge
+clients "__NOW__" "$(client 0 11 5 60 joined false authenticated)" "$(client 1 22 6 60 joined false authenticated)"
+markers 0 11 5 "[]"; markers 1 22 6 "[]"
+check "Reload with the feature keeps R1a's checks" 0 results.clientReadiness PASS
+
+# --- leave-rejoin (R1b)
+rm -f "$root"/locks/*.json
+bridge; before_clients; cursor
+python3 -I "$runner" prepare --slots 0,1 --procedure leave-rejoin --target-slot 1 --owner-pid $$ --run-root "$root" > "$work/out" 2>&1
+[ $? -eq 2 ] && grep -q -- --unvalidated "$work/out" && pass "leave-rejoin is refused without --unvalidated" \
+    || { fail "leave-rejoin is refused without --unvalidated"; cat "$work/out"; }
+python3 -I "$runner" prepare --slots 0,1 --procedure leave-rejoin --target-slot 2 --unvalidated --owner-pid $$ \
+    --run-root "$root" > "$work/out" 2>&1
+[ $? -eq 2 ] && pass "a target slot outside --slots is refused" || { fail "a target slot outside --slots is refused"; cat "$work/out"; }
+python3 -I "$runner" prepare --slots 0,1 --target-slot 1 --owner-pid $$ --run-root "$root" > "$work/out" 2>&1
+[ $? -eq 2 ] && pass "--target-slot without leave-rejoin is refused" || { fail "--target-slot without leave-rejoin is refused"; cat "$work/out"; }
+python3 -I "$runner" prepare --slots 0,1 --procedure leave-rejoin --target-slot 1 --unvalidated --remaining-marker '(' \
+    --owner-pid $$ --run-root "$root" > "$work/out" 2>&1
+[ $? -eq 2 ] && pass "a --remaining-marker that does not compile is refused" || { fail "a --remaining-marker that does not compile is refused"; cat "$work/out"; }
+: > "$fake/calls.log"
+python3 -I "$runner" prepare --slots 0,1 --procedure leave-rejoin --target-slot 1 --unvalidated --owner-pid $$ \
+    --run-root "$root" > "$work/out" 2>&1
+code=$?
+if [ "$code" -eq 3 ] && grep -q slotPreconditionsUnsupported "$work/out" && ! grep -q -- '-client' "$fake/calls.log"; then
+    pass "a Bridge without the feature gets no close or launch, and the run is UNKNOWN"
+else
+    fail "a Bridge without the feature gets no close or launch (exit $code)"; cat "$work/out"
+fi
+lr_run="$(ls -dt "$root"/runs/*/ | head -1)"
+[ "$(field "$lr_run/run.json" results.leaveRejoin)" = UNKNOWN ] && pass "leave-rejoin not started is UNKNOWN" \
+    || fail "leave-rejoin not started is UNKNOWN"
+
+owner_marker='{"seq":60,"text":"2026.11.26 00:00:00 Debug - [VRCRT] PRT001 ev=OWNER_CHANGED","truncated":%s,"withheld":false}'
+# lr_prepare [prepare args...]: a 0.12 Bridge with both clients ready and tagged, a passing deploy
+# result, and what the Bridge does and answers for the close and the launch of slot 1, staged.
+lr_prepare() {
+    FEATURE=1 prepare_run --procedure leave-rejoin --target-slot 1 --unvalidated "$@" || return $?
+    ready_clients "$tag"; deploy_result "$run" PASS PASS null "\"$tag\""
+    FEATURE=1 REV=18 BRIDGE_OUT=bridge-after-close.json bridge
+    CLIENTS_OUT=clients-after-close.json clients "__NOW__" "$(client 0 111 7 4 joined false authenticated)" \
+        "$(RUNNING=false client 1 222 8 4 joined false authenticated)"
+    MARKERS_OUT=markers-0-after-close.json markers 0 111 7 \
+        "[$(tagged "$tag" | sed 's/^\[//; s/\]$//'),$(printf "$owner_marker" "${CUT:-false}")]"
+    printf '{"slot":1,"processId":101,"closed":1,"notConfirmed":0,"recordUpdated":true,"problems":[],"operationRevision":%s,"bridgeInstanceId":"%s","operationId":"__OPID__","clientGeneration":222}' \
+        "${CLOSE_REV:-18}" "$instance_id" > "$fake/close.json"
+    FEATURE=1 REV=19 BRIDGE_OUT=bridge-after-launch.json bridge
+    CLIENTS_OUT=clients-after-launch.json clients "__NOW__" "$(client 0 111 7 4 joined false authenticated)" \
+        "$(client 1 333 9 4 joined false authenticated)"
+    MARKERS_OUT=markers-1-after-launch.json markers 1 333 9 "$(tagged "$tag")"
+    printf '{"slot":1,"profile":1,"processId":201,"clientGeneration":333,"operationRevision":19,"bridgeInstanceId":"%s","operationId":"__OPID__"}' \
+        "$instance_id" > "$fake/launch.json"
+    : > "$fake/calls.log"
+}
+calls() { grep -c "^$1-client" "$fake/calls.log"; }
+cancel_after_close() {
+    ( for _ in $(seq 400); do grep -q '^close-client' "$fake/calls.log" 2>/dev/null && break; sleep 0.05; done
+      touch "$run/cancel.request" ) &
+}
+
+lr_prepare --remaining-marker 'ev=OWNER_CHANGED'
+check "leave-rejoin passes when the slot leaves and comes back as declared" 0 results.leaveRejoin PASS
+[ "$(field "$run/run.json" result)" = PASS ] && [ "$(field "$run/run.json" leaveRejoin.newGeneration)" = 333 ] \
+    && pass "the run passes with the new generation recorded" || fail "the run passes with the new generation recorded"
+run_id="$(basename "$run")"
+printf 'close-client 1 --expect @%s/expect-close.json --operation-id %s-close --json\nlaunch-client 1 --expect @%s/expect-launch.json --operation-id %s-launch --json\n' \
+    "$run" "$run_id" "$run" "$run_id" > "$work/want-calls"
+if grep -E '^(close|launch)-client' "$fake/calls.log" | cmp -s - "$work/want-calls"; then
+    pass "exactly one close, then one launch, each with its expect file and operation ID"
+else
+    fail "exactly one close, then one launch, each with its expect file and operation ID"; grep -- '-client' "$fake/calls.log"
+fi
+python3 -I - "$fake/expect-close.seen" "$fake/expect-launch.seen" "$instance_id" <<'PY' && pass "the expect files state the Bridge and generations read before each request" || fail "the expect files state the Bridge and generations read before each request"
+import json, sys
+base = {"bridgeInstanceId": sys.argv[3], "hostGeneration": 2, "activeConfigEtag": "e1", "savedConfigEtag": "e1",
+        "buildId": "20261126T000001000Z-33334444", "clientGeneration": 222}
+close, launch = json.load(open(sys.argv[1])), json.load(open(sys.argv[2]))
+sys.exit(0 if close == dict(base, operationRevision=17) and launch == dict(base, operationRevision=18) else 1)
+PY
+cmp -s "$fake/expect-close.seen" "$run/expect-close.json" && [ "$(stat -f %Lp "$run/expect-close.json")" = "600" ] \
+    && pass "the expect file is the run's own, owner-only" || fail "the expect file is the run's own, owner-only"
+ls "$run"/evidence/leave-rejoin/before-close/slot-1/g222-e8/vrchat-slot-1-*.log > /dev/null 2>&1 \
+    && [ -f "$run/evidence/leave-rejoin/after-close/slot-0/g111-e7/markers.json" ] \
+    && [ -f "$run/evidence/leave-rejoin/after-close/slot-1/g222-e8/markers.json" ] \
+    && ls "$run"/evidence/leave-rejoin/after-rejoin/slot-1/g333-e9/vrchat-slot-1-*.log > /dev/null 2>&1 \
+    && [ -f "$run/evidence/slot-1/g222-e8/markers.json" ] \
+    && pass "evidence before the close, after it and of the new generation is kept apart" \
+    || fail "evidence before the close, after it and of the new generation is kept apart"
+
+CUT=true lr_prepare --remaining-marker 'ev=OWNER_CHANGED'
+check "a cut marker line does not satisfy --remaining-marker" 1 reason remainingMarkerMissing
+[ "$(field "$run/run.json" results.leaveRejoin)" = FAIL ] && [ "$(calls launch)" = 0 ] \
+    && [ "$(field "$run/run.json" leaveRejoin.clientMayBeLeftClosed)" = True ] \
+    && pass "a missing marker fails leave-rejoin and records the client left closed" \
+    || fail "a missing marker fails leave-rejoin and records the client left closed"
+
+lr_prepare
+rm -f "$fake"/*-after-close.json
+printf 'EXIT 1\n{"error":"preconditionFailed","mismatched":["operationRevision"],"current":{"operationRevision":18,"clientGeneration":null},"operationId":"__OPID__"}' > "$fake/close.json"
+check "a 412 for the close is UNKNOWN" 3 reason closePreconditionFailed
+[ "$(calls close)" = 1 ] && [ "$(calls launch)" = 0 ] && [ "$(field "$run/run.json" leaveRejoin.close.answer.mismatched)" = "['operationRevision']" ] \
+    && [ "$(field "$run/run.json" leaveRejoin.close.reread.bridge.operationRevision)" = 17 ] \
+    && pass "after a 412 nothing is sent again and the Bridge is read again into run.json" \
+    || fail "after a 412 nothing is sent again and the Bridge is read again into run.json"
+
+CLOSE_REV=19 lr_prepare
+check "a close answer whose revision is not expect + 1 is UNKNOWN" 3 reason closeAnswerUnexpected
+[ "$(calls close)" = 1 ] && [ "$(calls launch)" = 0 ] && pass "an unexpected close answer launches nothing" \
+    || fail "an unexpected close answer launches nothing"
+
+lr_prepare
+CLIENTS_OUT=clients-after-close.json clients "__NOW__" "$(client 0 111 7 5 joined false authenticated)" \
+    "$(RUNNING=false client 1 222 8 4 joined false authenticated)"
+check "a slot that stays but joins again during the wait is UNKNOWN" 3 reason unexpectedChange
+[ "$(calls launch)" = 0 ] && [ "$(field "$run/run.json" leaveRejoin.reread.clients.processListReadable)" = True ] \
+    && pass "a change while waiting launches nothing and the lists are read again into run.json" \
+    || fail "a change while waiting launches nothing and the lists are read again into run.json"
+
+lr_prepare
+printf 'EXIT 3\n' > "$fake/launch.json"
+check "a launch whose outcome is unknown is UNKNOWN" 3 reason launchUnavailable
+[ "$(calls close)" = 1 ] && [ "$(calls launch)" = 1 ] && grep -q "may be left closed" "$run/run.json" \
+    && pass "the launch is not sent again and the run says the client may be left closed" \
+    || fail "the launch is not sent again and the run says the client may be left closed"
+
+lr_prepare
+rm -f "$fake"/clients-after-close.json
+cancel_after_close
+VRCRT_RUNNER_TEST_LEAVE=10 check "a cancel while the slot leaves is CANCELED" 4 results.leaveRejoin CANCELED
+[ "$(calls launch)" = 0 ] && pass "a cancel launches nothing" || fail "a cancel launches nothing"
+
+lr_prepare
+printf 'SLEEP 30\n%s' "$(cat "$fake/close.json")" > "$fake/close.json"
+cancel_after_close
+start=$(python3 -I -c 'import time; print(time.monotonic())')
+check "a cancel during the close is CANCELED" 4 reason closeCanceled
+elapsed=$(python3 -I -c "import time; print(int(time.monotonic() - $start))")
+[ "$(calls close)" = 1 ] && [ "$(calls launch)" = 0 ] && [ "$(field "$run/run.json" leaveRejoin.close.outcome)" = unknown ] \
+    && [ "$elapsed" -lt 15 ] && pass "the close's outcome is recorded as unknown and nothing is sent again" \
+    || fail "the close's outcome is recorded as unknown and nothing is sent again (${elapsed} s)"
 
 if [ "$failures" -eq 0 ]; then
     echo "all checks passed"

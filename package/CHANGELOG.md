@@ -1,8 +1,24 @@
 # Changelog
 
-## [Unreleased]
+## [Unreleased] (planned as 0.12.0)
 
-Two small changes found in the Windows check of 0.11.0. The Bridge has no changes.
+R1b (`docs/plans/r1-automation.md` §5, contract `docs/plans/r1b-contract.md`): a single-client close or launch can carry a precondition, so one prepared from an earlier view does nothing if the Bridge or the client changed since; the runner gains the leave-and-rejoin procedure on top of it. **Update both the Unity package and the Windows Bridge.** Not tagged until it is checked on Windows (`docs/validation/slot-preconditions.md`); until then leave-rejoin runs only with `--unvalidated`. Also two small changes found in the Windows check of 0.11.0.
+
+### Added (Bridge)
+
+- `GET /api/v1/bridge` adds `bridgeInstanceId` (random per process), `operationRevision` (moves on every deploy, close or launch attempt, configuration write and host start; never on a refusal) and `currentBatch` (`buildId` and `launchedSlots` of the Relaunch batch). `GET /api/v1/capabilities` adds `features: ["slotPreconditions.v1"]`; `apiVersion` stays 1.
+- `POST /api/v1/clients/{slot}/close` and `/launch` take an optional JSON body `{"expect": {...}, "operationId": "..."}`. An empty body is the old request. Anything but exactly the contract's shape is 400 `invalidPrecondition` (never read as no body). Inside the operation gate the Bridge compares the process, host, configuration, revision and batch, then the slot's client generation; a difference is 412 `preconditionFailed` and nothing is done. Answers add `operationRevision`, `bridgeInstanceId`, `operationId` and, for close, the closed `clientGeneration`.
+- The Bridge deletes its own log exports (`state\exports`) a day after writing them, at start and hourly.
+
+### Added (Unity)
+
+- With a Bridge that reports `slotPreconditions.v1`, Close and Launch in the clients table carry the row's client generation and a recent `/bridge` read as a precondition; a 412 says the list changed and asks to refresh (never retried). Without the feature, as in 0.11.
+
+### Added (Mac scripts)
+
+- `vrcrt.sh close-client`/`launch-client` take `--expect @FILE`, `--operation-id` and `--json`: exit 1 on a failed precondition, 2 on a malformed one (nothing sent), 3 when the Bridge does not support it (nothing sent). Without `--expect` nothing changes.
+- `vrcrt_runner.py --procedure leave-rejoin --target-slot N --unvalidated [--remaining-marker REGEX]`: after deploy-collect, closes the target slot with a precondition, waits until it is gone and the other slots are unchanged, launches it again with a precondition, and waits until it is ready in the same instance (and shows the build tag, when the world logs one). Nothing is ever resent; any surprise stops UNKNOWN, recording that the client may be left closed. Evidence before the close, after it and after the rejoin is kept apart.
+- deploy-collect on a Bridge with the feature in Relaunch also checks that the launch plan is this deploy's and that nothing else happened on the Bridge after the clients were ready.
 
 ### Changed (Unity)
 

@@ -65,6 +65,7 @@ Windows Bridge の実行体（`VRCRemoteTest.Bridge.exe`）は、[Releases](http
 | `scripts/vrcrt.sh close-clients` | Bridge が起動した VRChat を閉じる。閉じたと確かめられない台が残れば終了コード 1 |
 | `scripts/vrcrt.sh close-client <slot>` | Bridge 0.10.0 以降、Relaunch: その slot の台だけを閉じる。ほかの台はそのまま。閉じたと確かめられないか記録を直せなければ終了コード 1。答えを最大45秒待ち、答えが無ければ終了コード 3 |
 | `scripts/vrcrt.sh launch-client <slot>` | Bridge 0.10.0 以降、Relaunch: その slot の台を、最後の配置と同じ profile・ワールド・インスタンスで起動し直す。動いていれば断る。Bridge の答えを最大90秒待ち、答えが無ければ終了コード 3（起動したかは `status --json` で確かめる） |
+| `scripts/vrcrt.sh close-client <slot> --expect @FILE [--operation-id ID] [--json]`（`launch-client` も同じ） | Bridge 0.12.0 以降: FILE の前提（`docs/plans/r1b-contract.md` の §1.3 の7つの値）が今の Bridge と台に合うときだけ閉じる・起動する。合わなければ Bridge は何もせず終了コード 1。前提の形の誤りは 2（何も送らない）、Bridge が前提に対応していなければ 3（何も送らない）。`--json` は答えの JSON を出す |
 | `scripts/vrcrt.sh profiles` | profile ごとに、最後にログインしたアカウント |
 | `scripts/vrcrt.sh bridge --json` | 0.11.0 以降: Bridge の `GET /api/v1/bridge` を JSON で（版、実行体の SHA-256、プロセスの起動時刻、host の世代、設定の etag、空き容量） |
 | `scripts/vrcrt.sh log <slot> --markers --json` | 0.11.0 以降: マーカーのヘッダー（世代・epoch・catchingUp・捨てた seq）と各行を JSON で。Bridge が切った行と伏せた行に印を付ける |
