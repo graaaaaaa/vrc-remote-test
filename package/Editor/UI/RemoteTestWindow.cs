@@ -85,7 +85,6 @@ namespace VRCRemoteTest
         private VrchatClients _bridgeClients;
         private double _lastBridgeSectionRead = double.NegativeInfinity;
         [NonSerialized] private double _lastBridgeRepaintTime = double.NegativeInfinity;
-        private static string _packageVersion;
 
         // Longer than ClientLogView.StaleAfter: the Slot rows come and go with the list, and
         // every change moves the controls below them, so a list a few reads late still shows.
@@ -703,19 +702,7 @@ namespace VRCRemoteTest
             }
         }
 
-        private static string PackageVersion
-        {
-            get
-            {
-                if (_packageVersion == null)
-                {
-                    var info = UnityEditor.PackageManager.PackageInfo.FindForAssembly(typeof(RemoteTestWindow).Assembly);
-                    _packageVersion = info?.version ?? string.Empty;
-                }
-
-                return _packageVersion;
-            }
-        }
+        private static string PackageVersion => PackageVersionInfo.Current;
 
         /// <summary>"0.8.0+abc123" and "v0.8.0" are both "0.8.0"; null for no version.</summary>
         internal static string CoreVersion(string version)

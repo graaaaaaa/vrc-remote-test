@@ -27,13 +27,16 @@ namespace VRCRemoteTest.Tests
         /// </summary>
         public Queue<BuildResult> ResultQueue { get; } = new Queue<BuildResult>();
 
+        /// <summary>Replaces the upload, e.g. to fail it the way LanRemoteTransport does.</summary>
+        public Func<CancellationToken, Task> UploadHandler { get; set; }
+
         public Task UploadBuildAsync(
             BuildArtifact artifact, BuildManifest manifest, string buildId,
             CancellationToken cancellationToken = default)
         {
             UploadCalled = true;
             LastUploadedBuildId = buildId;
-            return Task.CompletedTask;
+            return UploadHandler != null ? UploadHandler(cancellationToken) : Task.CompletedTask;
         }
 
         public Task<BuildResult> PollResultAsync(string buildId, CancellationToken cancellationToken = default)

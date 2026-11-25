@@ -16,9 +16,13 @@ namespace VRCRemoteTest.Tests
         /// </summary>
         public Task<string> BuildTaskOverride { get; set; }
 
+        /// <summary>Runs inside BuildWindowsWorldAsync, as a project's build preprocessing would.</summary>
+        public System.Action DuringBuild { get; set; }
+
         public Task<string> BuildWindowsWorldAsync()
         {
             BuildCallCount++;
+            DuringBuild?.Invoke();
 
             if (ThrowOnBuild != null)
             {
