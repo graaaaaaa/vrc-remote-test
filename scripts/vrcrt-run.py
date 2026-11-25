@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""Build a saved Unity scene, deploy it, and collect Bridge evidence without UI clicks."""
+"""Build a saved Unity scene, deploy it, and collect Bridge evidence without UI clicks.
+
+Kept as it was for existing callers: success means the build was deployed (a client without
+--watch-worlds only gets a warning), --expect-marker is checked only when given, and every
+running client's log is exported. For the stricter procedure (declared slots, readiness, world
+build match, run.json) use package/Tools~/vrcrt_runner.py run.
+"""
 
 import argparse
 import json
@@ -11,14 +17,53 @@ import sys
 
 
 def run_cli(cli, environment, *args):
-    result = subprocess.run([str(cli), *args], env=environment, text=True, capture_output=True)
+    result = subprocess.run(["/bin/bash", str(cli), *args], env=environment, text=True, capture_output=True)
     if result.returncode:
         raise RuntimeError("vrcrt.sh %s failed: %s" % (" ".join(args), result.stderr.strip()))
     return result.stdout
 
 
+def refused_output(path):
+    """Raw evidence never goes into a Git work tree or iCloud Drive / a cloud folder."""
+    existing = path
+    while not existing.exists() and existing != existing.parent:
+        existing = existing.parent
+    real = existing.resolve()
+    home = Path.home().resolve()
+    for synced in (home / "Library" / "Mobile Documents", home / "Library" / "CloudStorage"):
+        if real == synced or synced in real.parents:
+            return "inside %s" % synced
+    for folder in [real, *real.parents]:
+        if (folder / ".git").exists():
+            return "inside the Git work tree %s" % folder
+    return None
+
+
+def build_id_from(editor_log):
+    """The build ID of the deploy result Unity saved, or, from a package before v0.11.0, the
+    build ID it logged (with a warning). None when neither is there exactly once."""
+    text = editor_log.read_text(encoding="utf-8", errors="replace")
+    paths = re.findall(r"\[VRC Remote Test\] Deploy result: (/\S+\.json)", text)
+    if len(paths) == 1:
+        try:
+            with open(paths[0], encoding="utf-8") as stream:
+                result = json.load(stream)
+        except (OSError, ValueError):
+            result = None
+        if (isinstance(result, dict) and result.get("schema") == "vrcrt.deploy-result"
+                and isinstance(result.get("buildId"), str) and re.fullmatch(r"[0-9A-Za-z_-]{1,128}", result["buildId"])):
+            return result["buildId"]
+    build_ids = re.findall(r"\[VRC Remote Test\] Upload complete\. Build ID: ([0-9A-Za-z_-]+)", text)
+    if len(build_ids) != 1:
+        return None
+    if not paths:
+        print("warning: this Unity package saves no deploy result (before v0.11.0); the build ID was read from the log",
+              file=sys.stderr)
+    return build_ids[0]
+
+
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument("--project", type=Path, required=True, help="Unity project directory (close its interactive Editor first)")
     parser.add_argument("--scene", required=True, help="saved scene path relative to the project, under Assets/")
     parser.add_argument("--output-dir", type=Path, required=True, help="new directory for this run's evidence")
@@ -48,8 +93,14 @@ def main():
         parser.error("set VRCRT_BRIDGE_URL and VRCRT_CERT_SHA256 to the paired Bridge")
 
     output = args.output_dir.expanduser().resolve()
+    where = refused_output(output)
+    if where:
+        parser.error("--output-dir is %s; keep raw evidence outside Git and iCloud "
+                     "(e.g. under ~/Library/Application Support/VRCRemoteTest)" % where)
     output.mkdir(mode=0o700, parents=True, exist_ok=False)
     cli = Path(__file__).with_name("vrcrt.sh")
+    if os.environ.get("VRCRT_FIXTURE_DIR") and os.environ.get("VRCRT_RUNNER_TEST_CLI"):
+        cli = Path(os.environ["VRCRT_RUNNER_TEST_CLI"])  # the script tests only
     environment = dict(os.environ)
     environment["VRC_REMOTE_TEST_BRIDGE_URL"] = url
     environment["VRC_REMOTE_TEST_CERT_SHA256"] = pin
@@ -83,11 +134,9 @@ def main():
             raise RuntimeError("Unity timed out; see %s" % editor_log)
     if completed.returncode:
         raise RuntimeError("Unity exited %d; see %s" % (completed.returncode, editor_log))
-    build_ids = re.findall(r"\[VRC Remote Test\] Upload complete\. Build ID: ([0-9A-Za-z_-]+)",
-                           editor_log.read_text(encoding="utf-8", errors="replace"))
-    if len(build_ids) != 1:
+    build_id = build_id_from(editor_log)
+    if build_id is None:
         raise RuntimeError("Unity did not report exactly one build ID; see %s" % editor_log)
-    build_id = build_ids[0]
     result = run_cli(cli, environment, "result", build_id)
     (output / "build-result.json").write_text(result, encoding="utf-8")
     status = run_cli(cli, environment, "status", "--json")

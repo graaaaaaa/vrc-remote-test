@@ -509,6 +509,12 @@ else
     printf 'skip the local HTTPS checks: openssl could not make a certificate\n'
 fi
 
+# The runner has its own checks; run them here too so one command covers the Mac side.
+printf -- '--- vrcrt_runner.py\n'
+bash "$here/test-vrcrt-runner.sh" || failures=$((failures + 1))
+printf -- '--- vrcrt-run.py\n'
+bash "$here/test-vrcrt-run.sh" || failures=$((failures + 1))
+
 if [ "$failures" -ne 0 ]; then
     printf '%d check(s) failed\n' "$failures"
     exit 1
