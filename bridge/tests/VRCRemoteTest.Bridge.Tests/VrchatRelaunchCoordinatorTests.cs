@@ -469,7 +469,17 @@ public class VrchatRelaunchCoordinatorTests
 
         outcome.ErrorCode.Should().Be(ErrorCode.VrchatStartFailed);
         outcome.ErrorMessage.Should().Contain("Launched 1 of 2").And.Contain("profile 5");
-        _store.Clients.Should().ContainSingle();
+        _store.Clients.Should().ContainSingle();        _launchContext.BatchBuildId.Should().BeNull("a failed batch is no deploy's batch");
+        _launchContext.LaunchedSlots.Should().Equal(0);
+    }
+
+    [Fact]
+    public async Task A_batch_that_starts_every_client_keeps_its_build_id()
+    {
+        await CreateCoordinator(profiles: [0, 1]).LaunchClientsAsync(WorldPath, "20261126T000000000Z-aabbccdd", CancellationToken.None);
+
+        _launchContext.BatchBuildId.Should().Be("20261126T000000000Z-aabbccdd");
+        _launchContext.LaunchedSlots.Should().Equal(0, 1);
     }
 
     [Theory]

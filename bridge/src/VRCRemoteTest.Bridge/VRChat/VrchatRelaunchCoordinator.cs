@@ -265,12 +265,20 @@ public sealed class VrchatRelaunchCoordinator : IVrchatClientCoordinator
     public async Task<VrchatLaunchOutcome> LaunchClientsAsync(
         string deployedWorldPath, string buildId, CancellationToken cancellationToken)
     {
+        var succeeded = false;
         try
         {
-            return await LaunchClientsCoreAsync(deployedWorldPath, buildId, cancellationToken).ConfigureAwait(false);
+            var outcome = await LaunchClientsCoreAsync(deployedWorldPath, buildId, cancellationToken).ConfigureAwait(false);
+            succeeded = outcome.Succeeded;
+            return outcome;
         }
         finally
         {
+            if (!succeeded)
+            {
+                _launchContext.MarkBatchFailed();
+            }
+
             _logNotice.Clear();
         }
     }

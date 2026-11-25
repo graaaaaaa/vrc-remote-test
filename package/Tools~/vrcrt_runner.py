@@ -1300,14 +1300,15 @@ def deploy_collect(run):
         run.end(operation, "UNKNOWN", "bridgeChanged")
         raise Stop("UNKNOWN", "bridgeChanged", "between prepare and the deploy result")
     # R1b: with slotPreconditions.v1 in Relaunch, the launch plan must be this deploy's when the
-    # clients are fixed, and the operation revision read then must not move at any later recheck.
-    # The revision is taken then, not here: the Bridge moves it once more as the deploy ends,
-    # which can be just after Unity has read the result. Without the feature (Bridge 0.11 and
-    # earlier) nothing here changes R1a's procedure.
+    # clients are fixed, and the operation revision read here must not move at any recheck. The
+    # Bridge moves the revision before it writes a deploy's result, so nothing of this deploy
+    # moves it after Unity has read the result. Without the feature (Bridge 0.11 and earlier)
+    # nothing here changes R1a's procedure.
     guard = None
     if identity["slotPreconditions"] and bridge_before.get("mode") == "Relaunch":
-        guard = {"bridgeInstanceId": identity["bridgeInstanceId"], "operationRevision": None,
+        guard = {"bridgeInstanceId": identity["bridgeInstanceId"], "operationRevision": identity["operationRevision"],
                  "buildId": record.get("buildId")}
+        record["guard"] = dict(guard, establishedAtUtc=iso())
     run.end(operation, "PASS")
 
     operation = run.begin("waitClientsReady")
@@ -1327,10 +1328,7 @@ def deploy_collect(run):
             info = bridge_now(run)
             if not same_bridge(bridge_before, bridge_identity(info)):
                 raise Stop("UNKNOWN", "bridgeChanged", "when the clients were ready")
-            revision = info.get("operationRevision")
-            guard["operationRevision"] = revision if isinstance(revision, int) and not isinstance(revision, bool) else -1
             check_guard(info, guard, "when the clients were ready")
-            record["guard"] = dict(guard, establishedAtUtc=iso())
         except Stop as stop:
             results["clientReadiness"] = "UNKNOWN"
             run.end(operation, stop.result, stop.reason, detail=stop.detail)
@@ -1888,15 +1886,22 @@ def leave_rejoin_steps(run, state, fixed, guard, target, remaining, parameters):
     final = dict(fixed)
     final[target] = rejoined
     state["rejoined"] = rejoined
+    # Whenever these bytes carry a tag, the new generation must not show another one (FAIL). It
+    # must show this one only when the first join did (a world that logs no tag stays as it was):
+    # then the wait is the run's; otherwise the markers are looked at once.
     match = None
-    if record["results"].get("worldBuildMatch") == "PASS":
+    tag = record.get("effectiveWorldBuildTag")
+    if tag:
+        shown_before = record["results"].get("worldBuildMatch") == "PASS"
         with step(run, "waitWorldBuildRejoined") as operation:
             wait = parameters.get("worldBuildWaitSeconds", TAG_SECONDS)
             if isinstance(wait, bool) or not isinstance(wait, (int, float)) or not 0 <= wait <= MAX_TAG_WAIT:
                 wait = TAG_SECONDS
-            match, why = wait_world_build(run, [target], final, record.get("effectiveWorldBuildTag"), wait)
+            match, why = wait_world_build(run, [target], final, tag, wait if shown_before else 0)
+            if match == "UNKNOWN" and not shown_before:
+                match, why = None, "noTagBefore"
             state["worldBuildMatch"] = match
-            run.end(operation, match, why)
+            run.end(operation, match or "UNKNOWN", why)
 
     # 8. The new generation's evidence apart from the earlier ones, then every slot once more.
     with step(run, "recheckRejoined"):

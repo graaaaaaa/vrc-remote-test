@@ -48,7 +48,8 @@ public sealed class ExportCleanupService : BackgroundService
     /// <summary>Deletes the exports in <paramref name="directory"/> last written before now minus <see cref="MaxAge"/>; returns how many.</summary>
     internal static int CleanOnce(string directory, DateTime utcNow, ILogger logger)
     {
-        if (!Directory.Exists(directory))
+        // A link or junction in place of the folder is not followed: only files of the Bridge's own folder go.
+        if (!Directory.Exists(directory) || new DirectoryInfo(directory).Attributes.HasFlag(FileAttributes.ReparsePoint))
         {
             return 0;
         }

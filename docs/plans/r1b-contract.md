@@ -23,8 +23,11 @@
 ```
 
 - `bridgeInstanceId`: Bridge のプロセスごとの乱数（128ビット）。再起動すると変わる。
-- `operationRevision`: 0 以上の整数。プロセスのあいだ減らない。Windows で何かが変わった、または変わったかもしれないとき（配備の前後、台を閉じる・起動する試み、設定の書き込み、host の起動）に増える。副作用の前に断った要求では増えない。
-- `currentBatch`: 今の Relaunch の起動の計画。`buildId` は、その計画を作った配備の build ID。計画が無いときは null（Reload の配備、配備の失敗、host の再起動のあと）。`launchedSlots` は、1台ずつ起動し直せる slot。計画が無ければ空の配列。
+- `operationRevision`: 0 以上の整数。プロセスのあいだ減らない。Windows で何かが変わった、または変わったかもしれないときに増える。
+  - 配備: 始める前と、結果を書く**前**（結果を書かずに終わったときは終わりに）。結果を書いたあとは動かさないので、Unity が結果を読んだあとに読んだ値は、その配備のあとの値。
+  - 台を閉じる・起動する試み、設定の書き込み、台を閉じた設定の切り替え、全台の close、host の起動。
+  - 副作用の前に断った要求（何も閉じなかった全台の close や設定の切り替えも）では増えない。
+- `currentBatch`: 今の Relaunch の起動の計画。`buildId` は、その計画を作った配備の build ID。計画が無いとき（Reload の配備、配備の失敗、host の再起動のあと）と、全台を起動できなかったときは null。`launchedSlots` は、1台ずつ起動し直せる slot（全台を起動できなかったときも、起動できた slot は残る）。計画が無ければ空の配列。
 - 既存のフィールドはそのまま（`hostGeneration`、`activeConfigEtag`、`savedConfigEtag`、`processStartedAtUtc` など）。
 
 ### 1.3 `POST /api/v1/clients/{slot}/close` と `/launch` の本文
@@ -153,3 +156,8 @@ vrcrt.sh launch-client <slot> [--expect @FILE] [--operation-id ID] [--json]
 - 本文なしの close／launch の HTTP の状態と、今あるフィールド。
 - v0.11 の Bridge に対する、新しい CLI・runner・Unity の動き: R1a と同じ。
 - `scripts/test-vrcrt.sh`、`test-vrcrt-runner.sh`、`test-vrcrt-run.sh`、Unity の既存の試験は、そのまま通る（足すだけ）。
+
+## 6. 分かっている限界
+
+- leave-rejoin の `--remaining-marker` は、close を送る直前に読んだ位置より後の目印を数える。その位置を読んでから close が届くまでのごく短い間に出た目印も数えうるので、正規表現は退出のときだけ出る目印に当てる。
+- 前提条件は、Bridge と台が一覧を読んだときから変わっていないことを確かめるだけで、認証の代わりではない。トークンが漏れれば、その持ち主は前提なしの close／launch もできる。

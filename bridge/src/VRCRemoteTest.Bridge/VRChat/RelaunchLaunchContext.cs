@@ -69,7 +69,16 @@ public sealed class RelaunchLaunchContext
         }
     }
 
-    /// <summary>The build ID of the current batch (the deploy that launched it); null without one.</summary>
+    /// <summary>The batch did not start every client: its slots can still be launched one at a time, but it is no deploy's batch.</summary>
+    public void MarkBatchFailed()
+    {
+        lock (_gate)
+        {
+            _buildId = null;
+        }
+    }
+
+    /// <summary>The build ID of the current batch (the deploy that launched it); null without one or after a failed batch.</summary>
     public string? BatchBuildId
     {
         get { lock (_gate) return _buildId; }

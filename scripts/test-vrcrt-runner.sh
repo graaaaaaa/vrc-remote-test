@@ -488,9 +488,7 @@ FEATURE=1 BATCH=20261126T000002000Z-55556666 bridge
 check "with the feature, another deploy's launch plan is UNKNOWN" 3 reason batchChanged
 FEATURE=1 prepare_run; ready_clients "$tag"; deploy_result "$run" PASS PASS null "\"$tag\""
 FEATURE=1 REV=18 BRIDGE_OUT=bridge-then.json bridge
-check "with the feature, the deploy's own last revision move is not a change" 0 result PASS
-[ "$(field "$run/run.json" guard.operationRevision)" = 18 ] && pass "the revision is taken when the clients are ready" \
-    || fail "the revision is taken when the clients are ready"
+check "with the feature, a revision that moves while the clients get ready is UNKNOWN" 3 reason revisionChanged
 FEATURE=1 prepare_run; ready_clients "$tag"; deploy_result "$run" PASS PASS null "\"$tag\""
 FEATURE=1 BRIDGE_OUT=bridge-then.json bridge
 FEATURE=1 REV=18 BRIDGE_OUT=bridge-later.json bridge
@@ -584,6 +582,14 @@ ls "$run"/evidence/leave-rejoin/before-close/slot-1/g222-e8/vrchat-slot-1-*.log 
     && pass "evidence before the close, after it and of the new generation is kept apart" \
     || fail "evidence before the close, after it and of the new generation is kept apart"
 
+# The bytes carry a tag the first join did not show: another tag in the new generation still fails,
+# no tag there leaves leave-rejoin as it was.
+lr_prepare; markers 0 111 7 "[]"; markers 1 222 8 "[]"
+MARKERS_OUT=markers-1-after-launch.json markers 1 333 9 "$(tagged OTHERTAG1)"
+check "another tag in the rejoined generation fails, even when the first join showed none" 1 results.leaveRejoin FAIL
+lr_prepare; markers 0 111 7 "[]"; markers 1 222 8 "[]"
+MARKERS_OUT=markers-1-after-launch.json markers 1 333 9 "[]"
+check "no tag in the rejoined generation of a world that showed none is not held against it" 0 results.leaveRejoin PASS
 CUT=true lr_prepare --remaining-marker 'ev=OWNER_CHANGED'
 check "a cut marker line does not satisfy --remaining-marker" 1 reason remainingMarkerMissing
 [ "$(field "$run/run.json" results.leaveRejoin)" = FAIL ] && [ "$(calls launch)" = 0 ] \

@@ -62,6 +62,21 @@ public sealed class ExportCleanupServiceTests : IDisposable
     }
 
     [Fact]
+    public void A_link_in_place_of_the_folder_is_not_followed()
+    {
+        var real = Path.Combine(_directory, "real");
+        Directory.CreateDirectory(real);
+        var old = Path.Combine(real, new string('a', 32) + ".log");
+        System.IO.File.WriteAllText(old, "x");
+        System.IO.File.SetLastWriteTimeUtc(old, _now - TimeSpan.FromDays(3));
+        var link = Path.Combine(_directory, "exports");
+        Directory.CreateSymbolicLink(link, real);
+
+        ExportCleanupService.CleanOnce(link, _now, NullLogger.Instance).Should().Be(0);
+        System.IO.File.Exists(old).Should().BeTrue();
+    }
+
+    [Fact]
     public void A_missing_folder_is_nothing_to_do()
     {
         ExportCleanupService.CleanOnce(Path.Combine(_directory, "none"), _now, NullLogger.Instance).Should().Be(0);

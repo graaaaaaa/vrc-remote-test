@@ -391,9 +391,14 @@ internal static class BridgeAdminApi
         var active = context.RequestServices.GetRequiredService<IOptions<BridgeOptions>>().Value;
         if (options.IsRelaunchMode != active.IsRelaunchMode)
         {
-            runtime.Gate.Bump();
             var closer = context.RequestServices.GetRequiredService<OwnedClientCloser>();
             var closed = await closer.CloseAsync(requireNoOthers: true, context.RequestAborted);
+            if (!closed.Refused)
+            {
+                // Clients were closed, or may have been; a refusal before closing changes nothing.
+                runtime.Gate.Bump();
+            }
+
             if (closed.Refused || closed.NotConfirmed > 0 || closed.RecordNotUpdated)
             {
                 return Results.Json(new
@@ -474,8 +479,12 @@ internal static class BridgeAdminApi
         }
 
         var closer = context.RequestServices.GetRequiredService<OwnedClientCloser>();
-        runtime.Gate.Bump();
         var report = await closer.CloseAsync(requireNoOthers: false, context.RequestAborted);
+        if (!report.Refused)
+        {
+            runtime.Gate.Bump();
+        }
+
         return Results.Json(new
         {
             closed = report.Closed,
