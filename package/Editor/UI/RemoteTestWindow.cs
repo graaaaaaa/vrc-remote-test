@@ -169,6 +169,30 @@ namespace VRCRemoteTest
         [SerializeField] private bool _runUseLastBuild;
         [SerializeField] private bool _runWaitForTag = true;
 
+        // The procedure choice (r3-contract.md §6.3): only what RunProcedures.Offered() lists. The
+        // manual-steps fields are drawn only once that is offered (after validation).
+        [SerializeField] private int _runProcedureIndex;
+        [NonSerialized] private int _requestedRunProcedureIndex = -1;
+        [SerializeField] private string _runChecklistPath;
+        [SerializeField] private int _runLeaveRejoinIndex;
+        [NonSerialized] private int _requestedRunLeaveRejoinIndex = -1;
+        [SerializeField] private int _runTargetSlot;
+        [NonSerialized] private string[] _runChecklistIds;
+        [NonSerialized] private string _runChecklistIdsPath;
+        [NonSerialized] private string _runChecklistProblem;
+
+        // The waiting panel (r3-contract.md §6.2): this Bridge's run found from the default run root,
+        // asked through `runner waiting --json` at most once a second on a worker thread. The
+        // snapshot is taken at a Layout event only; whether the panel shows is the runner's `valid`.
+        private static RunWaitingWatcher _waitingWatcher;
+        [NonSerialized] private WaitingSnapshot _waitingSnapshot = new WaitingSnapshot();
+        [NonSerialized] private double _lastWaitingTick = double.NegativeInfinity;
+        [NonSerialized] private int _waitingVersion = -1;
+        [NonSerialized] private string _waitingMemo = string.Empty;
+        [NonSerialized] private string _waitingMemoWaitId;
+
+        private static RunWaitingWatcher WaitingWatcher => _waitingWatcher ?? (_waitingWatcher = new RunWaitingWatcher());
+
         private static RemoteRunController RunController
         {
             get
@@ -225,6 +249,23 @@ namespace VRCRemoteTest
                 Repaint();
             }
 
+            // On the same one-second beat: the watcher starts a poll only when the last one ended a
+            // second ago or more, and polls on a worker thread, so this never waits for Python.
+            if (now - _lastWaitingTick >= 1.0)
+            {
+                _lastWaitingTick = now;
+                // Also with no pairing: the watcher then drops what it found for the previous one.
+                WaitingWatcher.Tick(DeployResultWriter.DefaultRoot(), RemoteTestSettings.BridgeUrl, RemoteTestSettings.BridgeFingerprint);
+
+                var version = WaitingWatcher.Version;
+                if (version != _waitingVersion || _waitingSnapshot.Shown != null)
+                {
+                    // Also once a second while the panel shows, for the minutes left.
+                    _waitingVersion = version;
+                    Repaint();
+                }
+            }
+
             if (_showBridgeSection && now - _lastBridgeRepaintTime >= PreflightCheckIntervalSeconds)
             {
                 _lastBridgeRepaintTime = now;
@@ -253,6 +294,10 @@ namespace VRCRemoteTest
             }
 
             RefreshBridgeSection();
+            if (Event.current.type == EventType.Layout)
+            {
+                TakeWaitingSnapshot();
+            }
 
             _windowScrollPosition = EditorGUILayout.BeginScrollView(_windowScrollPosition);
 
@@ -267,6 +312,12 @@ namespace VRCRemoteTest
             EditorGUILayout.Space();
             DrawActionButtons();
             EditorGUILayout.Space();
+            if (_waitingSnapshot.Shown != null)
+            {
+                DrawWaitingPanel();
+                EditorGUILayout.Space();
+            }
+
             DrawRunSection();
             EditorGUILayout.Space();
             DrawProgressSection();
@@ -1291,19 +1342,22 @@ namespace VRCRemoteTest
                 _runWaitForTag = EditorGUILayout.Toggle(new GUIContent("Wait for the build tag",
                     "Wait up to 120 s for each client to log vrcrt.build=<tag>. Off: look once, for worlds that log no tag " +
                     "(their world build match stays UNKNOWN either way)."), _runWaitForTag);
+                DrawProcedureFields();
             }
+
+            var procedureArguments = RunProcedureArguments(out var procedureProblem);
 
             var coordinatorBusy = _bridgeConfigured && RemoteBuildCommand.GetCoordinator().IsRunning;
             using (new EditorGUILayout.HorizontalScope())
             {
                 using (new EditorGUI.DisabledScope(run.Active || coordinatorBusy || !_bridgeConfigured || _clientOperationRunning
-                                                   || string.IsNullOrWhiteSpace(_runSlots)))
+                                                   || string.IsNullOrWhiteSpace(_runSlots) || procedureArguments == null))
                 {
                     if (GUILayout.Button(new GUIContent("Run",
                             "Build (or redeploy), wait until every slot is ready, and collect evidence into a run folder.")))
                     {
                         run.Start(_runSlots.Replace(" ", string.Empty), _runUseLastBuild, RemoteTestSettings.BridgeUrl,
-                            RemoteTestSettings.BridgeFingerprint, _runWaitForTag);
+                            RemoteTestSettings.BridgeFingerprint, _runWaitForTag, procedureArguments);
                     }
                 }
 
@@ -1329,6 +1383,167 @@ namespace VRCRemoteTest
             EditorGUILayout.LabelField(run.Summary == null || run.Summary.Results.Count == 0
                 ? " "
                 : string.Join("   ", run.Summary.Results.Select(p => p.Key + ": " + p.Value)), EditorStyles.miniLabel);
+
+            // Any run that holds this Bridge's claim, also one from the CLI or from before a restart.
+            var found = _waitingSnapshot.Run;
+            EditorGUILayout.LabelField(found != null ? "This Bridge's run: " + found.RunId + " (" + found.State + ")"
+                : _waitingSnapshot.EndedNote ?? " ", RunWaitingView.PlainLabel);
+            if (SelectedProcedure() == RunProcedures.ManualSteps)
+            {
+                // Drawn whenever manual-steps is chosen (that changes at a Layout event only), empty when nothing is missing.
+                EditorGUILayout.LabelField(procedureProblem ?? " ", EditorStyles.wordWrappedMiniLabel);
+            }
+        }
+
+        private void TakeWaitingSnapshot()
+        {
+            _waitingSnapshot = WaitingWatcher.Snapshot();
+            var waitId = _waitingSnapshot.Shown?.WaitId;
+            if (waitId != _waitingMemoWaitId)
+            {
+                // A new item starts with an empty memo. The text area keeps its own copy of the
+                // text while it has keyboard focus, so the focus goes too (seen on Windows, 2026-11-26).
+                _waitingMemoWaitId = waitId;
+                _waitingMemo = string.Empty;
+                GUIUtility.keyboardControl = 0;
+            }
+
+            if (_requestedRunProcedureIndex >= 0)
+            {
+                _runProcedureIndex = _requestedRunProcedureIndex;
+                _requestedRunProcedureIndex = -1;
+            }
+
+            if (_requestedRunLeaveRejoinIndex >= 0)
+            {
+                _runLeaveRejoinIndex = _requestedRunLeaveRejoinIndex;
+                _requestedRunLeaveRejoinIndex = -1;
+            }
+        }
+
+        private void DrawWaitingPanel()
+        {
+            var pressed = RunWaitingView.Draw(_waitingSnapshot, ref _waitingMemo);
+            if (pressed != null)
+            {
+                WaitingWatcher.Answer(_waitingSnapshot.Shown.WaitId, pressed, _waitingMemo, RemoteTestSettings.BridgeUrl,
+                    RemoteTestSettings.BridgeFingerprint);
+            }
+        }
+
+        private string SelectedProcedure()
+        {
+            var offered = RunProcedures.Offered();
+            return offered[Mathf.Clamp(_runProcedureIndex, 0, offered.Length - 1)];
+        }
+
+        /// <summary>
+        /// The procedure choice, and for manual-steps (once it is offered) the checklist, "Leave and
+        /// rejoin after" and the target slot. Choices are taken over at the next Layout event.
+        /// </summary>
+        private void DrawProcedureFields()
+        {
+            var offered = RunProcedures.Offered();
+            var index = Mathf.Clamp(_runProcedureIndex, 0, offered.Length - 1);
+            var chosen = EditorGUILayout.Popup(new GUIContent("Procedure", "Only procedures validated on real clients are listed."),
+                index, offered);
+            if (chosen != index)
+            {
+                _requestedRunProcedureIndex = chosen;
+            }
+
+            if (offered[index] != RunProcedures.ManualSteps)
+            {
+                return;
+            }
+
+            using (new EditorGUILayout.HorizontalScope())
+            {
+                EditorGUILayout.LabelField(new GUIContent("Checklist", _runChecklistPath ?? string.Empty),
+                    new GUIContent(string.IsNullOrEmpty(_runChecklistPath) ? "(none)" : System.IO.Path.GetFileName(_runChecklistPath)),
+                    RunWaitingView.PlainLabel);
+                if (GUILayout.Button("Choose...", GUILayout.Width(80)))
+                {
+                    // After this event: a modal panel in the middle of OnGUI breaks the layout.
+                    EditorApplication.delayCall += ChooseChecklist;
+                }
+            }
+
+            ReadChecklistIds();
+            var options = new[] { "None" }.Concat(_runChecklistIds ?? new string[0]).ToArray();
+            var leaveIndex = Mathf.Clamp(_runLeaveRejoinIndex, 0, options.Length - 1);
+            var leaveChosen = EditorGUILayout.Popup(new GUIContent("Leave and rejoin after",
+                "After this item's answer, close the target slot and launch it again (with preconditions)."), leaveIndex, options);
+            if (leaveChosen != leaveIndex)
+            {
+                _requestedRunLeaveRejoinIndex = leaveChosen;
+            }
+
+            using (new EditorGUI.DisabledScope(leaveIndex == 0))
+            {
+                _runTargetSlot = Math.Max(0, EditorGUILayout.IntField(new GUIContent("Target slot",
+                    "The slot to close and launch again; one of the slots above."), _runTargetSlot));
+            }
+        }
+
+        private void ChooseChecklist()
+        {
+            var start = string.IsNullOrEmpty(_runChecklistPath) ? string.Empty : System.IO.Path.GetDirectoryName(_runChecklistPath);
+            var path = EditorUtility.OpenFilePanel("Checklist (vrcrt.checklist JSON)", start, "json");
+            if (!string.IsNullOrEmpty(path))
+            {
+                _runChecklistPath = path;
+                _runChecklistIdsPath = null;
+                _requestedRunLeaveRejoinIndex = 0;
+                Repaint();
+            }
+        }
+
+        /// <summary>The checklist's item IDs for the popup, read once per chosen file (display only; the runner checks the file).</summary>
+        private void ReadChecklistIds()
+        {
+            if (_runChecklistIdsPath == (_runChecklistPath ?? string.Empty) || Event.current.type != EventType.Layout)
+            {
+                return;
+            }
+
+            _runChecklistIdsPath = _runChecklistPath ?? string.Empty;
+            _runChecklistProblem = null;
+            _runChecklistIds = string.IsNullOrEmpty(_runChecklistPath)
+                ? null
+                : RunProcedures.ChecklistItemIds(_runChecklistPath, out _runChecklistProblem);
+        }
+
+        /// <summary>What prepare gets for the chosen procedure, or null (with why) when it cannot start yet.</summary>
+        private string[] RunProcedureArguments(out string problem)
+        {
+            problem = null;
+            var procedure = SelectedProcedure();
+            if (procedure != RunProcedures.ManualSteps)
+            {
+                return RunProcedures.PrepareArguments(procedure, null, null, null);
+            }
+
+            if (_runChecklistIds == null)
+            {
+                problem = string.IsNullOrEmpty(_runChecklistPath)
+                    ? "Choose a checklist file."
+                    : "The checklist cannot be used: " + (_runChecklistProblem ?? "not read yet");
+                return null;
+            }
+
+            var leaveAfter = _runLeaveRejoinIndex > 0 && _runLeaveRejoinIndex <= _runChecklistIds.Length
+                ? _runChecklistIds[_runLeaveRejoinIndex - 1]
+                : null;
+            try
+            {
+                return RunProcedures.PrepareArguments(procedure, _runChecklistPath, leaveAfter, leaveAfter == null ? (int?)null : _runTargetSlot);
+            }
+            catch (ArgumentException ex)
+            {
+                problem = ex.Message;
+                return null;
+            }
         }
 
         /// <summary>A button that cannot be pressed while a Deploy and Collect run holds the pairing it was prepared for.</summary>

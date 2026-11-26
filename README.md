@@ -99,7 +99,7 @@ python3 scripts/vrcrt-run.py \
 
 ### runner（`package/Tools~/vrcrt_runner.py`、0.11.0 以降）
 
-決まった手順（今は「通常の複数台の準備と証拠の回収」だけ）を、`vrcrt.sh` を順に呼んで行います。Python 3.9 以上が要ります（macOS なら Command Line Tools の `/usr/bin/python3`、ほかは `VRCRT_PYTHON`）。Unity の `Run` ボタンも同じものを使います。対話用の Editor を閉じたうえで、ターミナルから1行でも行えます。
+決まった手順（「通常の複数台の準備と証拠の回収」、0.12.0 からは「宣言した slot の退出と起動し直し」、0.13.0 からは「人の段」）を、`vrcrt.sh` を順に呼んで行います。Python 3.9 以上が要ります（macOS なら Command Line Tools の `/usr/bin/python3`、ほかは `VRCRT_PYTHON`）。Unity の `Run` ボタンも同じものを使います。対話用の Editor を閉じたうえで、ターミナルから1行でも行えます。
 
 ```bash
 python3 package/Tools~/vrcrt_runner.py run --build headless \
@@ -112,6 +112,20 @@ python3 package/Tools~/vrcrt_runner.py run --build headless \
 - ワールドが読み込み時に `vrcrt.build=<tag>` を含む目印（Bridge の `LogMarkerPrefixes` の行）を出せば、各台がこの回のビルドに入ったかを照らします（`worldBuildMatch`）。出さないワールドでは UNKNOWN のままで、ほかは使えます。そのときは `--world-build-wait 0`（Unity では `Wait for the build tag` を外す）で、120 s の待ちを1回見るだけにできます。
 - 止めるには run のフォルダーに `cancel.request` を作るか、Ctrl-C。runner が落ちた run は `recover --run <runDir>` で UNKNOWN に確定できます。古い run は `prune --older-than-days 30` で消します（自動では消しません）。
 - 試験は `bash scripts/test-vrcrt.sh`（runner と `vrcrt-run.py` の試験も呼びます）。
+
+#### 人の段（`--procedure manual-steps`、0.13.0 以降）
+
+配備と台の準備のあと、確認の項目（`vrcrt.checklist` の JSON。形は `docs/plans/r3-contract.md` §1）を1つずつ出して、人の答え（ok・ng・skip とメモ）を待ちます。答えるたびに、時刻と各台のログの位置と目印を記録します。答えは Unity のウィンドウ（待っている run があれば出る）からも、ターミナルからも入れられます。
+
+```bash
+python3 package/Tools~/vrcrt_runner.py waiting --run <runDir>
+python3 package/Tools~/vrcrt_runner.py answer --run <runDir> --wait-id <waitId> --item <id> ok --memo "線は見えた"
+```
+
+- `--leave-rejoin-after <id> --target-slot N` で、その項目の答えのあとに slot N を前提つきで閉じて起動し直します（代表の件 A の「持ち主が退出・途中参加」）。
+- 答えは人の言ったとおりに `results.manualSteps` に残し、道具は試験の合否を決めません（`testVerdict` は `notJudged`）。待っているあいだに台や Bridge が変われば UNKNOWN で止めます。
+- VR 台（slot 0）とデスクトップの観戦台（slot 1）は、Bridge の設定 `VrchatMode: VR`・`VrchatProfiles: [0,1]` で起動できますが、ヘッドセットでの確かめはまだです。
+- 始めるのはターミナルからです（Unity の Run の手順の選びには、画面から始めることを確かめるまで出しません）。待っている run への答えは、Unity の画面からもできます。
 
 ## 構成
 

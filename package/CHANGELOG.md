@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.13.0] - 2026-11-26
+
+R3 (`docs/plans/r3-contract.md`): a test with steps a person does by hand. The runner asks the items of a checklist one at a time, waits for each answer, and records it with every client's log position and markers; a declared client can leave and rejoin after an item. **Update the Unity package only**; the Bridge does not change. Checked on Windows with two Desktop clients (`docs/validation/manual-steps.md`); VR, four clients and starting it from the window are not checked yet, so the window answers a waiting run but does not offer the procedure in Run.
+
+### Added (Mac scripts)
+
+- `vrcrt_runner.py --procedure manual-steps --checklist FILE`: after deploy-collect, asks each item of a `vrcrt.checklist` file (up to 20, shown as plain text) and waits for an answer (ok, ng or skip, with a memo; `--answer-wait`, default 1200 s). While it waits it checks every 5 s that the clients and the Bridge stay as they were ready; a change stops the run UNKNOWN. Each answer is recorded with the time, each client's log range and markers; the full logs are collected at the end. `results.manualSteps` is the answers as given (PASS all ok, FAIL any ng, otherwise UNKNOWN); `testVerdict` stays `notJudged` and an answer never turns a tool result into PASS. The run's limit is `--run-minutes` (30 to 120, default 90); other procedures keep 30 minutes.
+- `--leave-rejoin-after ITEM --target-slot N [--remaining-marker REGEX]`: leave-rejoin's preconditioned close and launch after that item's answer (Bridge 0.12.0 and later, Relaunch); later items are asked of the new client.
+- `vrcrt_runner.py waiting --run DIR [--json]` shows what a run waits for; `answer --run DIR --wait-id ID --item ITEM ok|ng|skip [--memo TEXT]` answers it, only while that wait is open and its runner is alive, once per item (an agent can relay the answer of a person in VR).
+- `leave_rejoin_steps` hands back the rejoined client and the revision of its own launch; leave-rejoin's results and evidence do not change.
+
+### Added (Unity)
+
+- The window shows a run of this Bridge that is waiting for an answer, also one started from the terminal or before the Editor restarted: the item, the time left, a memo and OK / NG / Skip, sent through `vrcrt_runner.py answer`. The summary of a manual-steps run counts the answers.
+
+### Changed (Unity)
+
+- The window reads the Bridge's claim and the run's `run.json` without following links and with size limits.
+
 ## [0.12.0] - 2026-11-26
 
 R1b (`docs/plans/r1-automation.md` §5, contract `docs/plans/r1b-contract.md`): a single-client close or launch can carry a precondition, so one prepared from an earlier view does nothing if the Bridge or the client changed since; the runner gains the leave-and-rejoin procedure on top of it. **Update both the Unity package and the Windows Bridge.** Checked on Windows with two VRChat clients (`docs/validation/slot-preconditions.md`); the export cleanup and four clients are not checked on Windows yet. Also two small changes found in the Windows check of 0.11.0.
