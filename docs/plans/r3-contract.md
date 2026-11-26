@@ -194,7 +194,7 @@ answer --run DIR --wait-id ID --item ITEM_ID (ok|ng|skip) [--memo TEXT] [--by un
 
 ### 6.3 Run の始め
 
-- 手順の選び: `VALIDATED_PROCEDURES` に入った手順だけ（今は deploy-collect。manual-steps は確かめのあとで足す）。Unity 側に同じ一覧を定数で持つ。
+- 手順の選び: `VALIDATED_PROCEDURES` に入った手順だけ（deploy-collect と manual-steps。manual-steps は 2026-11-26 に画面から始めることを確かめ、0.13.1 で足した）。Unity 側に同じ一覧を定数で持つ。
 - manual-steps が選べるようになったら: checklist のファイル（ファイルの選びの画面）、`Leave and rejoin after`（checklist の id から選ぶ。`None` も可）と target slot。prepare に `--procedure manual-steps --checklist <path> ...` を渡す。
 - 待ちの画面は、手順の選びに出す前でも出す（CLI の `--unvalidated` で始めた run に答えるため）。
 

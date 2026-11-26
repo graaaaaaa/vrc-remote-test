@@ -619,10 +619,9 @@ namespace VRCRemoteTest.Tests
         // --- 6.3: procedures -------------------------------------------------------------------
 
         [Test]
-        public void The_window_offers_deploy_collect_only_until_starting_manual_steps_here_is_checked()
+        public void The_window_offers_deploy_collect_and_manual_steps()
         {
-            // manual-steps is validated from the terminal; this window's start for it is not checked yet.
-            CollectionAssert.AreEqual(new[] { "deploy-collect" }, RunProcedures.Offered());
+            CollectionAssert.AreEqual(new[] { "deploy-collect", "manual-steps" }, RunProcedures.Offered());
             CollectionAssert.Contains(RunProcedures.Validated, "manual-steps");
         }
 

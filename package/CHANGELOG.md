@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.13.1] - 2026-11-26
+
+**Update the Unity package only**; the runner and the Bridge do not change.
+
+### Changed (Unity)
+
+- The window's Run offers manual-steps: choose the checklist file, the item to leave and rejoin after (or None) and the target slot. Checked on Windows with two Desktop clients (`docs/validation/manual-steps.md`, check 4). VR and four clients are still not checked.
+
 ## [0.13.0] - 2026-11-26
 
 R3 (`docs/plans/r3-contract.md`): a test with steps a person does by hand. The runner asks the items of a checklist one at a time, waits for each answer, and records it with every client's log position and markers; a declared client can leave and rejoin after an item. **Update the Unity package only**; the Bridge does not change. Checked on Windows with two Desktop clients (`docs/validation/manual-steps.md`); VR, four clients and starting it from the window are not checked yet, so the window answers a waiting run but does not offer the procedure in Run.

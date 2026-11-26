@@ -887,8 +887,7 @@ namespace VRCRemoteTest
     /// <summary>
     /// The procedures the window may start (r3-contract.md §6.3). <see cref="Validated"/> mirrors
     /// the runner's VALIDATED_PROCEDURES; the window offers only what it has a start UI for and
-    /// what is validated. manual-steps is not validated yet: its start UI is behind
-    /// <see cref="ManualStepsStartEnabled"/>.
+    /// what is validated. manual-steps' start UI is behind <see cref="ManualStepsStartEnabled"/>.
     /// </summary>
     internal static class RunProcedures
     {
@@ -899,9 +898,9 @@ namespace VRCRemoteTest
         /// <summary>The runner's VALIDATED_PROCEDURES (package/Tools~/vrcrt_runner.py).</summary>
         internal static readonly string[] Validated = { DeployCollect, LeaveRejoin, ManualSteps };
 
-        /// <summary>manual-steps is validated from the terminal (docs/validation/manual-steps.md); starting it
-        /// from this window (the checklist picker and its prepare) is not checked on real clients yet.</summary>
-        internal const bool ManualStepsStartEnabled = false;
+        /// <summary>Starting manual-steps from this window (the checklist picker and its prepare) is checked
+        /// on real clients (docs/validation/manual-steps.md, check 4).</summary>
+        internal const bool ManualStepsStartEnabled = true;
 
         /// <summary>What the window's procedure choice lists, in order.</summary>
         internal static string[] Offered()
