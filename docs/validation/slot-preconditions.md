@@ -68,6 +68,13 @@ python3 package/Tools~/vrcrt_runner.py run --build headless --unity /Application
 | 6. 書き出しの片付け | |
 | 4台 | 未確認 |
 
+### 2026-11-26（UTC）、入れ替えの前（Bridge 0.10.0+7dbd10bc、パッケージ main 4892f91）
+
+| 項目 | 結果 |
+|---|---|
+| 新しい CLI から 0.10 の Bridge へ `close-client 0 --expect @… --operation-id …` と `launch-client 0 --expect @…` | どちらも終了コード 3、`unsupported: the Bridge does not announce slotPreconditions.v1 … nothing was sent`。POST は送っていない。台の状態は変わらない |
+| Bridge の入れ替え | 待ち。別のセッションの性能計測（09:07〜10:20 JST ごろ）が Bridge を使っているため。入れ替えには Windows 側のセッションの利用者の了承も要る。実行体は GitHub Actions の run 45726091307（main 4892f91 の Bridge tests）の成果物 `bridge-exe` |
+
 ## 気づいたこと
 
 ## 結論
