@@ -156,7 +156,7 @@ public sealed class VrchatClientCoordinator : IVrchatClientCoordinator
     /// client start.
     /// </summary>
     public async Task<VrchatLaunchOutcome> LaunchClientsAsync(
-        string deployedWorldPath, CancellationToken cancellationToken)
+        string deployedWorldPath, string buildId, CancellationToken cancellationToken)
     {
         var count = _options.ResolvedVrchatClientCount;
         var roomId = VrchatLaunchRequest.NewRoomId();

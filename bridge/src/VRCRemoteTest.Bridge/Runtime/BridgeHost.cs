@@ -132,6 +132,7 @@ public static class BridgeHost
         builder.Services.AddHostedService<VrchatLogService>();
 
         builder.Services.AddSingleton<SteamVrchatLocator>();
+        builder.Services.AddHostedService<ExportCleanupService>();
 
         test?.ConfigureServices?.Invoke(builder.Services);
 

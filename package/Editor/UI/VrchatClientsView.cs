@@ -198,6 +198,28 @@ namespace VRCRemoteTest
             + "The Bridge starts it with the world, instance, profile and VR setting it used for this slot in the "
             + "last deploy. If the answer is lost, whether it started is unknown: check the list before trying again.";
 
+        /// <summary>
+        /// The confirmation for a Bridge that checks the request (slotPreconditions.v1) when
+        /// <paramref name="guarded"/>; otherwise the R1a text, unchanged.
+        /// </summary>
+        internal static string ConfirmClose(VrchatClientEntry entry, bool guarded) =>
+            !guarded
+                ? ConfirmClose(entry)
+                : $"Close slot {entry.Slot} ({DescribeSlot(entry)})?\n\n"
+                  + "The request carries this client's generation and the Bridge's state as this list showed them. "
+                  + "If the client or the Bridge changed after the list was read, the Bridge does nothing, and the list "
+                  + "has to be read again. The other clients keep running.";
+
+        /// <inheritdoc cref="ConfirmClose(VrchatClientEntry, bool)"/>
+        internal static string ConfirmLaunch(VrchatClientEntry entry, bool guarded) =>
+            !guarded
+                ? ConfirmLaunch(entry)
+                : $"Start slot {entry.Slot} again ({DescribeSlot(entry)})?\n\n"
+                  + "The Bridge starts it with the world, instance, profile and VR setting it used for this slot in the "
+                  + "last deploy. If the client or the Bridge changed after this list was read, the Bridge does nothing, "
+                  + "and the list has to be read again. If the answer is lost, whether it started is unknown: check the "
+                  + "list before trying again.";
+
         private static string Short(string text, int max)
         {
             if (string.IsNullOrEmpty(text))

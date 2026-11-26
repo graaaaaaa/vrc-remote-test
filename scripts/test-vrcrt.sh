@@ -384,6 +384,261 @@ expect "launch-client without an answer" 3 "cannot reach the Bridge" "$vrcrt" la
 rm "$share/http/POST_api_v1_clients_1_launch"
 expect "launch-client on a Bridge older than v0.10.0" 3 "older than v0.10.0" "$vrcrt" launch-client 1
 
+# --- Slot preconditions (Bridge v0.12.0, docs/plans/r1b-contract.md §2): close-client and
+# launch-client with --expect @FILE [--operation-id ID] [--json]. requests.log records each request
+# with its headers and body, so a check can tell what was sent, and that nothing was.
+# logged <Python expression over `requests`, the list of logged requests, and `args`> [args...]:
+# exit 0 when it is true.
+logged() {
+    python3 -I -c '
+import json, os, sys
+path = sys.argv[1]
+requests = [json.loads(line) for line in open(path, encoding="utf-8")] if os.path.exists(path) else []
+if eval(sys.argv[2], {"requests": requests, "args": sys.argv[3:]}):
+    sys.exit(0)
+print(json.dumps(requests, indent=1))
+sys.exit(1)' "$share/http/requests.log" "$@"
+}
+# stdout_of <command...>: its standard output only (exit code ignored).
+stdout_of() { "$@" 2>/dev/null; }
+INSTANCE=0123456789abcdef0123456789abcdef
+# expect_file <file name> <JSON>
+expect_file() { printf '%s' "$2" > "$share/$1"; }
+EXPECT_JSON='{"bridgeInstanceId":"'$INSTANCE'","hostGeneration":3,"activeConfigEtag":"etag1","savedConfigEtag":null,"operationRevision":17,"buildId":"20261126T010203-abc","clientGeneration":11}'
+expect_file expect.json "$EXPECT_JSON"
+CAPABILITIES='{"apiVersion":1,"buildProtocolVersion":1,"maxArtifactSizeBytes":524288000,"maxClients":4,"features":["slotPreconditions.v1"]}'
+CLOSE_R1B='{"slot":0,"processId":100,"closed":1,"notConfirmed":0,"recordUpdated":true,"problems":[],"clientGeneration":11,"operationRevision":18,"bridgeInstanceId":"'$INSTANCE'","operationId":"run1-close"}'
+LAUNCH_R1B='{"slot":0,"profile":0,"processId":300,"clientGeneration":12,"operationRevision":19,"bridgeInstanceId":"'$INSTANCE'","operationId":null}'
+CURRENT='{"bridgeInstanceId":"'$INSTANCE'","hostGeneration":3,"activeConfigEtag":"etag1","savedConfigEtag":null,"operationRevision":18,"buildId":"20261126T010203-abc","clientGeneration":null}'
+
+# Without --expect: the same request (no body, no Content-Type, no capabilities read), line and exit
+# code as before, while the answer carries the fields R1b adds (Commander's dice_life_auto).
+http_reset
+http POST_api_v1_clients_0_close "$CLOSE_R1B"
+http POST_api_v1_clients_0_launch "$LAUNCH_R1B"
+if [ "$(stdout_of "$vrcrt" close-client 0; echo "exit $?")" = "$(printf 'closed slot 0 (PID 100)\nexit 0')" ]; then
+    pass "close-client without --expect prints the same line for an answer with the R1b fields"
+else
+    fail "close-client without --expect prints the same line for an answer with the R1b fields"
+fi
+if [ "$(stdout_of "$vrcrt" launch-client 0; echo "exit $?")" = "$(printf 'launched slot 0 (profile 0, PID 300, generation 12)\nexit 0')" ]; then
+    pass "launch-client without --expect prints the same line for an answer with the R1b fields"
+else
+    fail "launch-client without --expect prints the same line for an answer with the R1b fields"
+fi
+expect "close-client and launch-client without --expect send no body and read no capabilities" 0 "" logged \
+    '[(r["method"], r["path"], r["body"], r["headers"]) for r in requests] == [("POST", "/api/v1/clients/0/close", None, {}), ("POST", "/api/v1/clients/0/launch", None, {})]'
+http_reset
+http POST_api_v1_clients_0_close "$CLOSE_R1B"
+http POST_api_v1_clients_0_launch "$LAUNCH_R1B"
+expect "close-client --json without --expect prints the answer" 0 '"operationRevision": 18' "$vrcrt" close-client 0 --json
+expect "close-client --json prints JSON only on stdout" 0 "" python3 -I -c '
+import json, sys
+reply = json.loads(sys.argv[1])
+sys.exit(0 if reply["clientGeneration"] == 11 and reply["bridgeInstanceId"] == sys.argv[2] else 1)' \
+    "$(stdout_of "$vrcrt" close-client 0 --json)" "$INSTANCE"
+expect "launch-client --json without --expect prints the answer" 0 '"clientGeneration": 12' "$vrcrt" launch-client 0 --json
+expect "launch-client --json prints no line" 0 "" python3 -I -c 'import json, sys; json.loads(sys.argv[1])' \
+    "$(stdout_of "$vrcrt" launch-client 0 --json)"
+expect "--json without --expect sends no body either" 0 "" logged 'all(r["body"] is None and r["method"] == "POST" for r in requests)'
+http POST_api_v1_clients_0_close 409 '{"slot":0,"processId":100,"closed":0,"notConfirmed":1,"recordUpdated":false,"problems":["Could not confirm"],"clientGeneration":11,"operationRevision":18,"bridgeInstanceId":"'$INSTANCE'","operationId":null}'
+expect "close-client not confirmed, with the R1b fields, is still not done" 1 "slot 0 (PID 100) may still be running" \
+    "$vrcrt" close-client 0
+expect "close-client --json not confirmed prints the answer and is still not done" 1 '"notConfirmed": 1' \
+    "$vrcrt" close-client 0 --json
+http POST_api_v1_clients_0_launch 500 '{"error":"launchedNotRecorded","slot":0,"launched":true,"recorded":false,"processId":300,"problems":["Close it on Windows."],"operationRevision":19,"bridgeInstanceId":"'$INSTANCE'","operationId":null}'
+expect "launch-client launchedNotRecorded with the R1b fields is still exit 1" 1 "could not record it" "$vrcrt" launch-client 0
+http POST_api_v1_clients_0_close '{"slot":0,"processId":100,"closed":1,"notConfirmed":0,"recordUpdated":true,"problems":[],"operationRevision":"18"}'
+expect "close-client with an operationRevision that is not a number is an invalid answer" 3 "not a close report" \
+    "$vrcrt" close-client 0
+http POST_api_v1_clients_0_close '{"slot":0,"processId":100,"closed":1,"notConfirmed":0,"recordUpdated":true,"problems":[],"clientGeneration":true}'
+expect "close-client with a clientGeneration that is true is an invalid answer" 3 "not a close report" \
+    "$vrcrt" close-client 0
+http POST_api_v1_clients_0_launch '{"slot":0,"profile":0,"processId":300,"clientGeneration":12,"bridgeInstanceId":"0123456789ABCDEF0123456789ABCDEF"}'
+expect "launch-client with a bridgeInstanceId of the wrong form is an invalid answer" 3 "not a launch report" \
+    "$vrcrt" launch-client 0
+http POST_api_v1_clients_0_launch '{"slot":0,"profile":0,"processId":300,"clientGeneration":12,"operationId":"a b"}'
+expect "launch-client with an operationId of the wrong form is an invalid answer" 3 "not a launch report" \
+    "$vrcrt" launch-client 0
+
+http_reset
+http POST_api_v1_clients_0_close "$CLOSE_R1B"
+expect "--operation-id without --expect is a usage error" 2 "--operation-id goes with --expect" \
+    "$vrcrt" close-client 0 --operation-id run1-close
+expect "--operation-id of the wrong form is a usage error" 2 "--operation-id is 1 to 64" \
+    "$vrcrt" launch-client 0 --expect "@$share/expect.json" --operation-id 'run 1'
+expect "a usage error sends nothing" 0 "" logged 'requests == []'
+
+# With --expect: capabilities first, then one POST with the exact body as application/json.
+http_reset
+http GET_api_v1_capabilities "$CAPABILITIES"
+http POST_api_v1_clients_0_close "$CLOSE_R1B"
+http POST_api_v1_clients_0_launch "$LAUNCH_R1B"
+if [ "$(stdout_of "$vrcrt" close-client 0 --expect "@$share/expect.json" --operation-id run1-close; echo "exit $?")" \
+    = "$(printf 'closed slot 0 (PID 100)\nexit 0')" ]; then
+    pass "close-client --expect done prints the same line"
+else
+    fail "close-client --expect done prints the same line"
+fi
+expect "close-client --expect reads capabilities, then sends the expect object as JSON" 0 "" logged \
+    '([(r["method"], r["path"]) for r in requests] == [("GET", "/api/v1/capabilities"), ("POST", "/api/v1/clients/0/close")]
+      and requests[1]["headers"] == {"Content-Type": "application/json"} and requests[1]["body"] == args[0])' \
+    '{"expect":'"$EXPECT_JSON"',"operationId":"run1-close"}'
+http_reset
+http GET_api_v1_capabilities "$CAPABILITIES"
+http POST_api_v1_clients_0_launch "$LAUNCH_R1B"
+expect "launch-client --expect --json prints the answer" 0 '"operationRevision": 19' \
+    "$vrcrt" launch-client 0 --expect "@$share/expect.json" --json
+expect "launch-client --expect without --operation-id sends no operationId" 0 "" logged \
+    'requests[-1]["path"] == "/api/v1/clients/0/launch" and requests[-1]["body"] == args[0]' '{"expect":'"$EXPECT_JSON"'}'
+expect_file expect-spaced.json '{
+  "clientGeneration": 1, "buildId": null, "operationRevision": 0, "savedConfigEtag": "'"$(printf 'e%.0s' $(seq 128))"'",
+  "activeConfigEtag": null, "hostGeneration": 2147483647, "bridgeInstanceId": "'$INSTANCE'"
+}'
+expect "an expect file with null etag and buildId, edge values and its own key order is accepted" 0 "launched slot 0" \
+    "$vrcrt" launch-client 0 --expect "@$share/expect-spaced.json"
+
+# An expect file of the wrong shape: exit 2, and nothing is asked of the Bridge, not even capabilities.
+bad_expect() {
+    local name="$1" json="$2" text="$3"
+    http_reset
+    http GET_api_v1_capabilities "$CAPABILITIES"
+    http POST_api_v1_clients_0_close "$CLOSE_R1B"
+    expect_file bad.json "$json"
+    expect "an expect file with $name is a usage error" 2 "$text" "$vrcrt" close-client 0 --expect "@$share/bad.json"
+    expect "an expect file with $name sends nothing" 0 "" logged 'requests == []'
+}
+with() { python3 -I -c 'import json, sys; e = json.loads(sys.argv[1]); exec(sys.argv[2]); print(json.dumps(e))' "$EXPECT_JSON" "$1"; }
+bad_expect "a missing key" "$(with 'del e["buildId"]')" "buildId is missing"
+bad_expect "an extra key" "$(with 'e["operationId"] = "x"')" '"operationId" is not one of the seven fields'
+bad_expect "a duplicate key" "${EXPECT_JSON%\}},\"operationRevision\":17}" '"operationRevision" appears twice'
+bad_expect "a hostGeneration that is a string" "$(with 'e["hostGeneration"] = "3"')" "hostGeneration must be an integer from 1"
+bad_expect "a hostGeneration past 32 bits" "$(with 'e["hostGeneration"] = 2 ** 31')" "hostGeneration must be an integer from 1"
+bad_expect "an empty etag" "$(with 'e["activeConfigEtag"] = ""')" "activeConfigEtag must be a string of 1 to 128"
+bad_expect "a hostGeneration that is true" "$(with 'e["hostGeneration"] = True')" "hostGeneration must be an integer"
+bad_expect "a clientGeneration that is 0" "$(with 'e["clientGeneration"] = 0')" "clientGeneration must be an integer of at least 1"
+bad_expect "an operationRevision that is a float" "$(with 'e["operationRevision"] = 17.0')" "operationRevision must be an integer of at least 0"
+bad_expect "an operationRevision past 64 bits" "$(with 'e["operationRevision"] = 2 ** 63')" "operationRevision must be"
+bad_expect "an operationRevision of NaN" "$(with 'e["operationRevision"] = float("nan")')" "NaN is not a JSON number"
+bad_expect "a clientGeneration of Infinity" "$(with 'e["clientGeneration"] = float("inf")')" "Infinity is not a JSON number"
+bad_expect "a bridgeInstanceId in upper case" "$(with 'e["bridgeInstanceId"] = e["bridgeInstanceId"].upper()')" \
+    "bridgeInstanceId must be 32 lowercase hexadecimal digits"
+bad_expect "a bridgeInstanceId of 31 digits" "$(with 'e["bridgeInstanceId"] = e["bridgeInstanceId"][1:]')" "bridgeInstanceId must be"
+bad_expect "a bridgeInstanceId with a newline" "$(with 'e["bridgeInstanceId"] += "\n"')" "bridgeInstanceId must be"
+bad_expect "a buildId with a slash" "$(with 'e["buildId"] = "../x"')" "buildId must be"
+bad_expect "an etag of 129 characters" "$(with 'e["activeConfigEtag"] = "e" * 129')" "activeConfigEtag must be"
+bad_expect "an etag that is a number" "$(with 'e["savedConfigEtag"] = 1')" "savedConfigEtag must be"
+bad_expect "an array instead of an object" "[$EXPECT_JSON]" "does not hold a JSON object"
+bad_expect "the whole request body instead of the expect object" "{\"expect\":$EXPECT_JSON}" '"expect" is not one of the seven fields'
+bad_expect "text that is not JSON" "not json" "not valid JSON"
+bad_expect "more than 4096 bytes" "$(with 'e["pad"] = "x" * 5000')" "larger than 4096 bytes"
+http_reset
+expect "--expect without @ is a usage error" 2 "--expect needs @FILE" "$vrcrt" close-client 0 --expect "$EXPECT_JSON"
+expect "--expect with a missing file is a usage error" 2 "cannot read the --expect file" \
+    "$vrcrt" launch-client 0 --expect "@$share/missing.json"
+expect "a usage error of --expect sends nothing" 0 "" logged 'requests == []'
+
+# A Bridge that does not announce slotPreconditions.v1 (v0.11 or older) never gets the POST: it would
+# ignore the body and act without checking anything.
+no_feature() {
+    local name="$1" command="$2"
+    expect "$command --expect on a Bridge $name is unsupported" 3 "unsupported" \
+        "$vrcrt" "$command" 0 --expect "@$share/expect.json"
+    expect "$command --expect on a Bridge $name sends no POST" 0 "" logged 'all(r["method"] == "GET" for r in requests)'
+}
+for command in close-client launch-client; do
+    http_reset
+    http POST_api_v1_clients_0_close "$CLOSE_R1B"
+    http POST_api_v1_clients_0_launch "$LAUNCH_R1B"
+    http GET_api_v1_capabilities '{"apiVersion":1,"buildProtocolVersion":1,"maxArtifactSizeBytes":524288000,"maxClients":4}'
+    no_feature "without features" "$command"
+    http GET_api_v1_capabilities '{"apiVersion":1,"features":"slotPreconditions.v1"}'
+    no_feature "whose features are not a list" "$command"
+    http GET_api_v1_capabilities '{"apiVersion":1,"features":["slotPreconditions.v2"]}'
+    no_feature "with other features only" "$command"
+    http GET_api_v1_capabilities 'not json'
+    no_feature "whose capabilities are not JSON" "$command"
+    http GET_api_v1_capabilities 500 '{"error":"internal"}'
+    no_feature "whose capabilities fail" "$command"
+    http GET_api_v1_capabilities DOWN
+    no_feature "that does not answer" "$command"
+    rm "$share/http/GET_api_v1_capabilities"
+    no_feature "without capabilities" "$command"
+done
+
+# 412: the Bridge did nothing because something changed since the expect file was written.
+http_reset
+http GET_api_v1_capabilities "$CAPABILITIES"
+http POST_api_v1_clients_0_close 412 '{"error":"preconditionFailed","mismatched":["operationRevision","buildId"],"current":'"$CURRENT"',"operationId":"run1-close"}'
+expect "close-client --expect with a precondition failed is exit 1" 1 "precondition failed: operationRevision,buildId" \
+    "$vrcrt" close-client 0 --expect "@$share/expect.json" --operation-id run1-close
+expect "a failed precondition is never sent again" 0 "" logged \
+    'sum(r["method"] == "POST" for r in requests) == 1'
+expect "close-client --expect --json with a precondition failed prints the 412 body" 1 '"error": "preconditionFailed"' \
+    "$vrcrt" close-client 0 --expect "@$share/expect.json" --json
+expect "the 412 body on stdout is JSON" 0 "" python3 -I -c '
+import json, sys
+reply = json.loads(sys.argv[1])
+sys.exit(0 if reply["mismatched"] == ["operationRevision", "buildId"] and reply["current"]["operationRevision"] == 18 else 1)' \
+    "$(stdout_of "$vrcrt" close-client 0 --expect "@$share/expect.json" --json)"
+http POST_api_v1_clients_0_launch 412 '{"error":"preconditionFailed","mismatched":["clientGeneration"],"current":'"$CURRENT"',"operationId":null}'
+expect "launch-client --expect with a precondition failed is exit 1" 1 "precondition failed: clientGeneration" \
+    "$vrcrt" launch-client 0 --expect "@$share/expect.json"
+http POST_api_v1_clients_0_launch 412 '{"error":"preconditionFailed","mismatched":["\u001b[2J"],"current":{}}'
+expect "a 412 naming a field that is not one of the seven is an invalid answer" 3 "not one it sends (HTTP 412)" \
+    "$vrcrt" launch-client 0 --expect "@$share/expect.json"
+http POST_api_v1_clients_0_launch 412 '{"error":"preconditionFailed","mismatched":[],"current":{}}'
+expect "a 412 naming nothing is an invalid answer" 3 "not one it sends (HTTP 412)" \
+    "$vrcrt" launch-client 0 --expect "@$share/expect.json"
+http POST_api_v1_clients_0_close 412 '{"error":"preconditionFailed","mismatched":["operationRevision"],"current":'"$CURRENT"',"operationId":null}'
+expect "a 412 without --expect is still an answer the Bridge does not send" 3 "not one it sends" "$vrcrt" close-client 0
+
+# 400 invalidPrecondition: the Bridge refused the body before doing anything.
+http POST_api_v1_clients_0_close 400 '{"error":"invalidPrecondition","problems":["expect.clientGeneration is missing.\u001b"]}'
+expect "close-client --expect refused as invalidPrecondition is exit 2" 2 '  - expect.clientGeneration is missing.\x1b' \
+    "$vrcrt" close-client 0 --expect "@$share/expect.json"
+http POST_api_v1_clients_0_launch 400 '{"error":"invalidPrecondition","problems":["The body is not valid JSON."]}'
+expect "launch-client --expect refused as invalidPrecondition is exit 2" 2 "invalidPrecondition" \
+    "$vrcrt" launch-client 0 --expect "@$share/expect.json"
+expect "invalidPrecondition without --expect is read as before (a refusal, exit 1)" 1 "invalidPrecondition" \
+    "$vrcrt" launch-client 0
+
+# Every other answer to a request with --expect: the exit code it has without --expect.
+http POST_api_v1_clients_0_close 409 '{"error":"busy","operation":"deploy"}'
+expect "close-client --expect while the Bridge is busy" 1 "busy (deploy)" "$vrcrt" close-client 0 --expect "@$share/expect.json"
+http POST_api_v1_clients_0_close 409 '{"error":"notRunning","problems":["not running"]}'
+expect "close-client --expect refused" 1 "notRunning" "$vrcrt" close-client 0 --expect "@$share/expect.json"
+http POST_api_v1_clients_0_launch 500 '{"error":"launchedNotRecorded","slot":0,"launched":true,"recorded":false,"processId":300,"problems":["Close it on Windows."],"operationRevision":19,"bridgeInstanceId":"'$INSTANCE'","operationId":"run1-launch"}'
+expect "launch-client --expect --json launchedNotRecorded prints the answer, exit 1" 1 '"operationId": "run1-launch"' \
+    "$vrcrt" launch-client 0 --expect "@$share/expect.json" --operation-id run1-launch --json
+http_reset
+http GET_api_v1_capabilities "$CAPABILITIES"
+http POST_api_v1_clients_0_launch DOWN
+expect "launch-client --expect without an answer says the outcome is unknown" 3 "whether slot 0 was started is unknown" \
+    "$vrcrt" launch-client 0 --expect "@$share/expect.json"
+http POST_api_v1_clients_0_close "$(printf 'SLOW 3\n%s' "$CLOSE_R1B")"
+expect "close-client --expect with no answer in time says the outcome is unknown" 3 "whether slot 0 was closed is unknown" \
+    env VRCRT_TEST_CLOSE_TIMEOUT=0.5 "$vrcrt" close-client 0 --expect "@$share/expect.json"
+expect "a request with --expect that got no answer is not sent again" 0 "" logged \
+    '[r["path"] for r in requests if r["method"] == "POST"] == ["/api/v1/clients/0/launch", "/api/v1/clients/0/close"]'
+
+# bridge --json passes the v0.12.0 fields through (and still works without them, above).
+http_reset
+http GET_api_v1_bridge "$(bridge_info 3 | python3 -I -c '
+import json, sys
+info = json.load(sys.stdin)
+info.update(bridgeInstanceId=sys.argv[1], operationRevision=17,
+            currentBatch={"buildId": "20261126T010203-abc", "launchedSlots": [0, 1]})
+print(json.dumps(info))' "$INSTANCE")"
+expect "bridge --json keeps bridgeInstanceId" 0 "\"bridgeInstanceId\": \"$INSTANCE\"" "$vrcrt" bridge --json
+expect "bridge --json keeps operationRevision and currentBatch" 0 "" python3 -I -c '
+import json, sys
+info = json.loads(sys.argv[1])
+sys.exit(0 if info["operationRevision"] == 17 and info["currentBatch"] == {"buildId": "20261126T010203-abc", "launchedSlots": [0, 1]} else 1)' \
+    "$(stdout_of "$vrcrt" bridge --json)"
+http GET_api_v1_bridge "$(bridge_info 3 | sed 's/}$/,"currentBatch":null}/')"
+expect "bridge --json keeps a currentBatch of null" 0 '"currentBatch": null' "$vrcrt" bridge --json
+
 clients joined joined ', "warnings": ['"$(python3 -I -c 'print(",".join(["\"w\""] * 80))')"']'
 expect "status prints at most 50 warnings per slot" 0 "slot 1: ... and 30 more" "$vrcrt" status
 clients joined joined ""
@@ -441,7 +696,24 @@ def handle(raw):
         with lock:
             counts[key] = counts.get(key, 0) + 1
             n = counts[key]
-        if key == "POST /api/v1/clients/close":
+        if key == "GET /api/v1/capabilities":
+            answer(conn, 200, {"apiVersion": 1, "features": ["slotPreconditions.v1"]})
+        elif key == "POST /api/v1/clients/2/close":
+            # Records what arrived (Content-Type and the body by its Content-Length) for the test to compare.
+            head, _, body = request.partition(b"\r\n\r\n")
+            headers = dict(line.split(b":", 1) for line in head.split(b"\r\n")[1:] if b":" in line)
+            headers = {name.strip().lower().decode(): value.strip().decode() for name, value in headers.items()}
+            length = int(headers.get("content-length", "0"))
+            while len(body) < length:
+                chunk = conn.recv(4096)
+                if not chunk:
+                    break
+                body += chunk
+            with open(os.path.join(directory, "received.json"), "w") as stream:
+                json.dump({"contentType": headers.get("content-type"), "body": body.decode()}, stream)
+            answer(conn, 200, {"slot": 2, "processId": 300, "closed": 1, "notConfirmed": 0, "recordUpdated": True,
+                               "problems": [], "clientGeneration": 11, "operationRevision": 18, "operationId": "net1"})
+        elif key == "POST /api/v1/clients/close":
             answer(conn, 200, {"closed": 0, "notConfirmed": 0, "othersRunning": 0, "problem": None})
         elif key == "GET /api/v1/profiles":
             answer(conn, 200, {})
@@ -502,6 +774,13 @@ if command -v openssl >/dev/null 2>&1 \
                 fail "$command's deadline holds against a trickling server (${elapsed} ms for a 1 s wait)"
             fi
         done
+        expect "close-client --expect over HTTPS sends the body" 0 "closed slot 2 (PID 300)" \
+            real "$vrcrt" close-client 2 --expect "@$share/expect.json" --operation-id net1
+        expect "the body arrives whole as application/json" 0 "" python3 -I -c '
+import json, sys
+received = json.load(open(sys.argv[1]))
+sys.exit(0 if received == {"contentType": "application/json", "body": sys.argv[2]} else 1)' \
+            "$share/received.json" '{"expect":'"$EXPECT_JSON"',"operationId":"net1"}'
     else
         fail "the local HTTPS server did not start"
     fi

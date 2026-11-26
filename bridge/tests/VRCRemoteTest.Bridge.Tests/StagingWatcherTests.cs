@@ -149,6 +149,41 @@ public class StagingWatcherTests : IDisposable
         File.Exists(Path.Combine(_stagingDir, "incoming", "build-1.ready.json")).Should().BeFalse();
     }
 
+    /// <summary>Records the gate's revision when each result is written.</summary>
+    private sealed class RevisionAtWrite(Runtime.BridgeOperationGate gate) : IResultWriter
+    {
+        private readonly ResultWriter _inner = new();
+        public List<long> Revisions { get; } = [];
+
+        public void WriteSuccess(string buildId, string deployedFileName, string sha256, string resultsDirectory)
+        {
+            Revisions.Add(gate.Revision);
+            _inner.WriteSuccess(buildId, deployedFileName, sha256, resultsDirectory);
+        }
+
+        public void WriteFailure(string buildId, string errorCode, string errorMessage, string resultsDirectory)
+        {
+            Revisions.Add(gate.Revision);
+            _inner.WriteFailure(buildId, errorCode, errorMessage, resultsDirectory);
+        }
+    }
+
+    [Fact]
+    public async Task A_deploy_moves_the_revision_before_it_starts_and_before_its_result_only()
+    {
+        var gate = new Runtime.BridgeOperationGate();
+        var writer = new RevisionAtWrite(gate);
+        var watcher = new StagingWatcher(
+            Options.Create(CreateOptions(1024, 10, false, null)), new PackageValidator(), new WorldInstaller(), writer,
+            new CleanupService(), new FakeVrchatClientCoordinator(), _logNotice, NullLogger<StagingWatcher>.Instance, gate);
+        WriteIncomingBuild(_stagingDir, "build-1", Encoding.UTF8.GetBytes("fake-world-bundle"));
+
+        await watcher.RunOnceAsync(CancellationToken.None);
+
+        writer.Revisions.Should().Equal(2L);
+        gate.Revision.Should().Be(2, "nothing moves it after the result, which Unity may read at once");
+    }
+
     [Fact]
     public async Task Startup_discards_an_interrupted_http_upload_partial()
     {

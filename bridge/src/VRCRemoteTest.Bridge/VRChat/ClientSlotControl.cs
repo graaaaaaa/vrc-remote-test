@@ -21,22 +21,29 @@ public enum SlotRefusal
     OthersRunning,
     RecordUnwritable,
     LaunchFailed,
+
+    /// <summary>The caller's expected client generation differs (r1b-contract §1.3); answered 412.</summary>
+    PreconditionFailed,
 }
 
 /// <param name="Refusal">Set when nothing was closed; the rest is then empty.</param>
 /// <param name="RecordUpdated">The closed client's entry was removed from the record.</param>
+/// <param name="ClientGeneration">The generation of the client it closed (or tried to); for PreconditionFailed, the slot's current one.</param>
+/// <param name="Attempted">The client was asked to exit: something on Windows changed or may have.</param>
 public sealed record SlotCloseResult(
     SlotRefusal? Refusal, int Slot, int? ProcessId, int Closed, int NotConfirmed, bool RecordUpdated,
-    IReadOnlyList<string> Problems)
+    IReadOnlyList<string> Problems, long? ClientGeneration = null, bool Attempted = false)
 {
     public bool Done => Refusal is null && Closed == 1 && RecordUpdated;
 }
 
 /// <param name="Refusal">Set when nothing was started.</param>
 /// <param name="NotRecorded">A client started but could not be recorded: the Bridge cannot recognize it as its own.</param>
+/// <param name="ClientGeneration">The new client's generation; for PreconditionFailed, the generation a launch would expect (or null).</param>
+/// <param name="Attempted">VRChat was asked to start (even if it failed): something on Windows changed or may have.</param>
 public sealed record SlotLaunchResult(
     SlotRefusal? Refusal, int Slot, int? Profile, int? ProcessId, long? ClientGeneration, bool NotRecorded,
-    IReadOnlyList<string> Problems)
+    IReadOnlyList<string> Problems, bool Attempted = false)
 {
     public bool Done => Refusal is null && !NotRecorded;
 }
@@ -120,7 +127,13 @@ public sealed class ClientSlotControl
         _pacer = new VrchatLaunchPacer(logger, delay, listLogFiles, utcNow, TimeZoneInfo.Local);
     }
 
-    public async Task<SlotCloseResult> CloseAsync(int slot, CancellationToken cancellationToken)
+    /// <param name="expectedGeneration">
+    /// From the request's precondition: the generation of the client the caller means to close.
+    /// When the client found differs, nothing is closed (PreconditionFailed). Null: the old request.
+    /// </param>
+    /// <param name="beforeSideEffect">Called once right before the client is asked to exit (the LAN API moves the operation revision there).</param>
+    public async Task<SlotCloseResult> CloseAsync(
+        int slot, CancellationToken cancellationToken, long? expectedGeneration = null, Action? beforeSideEffect = null)
     {
         if (CheckSlotAndMode(slot) is { } refusal)
         {
@@ -162,12 +175,24 @@ public sealed class ClientSlotControl
                 $"(PID {handle.ProcessId}); try again once `vrcrt.sh status` shows PID {handle.ProcessId} in slot {slot}.");
         }
 
+        var generation = VrchatClientRoster.GenerationOf(handle.ProcessId, handle.CreationTimeUtc);
+        if (expectedGeneration is { } expected && expected != generation)
+        {
+            _logger.LogWarning(
+                "Single-client close of slot {Slot} refused (PreconditionFailed): expected generation {Expected}, found {Generation}.",
+                slot, expected, generation);
+            return new SlotCloseResult(SlotRefusal.PreconditionFailed, slot, null, 0, 0, false,
+                [$"Slot {slot} runs generation {generation}, not the expected {expected}."], generation);
+        }
+
+        beforeSideEffect?.Invoke();
         var result = await _terminator.CloseAsync([handle], cancellationToken).ConfigureAwait(false);
         var problems = new List<string>();
         var exited = result.NotConfirmed.Count == 0;
         var recordUpdated = false;
         if (exited)
         {
+            _context.MarkClosed(slot, generation);
             recordUpdated = TrySave(load.Clients.Where(c => c != record).ToList());
             if (!recordUpdated)
             {
@@ -189,10 +214,18 @@ public sealed class ClientSlotControl
             slot, handle.ProcessId, handle.CreationTimeUtc, record.Profile, exited, recordUpdated);
 
         return new SlotCloseResult(
-            null, slot, handle.ProcessId, exited ? 1 : 0, exited ? 0 : 1, recordUpdated, problems);
+            null, slot, handle.ProcessId, exited ? 1 : 0, exited ? 0 : 1, recordUpdated, problems, generation, Attempted: true);
     }
 
-    public async Task<SlotLaunchResult> LaunchAsync(int slot, CancellationToken cancellationToken)
+    /// <param name="expectedGeneration">
+    /// From the request's precondition: the generation of the client this launch replaces, which
+    /// must be the one a single close last confirmed closed in this slot during the current batch,
+    /// or the recorded (no longer running) client of the slot. Otherwise nothing is started
+    /// (PreconditionFailed). Null: the old request.
+    /// </param>
+    /// <param name="beforeSideEffect">Called once right before VRChat is asked to start (the LAN API moves the operation revision there).</param>
+    public async Task<SlotLaunchResult> LaunchAsync(
+        int slot, CancellationToken cancellationToken, long? expectedGeneration = null, Action? beforeSideEffect = null)
     {
         if (CheckSlotAndMode(slot) is { } refusal)
         {
@@ -224,6 +257,25 @@ public sealed class ClientSlotControl
             return RefuseLaunch(slot, running.Reason, running.Problem);
         }
 
+        if (expectedGeneration is { } expected)
+        {
+            var closed = _context.ClosedGeneration(slot);
+            var recorded = load.Clients.FirstOrDefault(c => c.LaunchOrder == slot) is { } r
+                ? VrchatClientRoster.GenerationOf(r.ProcessId, r.CreationTimeUtc)
+                : (long?)null;
+            if (expected != closed && expected != recorded)
+            {
+                var known = closed ?? recorded;
+                _logger.LogWarning(
+                    "Single-client launch of slot {Slot} refused (PreconditionFailed): expected generation {Expected}, " +
+                    "closed {Closed}, recorded {Recorded}.", slot, expected, closed, recorded);
+                return new SlotLaunchResult(SlotRefusal.PreconditionFailed, slot, null, null, known, false,
+                    [known is null
+                        ? $"No client of slot {slot} is known to have been closed in this batch."
+                        : $"The client last closed in slot {slot} is generation {known}, not the expected {expected}."]);
+            }
+        }
+
         // Writing the record as it is proves it can be written, so the client launched next can be
         // recorded, without changing which clients it lists: a refusal below leaves it as it was.
         // The slot's old entry (a client that has exited) is replaced only once the new one starts.
@@ -252,6 +304,7 @@ public sealed class ClientSlotControl
         var filesBefore = _pacer.ListPaths();
         var startedUtc = _utcNow();
         LaunchResult result;
+        beforeSideEffect?.Invoke();
         try
         {
             var task = _launcher.LaunchAsync(request);
@@ -265,7 +318,7 @@ public sealed class ClientSlotControl
         if (!result.Succeeded)
         {
             return RefuseLaunch(slot, SlotRefusal.LaunchFailed,
-                $"VRChat could not be started in slot {slot} (profile {plan.Profile}): {result.ErrorMessage}");
+                $"VRChat could not be started in slot {slot} (profile {plan.Profile}): {result.ErrorMessage}") with { Attempted = true };
         }
 
         _context.RecordLaunch(startedUtc, filesBefore);
@@ -296,7 +349,7 @@ public sealed class ClientSlotControl
             "Single-client launch of slot {Slot} (profile {Profile}, PID {ProcessId}, created {CreationTimeUtc:O}, " +
             "generation {Generation}, roomId {RoomId}).",
             slot, plan.Profile, processId, creationTimeUtc, generation, plan.RoomId);
-        return new SlotLaunchResult(null, slot, plan.Profile, processId, generation, false, []);
+        return new SlotLaunchResult(null, slot, plan.Profile, processId, generation, false, [], Attempted: true);
     }
 
     private (SlotRefusal Reason, string Problem)? CheckSlotAndMode(int slot)
@@ -388,6 +441,6 @@ public sealed class ClientSlotControl
     private SlotLaunchResult NotRecorded(int slot, int profile, int? processId, string problem)
     {
         _logger.LogError("Single-client launch of slot {Slot}: {Problem}", slot, problem);
-        return new SlotLaunchResult(null, slot, profile, processId, null, true, [problem]);
+        return new SlotLaunchResult(null, slot, profile, processId, null, true, [problem], Attempted: true);
     }
 }

@@ -31,7 +31,7 @@ internal sealed class FakeVrchatClientCoordinator : IVrchatClientCoordinator
         return Task.FromResult(PreparationToReturn);
     }
 
-    public Task<VrchatLaunchOutcome> LaunchClientsAsync(string deployedWorldPath, CancellationToken cancellationToken)
+    public Task<VrchatLaunchOutcome> LaunchClientsAsync(string deployedWorldPath, string buildId, CancellationToken cancellationToken)
     {
         LaunchedWorldPaths.Add(deployedWorldPath);
         OnLaunch?.Invoke();

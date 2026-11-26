@@ -343,6 +343,19 @@ namespace VRCRemoteTest
                 SlotOperationReport.ReadClose, cancellationToken);
 
         /// <summary>
+        /// POST /clients/{slot}/close with a precondition (Bridge v0.12.0 and later, feature
+        /// slotPreconditions.v1): the Bridge does nothing (412) when the client or the Bridge
+        /// differs from <paramref name="precondition"/>. A null precondition is the body-less
+        /// request of <see cref="CloseVrchatClientAsync(int, CancellationToken)"/>. Send one only
+        /// to a Bridge that reports the feature. Holds the build lock; never retried.
+        /// </summary>
+        public Task<VrchatClientSettingsOutcome> CloseVrchatClientAsync(int slot, SlotPrecondition precondition,
+            string operationId = null, CancellationToken cancellationToken = default) =>
+            CheckedOperationId(precondition, operationId)
+            ?? SlotOperationAsync(slot, "close", token => _transport.CloseClientAsync(slot, precondition, operationId, token),
+                SlotCloseTimeout, SlotOperationReport.ReadClose, cancellationToken);
+
+        /// <summary>
         /// POST /clients/{slot}/launch (Bridge v0.10.0 and later, Relaunch): starts that slot again
         /// with the arguments of the last deploy. Never retried: an answer that is lost leaves
         /// unknown whether it started.
@@ -350,6 +363,93 @@ namespace VRCRemoteTest
         public Task<VrchatClientSettingsOutcome> LaunchVrchatClientAsync(int slot, CancellationToken cancellationToken = default) =>
             SlotOperationAsync(slot, "launch", token => _transport.LaunchClientAsync(slot, token), SlotLaunchTimeout,
                 SlotOperationReport.ReadLaunch, cancellationToken);
+
+        /// <summary>
+        /// POST /clients/{slot}/launch with a precondition; as the close overload. For a launch,
+        /// the client generation is the one of the client that exited in that slot.
+        /// </summary>
+        public Task<VrchatClientSettingsOutcome> LaunchVrchatClientAsync(int slot, SlotPrecondition precondition,
+            string operationId = null, CancellationToken cancellationToken = default) =>
+            CheckedOperationId(precondition, operationId)
+            ?? SlotOperationAsync(slot, "launch", token => _transport.LaunchClientAsync(slot, precondition, operationId, token),
+                SlotLaunchTimeout, SlotOperationReport.ReadLaunch, cancellationToken);
+
+        /// <summary>An answer without a request when the operation ID cannot be sent; else null.</summary>
+        private static Task<VrchatClientSettingsOutcome> CheckedOperationId(SlotPrecondition precondition, string operationId)
+        {
+            if (operationId == null || (precondition != null && SlotPrecondition.IsValidOperationId(operationId)))
+            {
+                return null;
+            }
+
+            return Task.FromResult(precondition == null
+                ? VrchatClientSettingsOutcome.Failure("An operation ID is sent only with a precondition; nothing was sent.")
+                : VrchatClientSettingsOutcome.Failure(
+                    "An operation ID is 1 to 64 letters, digits, '_' or '-'; nothing was sent."));
+        }
+
+        /// <summary>Each fresh read before a checked Close or Launch (GET /capabilities, GET /bridge).</summary>
+        internal TimeSpan SlotGuardReadTimeout { get; set; } = TimeSpan.FromSeconds(10);
+
+        /// <summary>Replaced by the tests.</summary>
+        internal Func<DateTimeOffset> UtcNow { get; set; } = () => DateTimeOffset.UtcNow;
+
+        /// <summary>A fresh GET /capabilities within <see cref="SlotGuardReadTimeout"/>; null when it could not be read.</summary>
+        internal async Task<BridgeCapabilities> ReadBridgeCapabilitiesAsync(CancellationToken cancellationToken = default)
+        {
+            using (var deadline = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken))
+            {
+                deadline.CancelAfter(SlotGuardReadTimeout);
+                try
+                {
+                    return await _transport.GetCapabilitiesAsync(deadline.Token).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+                {
+                    return null;
+                }
+            }
+        }
+
+        /// <summary>A fresh GET /bridge with <see cref="BridgeInfo.ReadAtUtc"/> set; null when it could not be read.</summary>
+        internal async Task<BridgeInfo> ReadBridgeInfoAsync(CancellationToken cancellationToken = default)
+        {
+            var askedAtUtc = UtcNow();
+            var response = await CallWithin(_transport.GetBridgeInfoAsync, SlotGuardReadTimeout, cancellationToken)
+                .ConfigureAwait(false);
+            var info = response.IsSuccess ? response.As<BridgeInfo>() : null;
+            if (info != null)
+            {
+                info.ReadAtUtc = askedAtUtc;
+            }
+
+            return info;
+        }
+
+        /// <summary>
+        /// Whether the window's Close or Launch goes with a precondition, and which
+        /// (docs/plans/r1b-contract.md §4): the capabilities are read afresh; when they report
+        /// slotPreconditions.v1, the precondition is <paramref name="clientGeneration"/> (the row's)
+        /// with <paramref name="shownBridge"/> when it was asked for in the last 15 s, else with a
+        /// GET /bridge read now. Sends nothing to close or launch.
+        /// </summary>
+        internal async Task<SlotGuardDecision> ResolveSlotGuardAsync(bool confirmedGuarded, long clientGeneration,
+            BridgeInfo shownBridge, CancellationToken cancellationToken = default)
+        {
+            var capabilities = await ReadBridgeCapabilitiesAsync(cancellationToken).ConfigureAwait(false);
+            var feature = capabilities != null && capabilities.SupportsSlotPreconditions;
+            var decision = SlotGuard.Decide(feature, confirmedGuarded, shownBridge, clientGeneration, UtcNow());
+            if (decision.Kind != SlotGuardKind.NeedsFreshBridge)
+            {
+                return decision;
+            }
+
+            var fresh = await ReadBridgeInfoAsync(cancellationToken).ConfigureAwait(false);
+            decision = SlotGuard.Decide(feature, confirmedGuarded, fresh, clientGeneration, UtcNow());
+            return decision.Kind == SlotGuardKind.NeedsFreshBridge
+                ? SlotGuardDecision.Refused("the Bridge's state (GET /bridge) could not be read again, so nothing was sent")
+                : decision;
+        }
 
         private async Task<VrchatClientSettingsOutcome> SlotOperationAsync(
             int slot, string what, Func<CancellationToken, Task<BridgeAdminResponse>> call, TimeSpan timeout,

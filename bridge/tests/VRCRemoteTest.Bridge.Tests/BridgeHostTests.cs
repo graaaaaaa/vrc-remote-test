@@ -544,6 +544,148 @@ public sealed class BridgeHostTests : IAsyncLifetime
         Assert.Contains(_record.Clients, c => c.ProcessId == 101 && c.LaunchOrder == 1);
     }
 
+    // ---- preconditions (docs/plans/r1b-contract.md §1) ----
+
+    private async Task<JsonObject> BridgeInfoAsync() =>
+        JsonNode.Parse(await (await _client!.GetAsync("bridge")).Content.ReadAsStringAsync())!.AsObject();
+
+    private static JsonObject ExpectFrom(JsonObject info, long clientGeneration, long? revision = null) => new()
+    {
+        ["bridgeInstanceId"] = info["bridgeInstanceId"]!.GetValue<string>(),
+        ["hostGeneration"] = info["hostGeneration"]!.GetValue<int>(),
+        ["activeConfigEtag"] = info["activeConfigEtag"]?.GetValue<string>(),
+        ["savedConfigEtag"] = info["savedConfigEtag"]?.GetValue<string>(),
+        ["operationRevision"] = revision ?? info["operationRevision"]!.GetValue<long>(),
+        ["buildId"] = info["currentBatch"]!["buildId"]?.GetValue<string>(),
+        ["clientGeneration"] = clientGeneration,
+    };
+
+    private Task<HttpResponseMessage> PostExpectAsync(string path, JsonObject expect, string? operationId = null)
+    {
+        var body = new JsonObject { ["expect"] = expect };
+        if (operationId is not null)
+        {
+            body["operationId"] = operationId;
+        }
+
+        return _client!.PostAsync(path, new StringContent(body.ToJsonString(), Encoding.UTF8, "application/json"));
+    }
+
+    [Fact]
+    public async Task A_guarded_close_and_launch_each_move_the_revision_by_one()
+    {
+        var (slot0, slot1) = await StartRelaunchAsync();
+        var capabilities = JsonNode.Parse(await (await _client!.GetAsync("capabilities")).Content.ReadAsStringAsync())!;
+        Assert.Contains("slotPreconditions.v1", capabilities["features"]!.AsArray().Select(f => f!.GetValue<string>()));
+        var info = await BridgeInfoAsync();
+        Assert.Matches("^[0-9a-f]{32}$", info["bridgeInstanceId"]!.GetValue<string>());
+        var revision = info["operationRevision"]!.GetValue<long>();
+        var generation0 = VrchatClientRoster.GenerationOf(100, slot0.CreationTimeUtc);
+
+        var close = await PostExpectAsync("clients/0/close", ExpectFrom(info, generation0), "run-1-close");
+        var closed = JsonNode.Parse(await close.Content.ReadAsStringAsync())!;
+        Assert.Equal(HttpStatusCode.OK, close.StatusCode);
+        Assert.Equal(revision + 1, closed["operationRevision"]!.GetValue<long>());
+        Assert.Equal(generation0, closed["clientGeneration"]!.GetValue<long>());
+        Assert.Equal("run-1-close", closed["operationId"]!.GetValue<string>());
+        Assert.Equal(info["bridgeInstanceId"]!.GetValue<string>(), closed["bridgeInstanceId"]!.GetValue<string>());
+        Assert.False(slot0.IsRunning);
+        // The test host seeds its batch when the control is first used, so it shows from here.
+        Assert.Equal(new[] { 0, 1 }, (await BridgeInfoAsync())["currentBatch"]!["launchedSlots"]!.AsArray().Select(s => s!.GetValue<int>()));
+
+        var launch = await PostExpectAsync("clients/0/launch", ExpectFrom(info, generation0, revision + 1), "run-1-launch");
+        var launched = JsonNode.Parse(await launch.Content.ReadAsStringAsync())!;
+        Assert.Equal(HttpStatusCode.OK, launch.StatusCode);
+        Assert.Equal(revision + 2, launched["operationRevision"]!.GetValue<long>());
+        Assert.Single(_launcher.Requests);
+        Assert.True(slot1.IsRunning);
+    }
+
+    [Fact]
+    public async Task A_stale_precondition_is_answered_412_and_does_nothing()
+    {
+        var (slot0, _) = await StartRelaunchAsync();
+        var info = await BridgeInfoAsync();
+        var revision = info["operationRevision"]!.GetValue<long>();
+        var generation0 = VrchatClientRoster.GenerationOf(100, slot0.CreationTimeUtc);
+
+        var staleRevision = await PostExpectAsync("clients/0/close", ExpectFrom(info, generation0, revision - 1), "op-1");
+        var otherClient = await PostExpectAsync("clients/0/close", ExpectFrom(info, generation0 + 1));
+        var otherBridge = ExpectFrom(info, generation0);
+        otherBridge["bridgeInstanceId"] = new string('0', 32);
+        var restarted = await PostExpectAsync("clients/0/close", otherBridge);
+
+        Assert.Equal(HttpStatusCode.PreconditionFailed, staleRevision.StatusCode);
+        var body = JsonNode.Parse(await staleRevision.Content.ReadAsStringAsync())!;
+        Assert.Equal("preconditionFailed", body["error"]!.GetValue<string>());
+        Assert.Equal(new[] { "operationRevision" }, body["mismatched"]!.AsArray().Select(m => m!.GetValue<string>()));
+        Assert.Equal(revision, body["current"]!["operationRevision"]!.GetValue<long>());
+        Assert.Equal("op-1", body["operationId"]!.GetValue<string>());
+        Assert.Equal(HttpStatusCode.PreconditionFailed, otherClient.StatusCode);
+        Assert.Contains("clientGeneration", await otherClient.Content.ReadAsStringAsync());
+        Assert.Equal(HttpStatusCode.PreconditionFailed, restarted.StatusCode);
+        Assert.True(slot0.IsRunning);
+        Assert.Equal(0, slot0.CloseCalls + slot0.KillCalls);
+        Assert.Equal(revision, (await BridgeInfoAsync())["operationRevision"]!.GetValue<long>());
+    }
+
+    [Fact]
+    public async Task A_malformed_body_is_refused_400_and_never_read_as_none()
+    {
+        var (slot0, _) = await StartRelaunchAsync();
+        var revision = (await BridgeInfoAsync())["operationRevision"]!.GetValue<long>();
+        var chunked = new StreamContent(new MemoryStream(Encoding.UTF8.GetBytes("{\"expect\":")));
+        chunked.Headers.ContentType = new MediaTypeHeaderValue("application/json");
+
+        var responses = new[]
+        {
+            await _client!.PostAsync("clients/0/close", new StringContent("{}", Encoding.UTF8, "application/json")),
+            await _client.PostAsync("clients/0/close", new StringContent("{\"expect\":{}}", Encoding.UTF8, "text/plain")),
+            await _client.PostAsync("clients/0/close", chunked),
+            await _client.PostAsync("clients/0/launch", new StringContent(new string(' ', 5000), Encoding.UTF8, "application/json")),
+        };
+
+        Assert.All(responses, r => Assert.Equal(HttpStatusCode.BadRequest, r.StatusCode));
+        foreach (var response in responses)
+        {
+            Assert.Equal("invalidPrecondition", JsonNode.Parse(await response.Content.ReadAsStringAsync())!["error"]!.GetValue<string>());
+        }
+
+        Assert.True(slot0.IsRunning);
+        Assert.False(_launcher.LaunchCalled);
+        Assert.Equal(revision, (await BridgeInfoAsync())["operationRevision"]!.GetValue<long>());
+    }
+
+    [Fact]
+    public async Task A_close_all_that_closes_nothing_leaves_the_revision()
+    {
+        var (slot0, slot1) = await StartRelaunchAsync();
+        slot0.Exit();
+        slot1.Exit();
+        var revision = (await BridgeInfoAsync())["operationRevision"]!.GetValue<long>();
+
+        var response = await _client!.PostAsync("clients/close", null);
+
+        Assert.Equal(0, JsonNode.Parse(await response.Content.ReadAsStringAsync())!["closed"]!.GetValue<int>());
+        Assert.Equal(revision, (await BridgeInfoAsync())["operationRevision"]!.GetValue<long>());
+    }
+
+    [Fact]
+    public async Task A_close_without_a_body_also_reports_the_revision_and_the_Bridge()
+    {
+        await StartRelaunchAsync();
+        var revision = (await BridgeInfoAsync())["operationRevision"]!.GetValue<long>();
+
+        var close = await _client!.PostAsync("clients/0/close", null);
+        var closed = JsonNode.Parse(await close.Content.ReadAsStringAsync())!.AsObject();
+
+        Assert.Equal(HttpStatusCode.OK, close.StatusCode);
+        Assert.Equal(revision + 1, closed["operationRevision"]!.GetValue<long>());
+        Assert.True(closed.ContainsKey("operationId"));
+        Assert.Null(closed["operationId"]);
+        Assert.Matches("^[0-9a-f]{32}$", closed["bridgeInstanceId"]!.GetValue<string>());
+    }
+
     [Fact]
     public async Task Without_the_token_the_single_client_routes_answer_401_and_touch_nothing()
     {

@@ -117,5 +117,28 @@ namespace VRCRemoteTest
 
         /// <summary>POST /clients/{slot}/launch (Bridge v0.10.0 and later, Relaunch): starts that slot again with the last deploy's arguments.</summary>
         Task<BridgeAdminResponse> LaunchClientAsync(int slot, CancellationToken cancellationToken = default);
+
+        /// <summary>
+        /// POST /clients/{slot}/close with an optional precondition (Bridge v0.12.0 and later,
+        /// feature slotPreconditions.v1). A null <paramref name="precondition"/> sends exactly the
+        /// body-less request of <see cref="CloseClientAsync(int, CancellationToken)"/>; otherwise the
+        /// body {"expect": ..., "operationId": ...} goes as application/json, and the Bridge does
+        /// nothing (412) when what it expects differs. Send one only to a Bridge that reports the
+        /// feature: an older one ignores the body and closes unchecked.
+        /// </summary>
+        /// <exception cref="System.ArgumentException">An <paramref name="operationId"/> that is not valid.</exception>
+        Task<BridgeAdminResponse> CloseClientAsync(int slot, SlotPrecondition precondition, string operationId,
+            CancellationToken cancellationToken = default);
+
+        /// <summary>POST /clients/{slot}/launch with an optional precondition; as the close overload.</summary>
+        /// <exception cref="System.ArgumentException">An <paramref name="operationId"/> that is not valid.</exception>
+        Task<BridgeAdminResponse> LaunchClientAsync(int slot, SlotPrecondition precondition, string operationId,
+            CancellationToken cancellationToken = default);
+
+        /// <summary>
+        /// A fresh read of GET /capabilities, or null when it could not be read. Its features are
+        /// empty for a Bridge that reports none.
+        /// </summary>
+        Task<BridgeCapabilities> GetCapabilitiesAsync(CancellationToken cancellationToken = default);
     }
 }

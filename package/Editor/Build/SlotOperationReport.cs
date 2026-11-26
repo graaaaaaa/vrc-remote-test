@@ -113,6 +113,26 @@ namespace VRCRemoteTest
 
             var error = body?["error"]?.Type == JTokenType.String ? (string)body["error"] : null;
             var problems = Strings(body?["problems"]);
+
+            // Bridge v0.12.0, a request sent with a precondition: the Bridge checked it inside its
+            // operation gate and did nothing. Never retried: the list has to be read again.
+            if (response.StatusCode == 412 && error == "preconditionFailed")
+            {
+                var mismatched = MismatchedNames(body["mismatched"]);
+                return VrchatClientSettingsOutcome.Failure(
+                    $"The Bridge did not {what} slot {slot}: the client or the Bridge changed after the client list "
+                    + "was read" + (mismatched == null ? string.Empty : " (" + mismatched + " differ)")
+                    + ". Nothing was done. Wait for the list to refresh, check it, and try again.");
+            }
+
+            if (response.StatusCode == 400 && error == "invalidPrecondition" && problems != null)
+            {
+                return VrchatClientSettingsOutcome.Failure(
+                    $"The Bridge did not {what} slot {slot}: it does not accept the check this package sent "
+                    + "(invalidPrecondition). Nothing was done. Update the Bridge and this package to the same version.",
+                    problems);
+            }
+
             if ((response.StatusCode == 400 || response.StatusCode == 409 || response.StatusCode == 500) && error != null
                 && (problems != null || (error == "busy" && body["problems"] == null)))
             {
@@ -128,6 +148,28 @@ namespace VRCRemoteTest
             return VrchatClientSettingsOutcome.Failure(
                 $"The Bridge's answer to {what} slot {slot} is not one it sends (HTTP {response.StatusCode}); "
                 + "whether it acted is unknown. Check the client list.");
+        }
+
+        /// <summary>The names the Bridge checks, of those in a 412's "mismatched"; null when none of them is there.</summary>
+        private static string MismatchedNames(JToken token)
+        {
+            var names = Strings(token);
+            if (names == null)
+            {
+                return null;
+            }
+
+            // Only the seven known names are shown, so nothing else from the answer reaches the UI.
+            var known = new List<string>();
+            foreach (var name in names)
+            {
+                if (System.Array.IndexOf(SlotPrecondition.Keys, name) >= 0 && !known.Contains(name))
+                {
+                    known.Add(name);
+                }
+            }
+
+            return known.Count == 0 ? null : string.Join(", ", known);
         }
 
         private static VrchatClientSettingsOutcome NotAReport(string what, int slot) =>

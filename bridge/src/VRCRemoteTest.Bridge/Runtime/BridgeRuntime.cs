@@ -116,6 +116,9 @@ public sealed class BridgeRuntime
 
     public DateTimeOffset ProcessStartedAtUtc { get; }
 
+    /// <summary>128 random bits per process, 32 hex digits: a restarted Bridge is told apart from the one before.</summary>
+    public string InstanceId { get; } = Convert.ToHexString(RandomNumberGenerator.GetBytes(16)).ToLowerInvariant();
+
     /// <summary>1 for the first host, one more for each restart.</summary>
     public int HostGeneration { get; private set; }
 
@@ -206,6 +209,7 @@ public sealed class BridgeRuntime
         {
             HostGeneration++;
             HostStartedAtUtc = _utcNow();
+            Gate.Bump();
             ActiveConfigEtag = activeConfigEtag;
             _restartScheduled = false;
             _restartSignal = NewSignal();

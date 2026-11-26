@@ -263,20 +263,28 @@ public sealed class VrchatRelaunchCoordinator : IVrchatClientCoordinator
     /// Viewer's notice ends once the first client is recorded, or when the batch stops before.
     /// </summary>
     public async Task<VrchatLaunchOutcome> LaunchClientsAsync(
-        string deployedWorldPath, CancellationToken cancellationToken)
+        string deployedWorldPath, string buildId, CancellationToken cancellationToken)
     {
+        var succeeded = false;
         try
         {
-            return await LaunchClientsCoreAsync(deployedWorldPath, cancellationToken).ConfigureAwait(false);
+            var outcome = await LaunchClientsCoreAsync(deployedWorldPath, buildId, cancellationToken).ConfigureAwait(false);
+            succeeded = outcome.Succeeded;
+            return outcome;
         }
         finally
         {
+            if (!succeeded)
+            {
+                _launchContext.MarkBatchFailed();
+            }
+
             _logNotice.Clear();
         }
     }
 
     private async Task<VrchatLaunchOutcome> LaunchClientsCoreAsync(
-        string deployedWorldPath, CancellationToken cancellationToken)
+        string deployedWorldPath, string buildId, CancellationToken cancellationToken)
     {
         var profiles = _options.VrchatProfiles
             ?? throw new InvalidOperationException("VrchatProfiles is required in Relaunch mode.");
@@ -286,7 +294,7 @@ public sealed class VrchatRelaunchCoordinator : IVrchatClientCoordinator
 
         // PrepareAsync left the record empty: every client it listed has exited.
         var launched = new List<ManagedClient>();
-        _launchContext.BeginBatch(deployedWorldPath, roomId);
+        _launchContext.BeginBatch(deployedWorldPath, roomId, buildId);
         var batch = _pacer.StartBatch(count);
         var previousLaunchUtc = DateTime.MinValue;
 

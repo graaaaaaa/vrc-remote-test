@@ -22,6 +22,7 @@ public interface IVrchatClientCoordinator
     /// entry), at least 3 seconds apart and each after the previous one's output_log
     /// file has appeared (within a bounded wait), all opening
     /// <paramref name="deployedWorldPath"/> in one shared instance via --url.
+    /// <paramref name="buildId"/> is the manifest's build ID, kept with a Relaunch batch for /bridge's currentBatch.
     /// </summary>
-    Task<VrchatLaunchOutcome> LaunchClientsAsync(string deployedWorldPath, CancellationToken cancellationToken);
+    Task<VrchatLaunchOutcome> LaunchClientsAsync(string deployedWorldPath, string buildId, CancellationToken cancellationToken);
 }

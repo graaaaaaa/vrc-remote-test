@@ -82,7 +82,7 @@ public sealed class StagingWatcher : BackgroundService, IBridgeWatcher
         {
             Attempted = false,
             Outcome = _options.AutoLaunchVrchat ? LaunchReport.NotReached : LaunchReport.Disabled,
-        });
+        }, BeforeResult);
         _cleanupService = cleanupService;
         _clientCoordinator = clientCoordinator;
         _logNotice = logNotice;
@@ -99,23 +99,68 @@ public sealed class StagingWatcher : BackgroundService, IBridgeWatcher
     /// (validation failures and the like, before VRChat was looked at) gets notReached, or
     /// disabled when AutoLaunchVrchat is off.
     /// </summary>
-    private sealed class DefaultLaunchWriter(IResultWriter inner, Func<LaunchReport> notLaunched) : IResultWriter
+    private sealed class DefaultLaunchWriter(IResultWriter inner, Func<LaunchReport> notLaunched, Action beforeWrite) : IResultWriter
     {
-        public void WriteSuccess(string buildId, string deployedFileName, string sha256, string resultsDirectory) =>
+        public void WriteSuccess(string buildId, string deployedFileName, string sha256, string resultsDirectory)
+        {
+            beforeWrite();
             inner.WriteSuccess(buildId, deployedFileName, sha256, resultsDirectory, new BuildResultExtras(notLaunched()));
+        }
 
-        public void WriteFailure(string buildId, string errorCode, string errorMessage, string resultsDirectory) =>
+        public void WriteFailure(string buildId, string errorCode, string errorMessage, string resultsDirectory)
+        {
+            beforeWrite();
             inner.WriteFailure(buildId, errorCode, errorMessage, resultsDirectory, new BuildResultExtras(notLaunched()));
+        }
 
         public void WriteSuccess(
-            string buildId, string deployedFileName, string sha256, string resultsDirectory, BuildResultExtras extras) =>
+            string buildId, string deployedFileName, string sha256, string resultsDirectory, BuildResultExtras extras)
+        {
+            beforeWrite();
             inner.WriteSuccess(buildId, deployedFileName, sha256, resultsDirectory,
                 extras with { Launch = extras.Launch ?? notLaunched() });
+        }
 
         public void WriteFailure(
-            string buildId, string errorCode, string errorMessage, string resultsDirectory, BuildResultExtras extras) =>
+            string buildId, string errorCode, string errorMessage, string resultsDirectory, BuildResultExtras extras)
+        {
+            beforeWrite();
             inner.WriteFailure(buildId, errorCode, errorMessage, resultsDirectory,
                 extras with { Launch = extras.Launch ?? notLaunched() });
+        }
+    }
+
+    private int _resultsWritten;
+
+    /// <summary>
+    /// The revision moves before a result is written, not after: Unity (and the runner after it)
+    /// may read /bridge as soon as the result is there, and must see the deploy's last move.
+    /// </summary>
+    private void BeforeResult()
+    {
+        Interlocked.Increment(ref _resultsWritten);
+        _gate?.Bump();
+    }
+
+    /// <summary>
+    /// One deploy (or one recovered from processing/): the revision moves before it starts and
+    /// before its result is written (BeforeResult), or once at the end when no result was written.
+    /// </summary>
+    private async Task WithRevisionAsync(Func<Task> deploy)
+    {
+        _gate?.Bump();
+        var written = Volatile.Read(ref _resultsWritten);
+        try
+        {
+            await deploy();
+        }
+        finally
+        {
+            if (Volatile.Read(ref _resultsWritten) == written)
+            {
+                _gate?.Bump();
+            }
+        }
     }
 
     // HTTP commits arrive in a private queue; no directory is network-shared.
@@ -216,9 +261,11 @@ public sealed class StagingWatcher : BackgroundService, IBridgeWatcher
             // One file the Bridge cannot handle must not stall every build queued behind
             // it: the share is attacker-writable, so a single crafted name or a transient
             // I/O error would otherwise block ingestion on every scan.
+            // A deploy changes what runs on Windows (or may, if it stops halfway): the revision
+            // moves before it and again before its result (WithRevisionAsync), whatever the outcome.
             try
             {
-                await ClaimAndProcessAsync(readyFile, cancellationToken);
+                await WithRevisionAsync(() => ClaimAndProcessAsync(readyFile, cancellationToken));
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
@@ -254,7 +301,7 @@ public sealed class StagingWatcher : BackgroundService, IBridgeWatcher
         {
             cancellationToken.ThrowIfCancellationRequested();
             _logger.LogWarning("Recovering unfinished build left in processing/: {File}", readyFile);
-            await ProcessClaimedManifestSafelyAsync(readyFile, cancellationToken);
+            await WithRevisionAsync(() => ProcessClaimedManifestSafelyAsync(readyFile, cancellationToken));
         }
     }
 
@@ -727,7 +774,7 @@ public sealed class StagingWatcher : BackgroundService, IBridgeWatcher
         VrchatLaunchOutcome outcome;
         try
         {
-            outcome = await _clientCoordinator.LaunchClientsAsync(deployedWorldPath, cancellationToken);
+            outcome = await _clientCoordinator.LaunchClientsAsync(deployedWorldPath, manifest.BuildId, cancellationToken);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
