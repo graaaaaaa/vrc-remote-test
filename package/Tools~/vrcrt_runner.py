@@ -446,10 +446,17 @@ class Run:
                 self.record["leaveRejoin"] = {"state": "notStarted"}
         if procedure.get("name") == "manual-steps":
             finish_manual(self.record, self.directory, result)
-        # An end-marker wait that never gave its own word: not reached when it never started.
-        if isinstance(results, dict) and "endMarker" in results and results["endMarker"] is None:
-            started = isinstance(self.record.get("endMarker"), dict)
-            results["endMarker"] = "CANCELED" if result == "CANCELED" else ("UNKNOWN" if started else "notReached")
+        # An end-marker wait that never gave its own word: not reached when it never started,
+        # otherwise CANCELED or UNKNOWN, and its record closed with this run's reason (also for
+        # recover and the next prepare's takeover, which finish here too).
+        if isinstance(results, dict) and "endMarker" in results:
+            state = self.record.get("endMarker")
+            started = isinstance(state, dict)
+            if results["endMarker"] is None:
+                results["endMarker"] = ("CANCELED" if result == "CANCELED" else "UNKNOWN") if started else "notReached"
+            if started and state.get("endedAtUtc") is None:
+                state["endedAtUtc"] = iso()
+                state["reason"] = state.get("reason") or reason or result
         self.save()
         self.progress("finished", result, reason=reason)
 

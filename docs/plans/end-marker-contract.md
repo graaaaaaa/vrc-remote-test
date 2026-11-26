@@ -118,3 +118,11 @@ PASS を記録した commit で `--unvalidated` の要求を外す。
 - 同じ seq の行が伸びる → 一番新しい行は次の回にもう一度照らす（3.3）。
 - 当たった行があとで捨てられる → 採るときに目印の控えを保存する（3.3）。
 - 結果の順と、途中で止まったときの `endMarker` → 3.4 に書いた。
+
+## 8. Codex のレビュー（差分、gpt-6.1-sol・high、APPROVE_WITH_CHANGES）
+
+major は無し。前の join や確かめていない行が PASS になる道、終わらない繰り返し、送り直し、古い runner の run をハッシュで断ることは見つからなかった。minor 3 件をすべて直した:
+
+- 待ちの前に取り消した run の `results.endMarker` が CANCELED になっていた → 待ちが始まっていなければ `notReached`（3.4 のとおり）。
+- 待ちの途中で止まった run の `record.endMarker` に、終わりの時刻と理由が残らなかった → `Run.finish` で閉じる（recover と次の prepare の引き継ぎも同じ道を通る）。
+- 待ちのあいだの試験が固定の sleep に頼っていた → 段 `waitEndMarker` に入ったこと（伸びる行の試験では、そのあと目印を読んだこと）を待ってから変える形にし、段の結果と理由も確かめる。待ちの前の取り消しの試験を足した。
