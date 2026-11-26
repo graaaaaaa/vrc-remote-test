@@ -508,8 +508,8 @@ check "Reload with the feature keeps R1a's checks" 0 results.clientReadiness PAS
 rm -f "$root"/locks/*.json
 bridge; before_clients; cursor
 python3 -I "$runner" prepare --slots 0,1 --procedure leave-rejoin --target-slot 1 --owner-pid $$ --run-root "$root" > "$work/out" 2>&1
-[ $? -eq 2 ] && grep -q -- --unvalidated "$work/out" && pass "leave-rejoin is refused without --unvalidated" \
-    || { fail "leave-rejoin is refused without --unvalidated"; cat "$work/out"; }
+[ $? -ne 2 ] && ! grep -q -- --unvalidated "$work/out" && pass "leave-rejoin, validated on Windows, needs no --unvalidated" \
+    || { fail "leave-rejoin, validated on Windows, needs no --unvalidated"; cat "$work/out"; }
 python3 -I "$runner" prepare --slots 0,1 --procedure leave-rejoin --target-slot 2 --unvalidated --owner-pid $$ \
     --run-root "$root" > "$work/out" 2>&1
 [ $? -eq 2 ] && pass "a target slot outside --slots is refused" || { fail "a target slot outside --slots is refused"; cat "$work/out"; }

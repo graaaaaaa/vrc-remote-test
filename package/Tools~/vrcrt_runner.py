@@ -6,18 +6,18 @@ declared client is ready (and, for worlds that log one, until each client shows 
 tag), collect evidence per client generation, and write the whole run to run.json. It never
 closes or launches a client. Whether a test passed is not decided here.
 
-leave-rejoin (R1b, not validated yet: only with --unvalidated): deploy-collect, then, in the same
+leave-rejoin (R1b, validated on Windows with Bridge 0.12.0): deploy-collect, then, in the same
 continue, close the declared --target-slot with a precondition (Bridge 0.12.0 and later,
 slotPreconditions.v1, Relaunch), wait until it has left while the other slots stay as they were
 (and, with --remaining-marker, until one of them logs a marker matching that regular expression),
 launch it again with a precondition, wait until the new client is back in the same instance, and
 collect evidence before the close, after the close and after the rejoin. Nothing is sent again.
 
-    vrcrt_runner.py prepare --slots 0,1 [--procedure deploy-collect|leave-rejoin] [--target-slot N --unvalidated
+    vrcrt_runner.py prepare --slots 0,1 [--procedure deploy-collect|leave-rejoin] [--target-slot N
                     [--remaining-marker REGEX]] [--expect-clients ...] [--world-build-wait S] [--owner-pid PID] [--run-root DIR]
     vrcrt_runner.py continue --run DIR --claim-token TOKEN
     vrcrt_runner.py run --build headless --project DIR --scene Assets/... --slots 0,1 [--procedure ... --target-slot N
-                    --unvalidated [--remaining-marker REGEX]] [--world-build-wait S] [--unity PATH]
+                    [--remaining-marker REGEX]] [--world-build-wait S] [--unity PATH]
     vrcrt_runner.py recover --run DIR
     vrcrt_runner.py prune --older-than-days N [--run-root DIR]
 
@@ -75,7 +75,8 @@ OPERATION_ID = re.compile(r"[A-Za-z0-9_-]{1,64}")
 
 # Procedures that were checked on real Windows clients, with the runner version that was checked.
 # A procedure missing here runs only with --unvalidated (docs/plans/r1-automation.md §5.5).
-VALIDATED_PROCEDURES = {"deploy-collect": "0.11.0"}
+# leave-rejoin: docs/validation/slot-preconditions.md, 2026-11-26, Bridge 0.12.0+4892f91 (exe SHA-256 a69a379a…bae6e).
+VALIDATED_PROCEDURES = {"deploy-collect": "0.11.0", "leave-rejoin": "0.12.0"}
 PROCEDURES = ("deploy-collect", "leave-rejoin")
 
 

@@ -1,6 +1,6 @@
 # 前提つきの close／launch と leave-rejoin の実機の確かめ（R1b、v0.12.0）
 
-Bridge 0.12.0 の前提条件（`docs/plans/r1b-contract.md`）と、runner の leave-rejoin（`docs/plans/r1-automation.md` §5.4）を Windows 実機で確かめる手順と、その記録です。leave-rejoin は、ここで PASS を記録した commit で runner の `VALIDATED_PROCEDURES` に足すまで、`--unvalidated` を付けたときだけ動きます。
+Bridge 0.12.0 の前提条件（`docs/plans/r1b-contract.md`）と、runner の leave-rejoin（`docs/plans/r1-automation.md` §5.4）を Windows 実機で確かめる手順と、その記録です。leave-rejoin は、2026-11-26 にここで PASS を記録した commit で runner の `VALIDATED_PROCEDURES` に足しました。それより前の runner では `--unvalidated` を付けたときだけ動きます。
 
 Windows で人がすることは、Bridge の入れ替えだけです（Windows 側のセッションに頼む。`docs/setup-windows.md` の1「版を入れ替える」）。VR で遊んでいないこと、電源が入っていることが要ります。
 
@@ -36,10 +36,10 @@ Windows で人がすることは、Bridge の入れ替えだけです（Windows 
 2. `Launch`。期待: 起動し直す。
 3. 表を出したまま、ターミナルで本文なしの `vrcrt.sh close-client 1` と `launch-client 1` を打ってから（表が古いまま）、画面の `Close` を押す。期待: 「一覧を読んだあとに変わった。読み直して」の旨で、何もしない。
 
-## 5. leave-rejoin（`--unvalidated`）
+## 5. leave-rejoin
 
 ```bash
-python3 package/Tools~/vrcrt_runner.py run --build headless --unity /Applications/Unity/Hub/Editor/2022.3.22f1/Unity.app/Contents/MacOS/Unity --project <試験用のプロジェクト> --scene Assets/Scenes/VrcrtTagScene.unity --slots 0,1 --procedure leave-rejoin --target-slot 1 --unvalidated
+python3 package/Tools~/vrcrt_runner.py run --build headless --unity /Applications/Unity/Hub/Editor/2022.3.22f1/Unity.app/Contents/MacOS/Unity --project <試験用のプロジェクト> --scene Assets/Scenes/VrcrtTagScene.unity --slots 0,1 --procedure leave-rejoin --target-slot 1
 ```
 
 期待すること:
@@ -47,7 +47,6 @@ python3 package/Tools~/vrcrt_runner.py run --build headless --unity /Application
 - slot 1 が閉じて起動し直し、新しい世代で slot 0 と同じインスタンスに joined。slot 0 は世代・epoch・joinedSeq とも変わらない。
 - 新しい世代でも tag の目印が照らされる。
 - 証拠が、close の前・残る台・新しい世代に分かれて保存され、`run.json` の evidence の sha256 と合う。
-- `--unvalidated` を外すと、prepare が終了コード 2 で断る。
 
 ## 6. 書き出しの片付け
 
@@ -55,19 +54,27 @@ python3 package/Tools~/vrcrt_runner.py run --build headless --unity /Application
 
 ## 記録
 
-### （日付、Bridge の版と SHA-256、パッケージの commit）
+### 2026-11-26（UTC）、Bridge 0.12.0+4892f91、パッケージ main 4892f91
+
+Mac のエージェントが CLI と computer use で確かめた。Windows で人がしたことは無い（Bridge の入れ替えは Windows 側のセッション）。別のセッションの性能計測と重ならないよう、そのセッションと合意した時間（09:14〜09:22 JST）に、`VrchatProfiles` を `[0,1]` にして行い、終わったら `[0]` に戻した。
 
 | 項目 | 結果 |
 |---|---|
-| 環境（Windows、VRChat の版、Bridge の版と SHA-256、パッケージの commit、Unity の版） | |
-| 1. 本文なしの close／launch（出力・終了コードが v0.11 と同じか） | |
-| 2. 前提つきの close／launch（revision +1、世代、operationId） | |
-| 3. 古い前提（revision・先に閉じた台・再起動・形の誤り） | |
-| 4. Unity の台の表（前提つき、古い表での断り） | |
-| 5. leave-rejoin（results、所要時間、証拠） | |
-| 6. 書き出しの片付け | |
+| 環境 | Bridge `0.12.0+4892f91a0ad230b5bd2732dd3af48d857327fb46`、exe SHA-256 `a69a379a5637b527f74050d901c22a9424e50e336df1e66da755bbd79f3bae6e`（GitHub Actions の run 45726091307 の成果物）。パッケージ main `4892f91`（0.12.0）。Unity 2022.3.22f1（Mac）。Relaunch profiles `[0,1]`、Desktop。`/bridge` に `bridgeInstanceId`・`operationRevision`・`currentBatch` が出る。版の違いの警告は消えた |
+| 1. 本文なしの close／launch | **PASS**。`close-client 1` は `closed slot 1 (PID 29264)`、終了コード 0（v0.11 と同じ1行）。`launch-client 1 --json` は終了コード 0、応答に `operationRevision`（8→9）・`bridgeInstanceId`・`operationId: null` が足されている |
+| 2. 前提つきの close／launch | **PASS**。expect の revision 9 で `close-client 1 --expect … --operation-id manual-close --json` → 終了コード 0、revision 10（+1）、`clientGeneration` が対象の世代、`operationId` がそのまま返る。続けて revision 10・閉じた世代で `launch-client 1 --expect …` → 終了コード 0、revision 11（+1）、新しい世代で joined |
+| 3. 古い前提は何もしない | **PASS**。古い revision の expect で `close-client 0` → 終了コード 1、`precondition failed: operationRevision`、slot 0 は動いたまま、revision も変わらない。本文なしで先に閉じた台へ前提つき close → 409 `notLaunchedByBridge`（何もしない）。キーが欠けた expect → 終了コード 2、何も送らない。`vrcrt.sh restart`（host 2→3、同じプロセスなので `bridgeInstanceId` は同じ）のあと、前の expect で close → 412 `hostGeneration,operationRevision,buildId` |
+| 4. Unity の台の表（前提つき） | **PASS**。Bridge 0.12 では確認の画面が前提つきの文言（「一覧を読んだあとに台か Bridge が変わっていれば、Bridge は何もしない」）。確認の画面を開いたまま、ターミナルで slot 1 を本文なしで閉じて起動し直し、観測が追いついてから画面の Close を押すと、`The Bridge did not close slot 1: the client or the Bridge changed after the client list was read (clientGeneration differ). Nothing was done.`、slot 1 は動いたまま。観測が追いつく前に押したときは、R1a からある観測の照合で `slotMismatch` になり、これも何もしない。新しい一覧からの Close（`Closed slot 1 (PID 22512).`）と Launch（`Launched slot 1 (profile 1, PID 22640, …)`、slot 0 と同じインスタンスに joined）は通った。画面の Run も PASS（run `20261126T001914Z-ac6f991d`、35 s、起動の計画と revision の照合を含む） |
+| 5. leave-rejoin | **PASS**。run `20261126T001456Z-278f717c`（`--unvalidated` 付き、シーン B）、build `20261126T001519859Z-e07d9fa1`。00:14:56〜00:16:00（64 s）。results すべて PASS（deploy・launch・clientReadiness・worldBuildMatch・evidence・leaveRejoin）。revision は配備で 3→5、close で 5→6、launch で 6→7。close 2 s、退出の確認 5 s、起動し直しの準備 9 s、新しい世代の tag 1 s。slot 0 は世代・epoch・joinedSeq とも変わらない。証拠 22 件（deploy・beforeClose・afterClose・afterRejoin）の sha256 が一致 |
+| 6. 書き出しの片付け | 未確認（24 時間を待つか、Windows 側でファイルの日時を変える必要がある）。fixture の試験だけ |
+| 0.10 の Bridge との互換（入れ替えの前） | 上の「入れ替えの前」の記録のとおり、新しい CLI は何も送らずに終了コード 3 |
 | 4台 | 未確認 |
 
 ## 気づいたこと
 
+- 画面の古い一覧からの Close は、Bridge の観測が追いつく前だと R1a からある `slotMismatch` が先に効き、追いついたあとだと前提（`clientGeneration`）が効く。どちらでも何もしない。
+- `vrcrt.sh restart` は host を起動し直すだけなので `bridgeInstanceId` は変わらず、`hostGeneration` と revision・起動の計画の build ID の違いで古い前提を断る。Bridge のプロセスを起動し直したときは `bridgeInstanceId` も変わる（入れ替えで確かめた: 起動直後の revision は 1）。
+
 ## 結論
+
+R1b は、本物の Bridge 0.12.0 と VRChat 2台で、本文なしの close／launch が今までどおり、前提つきの close／launch が revision をちょうど1つずつ進め、古い前提や形の誤りは何もしないことを確かめた。leave-rejoin は64秒で PASS した。これをもって runner の `VALIDATED_PROCEDURES` に leave-rejoin を足した。書き出しの片付けと4台は未確認。
