@@ -2055,7 +2055,7 @@ ITEM_ID = re.compile(r"[a-z0-9][a-z0-9_-]{0,31}")
 ANSWERS = ("ok", "ng", "skip")
 ITEM_STATES = ("notAsked", "waiting", "answered", "unanswered", "interrupted")
 # Characters shown as \uXXXX: C0 but newline, DEL, C1, line/paragraph separators, bidi controls.
-HIDDEN = re.compile("[\x00-\x09\x0b-\x1f\x7f-\x9f  ‪-‮⁦-⁩]")
+HIDDEN = re.compile(r"[\x00-\x09\x0b-\x1f\x7f-\x9f\u2028\u2029\u202a-\u202e\u2066-\u2069]")
 
 
 def strict_json(data):
