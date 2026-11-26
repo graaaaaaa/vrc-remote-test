@@ -277,6 +277,27 @@
           },
           "url": "https://github.com/graaaaaaa/vrc-remote-test/releases/download/v0.11.0/com.github.graaaaaaa.vrc-remote-test-0.11.0.zip",
           "zipSHA256": "19df23632519a545333fd5ca03a3bcb455e3bbc55e919de82e01a09a231f9ad0"
+        },
+        "0.12.0": {
+          "name": "com.github.graaaaaaa.vrc-remote-test",
+          "displayName": "VRC Remote Test",
+          "version": "0.12.0",
+          "unity": "2022.3",
+          "description": "Remote VRChat world testing from macOS Unity to a Windows VRChat client.",
+          "license": "MIT",
+          "author": {
+            "name": "graaaaaaa",
+            "email": "89264042+graaaaaaa@users.noreply.github.com",
+            "url": "https://github.com/graaaaaaa"
+          },
+          "dependencies": {
+            "com.unity.nuget.newtonsoft-json": "3.2.2"
+          },
+          "vpmDependencies": {
+            "com.vrchat.worlds": ">=3.7.5"
+          },
+          "url": "https://github.com/graaaaaaa/vrc-remote-test/releases/download/v0.12.0/com.github.graaaaaaa.vrc-remote-test-0.12.0.zip",
+          "zipSHA256": "98fdfbe03c40945efbf6134cc11cf92c447bdf753a550439daa7ff39fd015d5d"
         }
       }
     }
