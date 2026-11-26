@@ -66,7 +66,7 @@ if sys.version_info < (3, 9):
     sys.stderr.write("vrcrt_runner: Python 3.9 or later is needed (this is %d.%d)\n" % sys.version_info[:2])
     sys.exit(2)
 
-RUNNER_VERSION = "0.13.0"
+RUNNER_VERSION = "0.14.0"
 RUN_SCHEMA = "vrcrt.run"
 HERE = os.path.dirname(os.path.realpath(__file__))
 FIXTURE_DIR = os.environ.get("VRCRT_FIXTURE_DIR", "")
@@ -148,6 +148,13 @@ ANSWER_WAIT_CAP = test_setting("VRCRT_RUNNER_TEST_ANSWER_WAIT", "3600", 0.5, 360
 MANUAL_RUN_CAP = test_setting("VRCRT_RUNNER_TEST_MANUAL_RUN", "7200", 1, 7200)
 MANUAL_RECHECK_SECONDS = test_setting("VRCRT_RUNNER_TEST_MANUAL_RECHECK", "5", 0.05, 5)
 OBSERVATION_GRACE_SECONDS = test_setting("VRCRT_RUNNER_TEST_OBSERVATION_GRACE", "15", 0.1, 15)
+# deploy-collect --end-marker, also `proposed` (docs/plans/end-marker-contract.md). It needs
+# --unvalidated until it is checked on real clients.
+END_MARKER_VALIDATED = False
+MIN_END_WAIT, DEFAULT_END_WAIT, MAX_END_WAIT = 60, 900, 1500
+END_WAIT_CAP = test_setting("VRCRT_RUNNER_TEST_END_WAIT", "1500", 0.5, 1500)
+END_POLL_SECONDS = test_setting("VRCRT_RUNNER_TEST_END_POLL", "5", 0.05, 5)
+END_FIELDS = {"pattern", "slots", "waitSeconds", "unvalidated"}
 
 
 class Stop(Exception):
@@ -439,6 +446,10 @@ class Run:
                 self.record["leaveRejoin"] = {"state": "notStarted"}
         if procedure.get("name") == "manual-steps":
             finish_manual(self.record, self.directory, result)
+        # An end-marker wait that never gave its own word: not reached when it never started.
+        if isinstance(results, dict) and "endMarker" in results and results["endMarker"] is None:
+            started = isinstance(self.record.get("endMarker"), dict)
+            results["endMarker"] = "CANCELED" if result == "CANCELED" else ("UNKNOWN" if started else "notReached")
         self.save()
         self.progress("finished", result, reason=reason)
 
@@ -1112,6 +1123,12 @@ def procedure_parameters(args, slots, expect, wait, checklist=None):
     manual_only = {"--checklist": getattr(args, "checklist", None), "--answer-wait": getattr(args, "answer_wait", None),
                    "--run-minutes": getattr(args, "run_minutes", None), "--leave-rejoin-after": after}
     parameters = {"slots": slots, "expectClients": expect, "worldBuildWaitSeconds": wait}
+    end_flags = {"--end-marker": getattr(args, "end_marker", None), "--end-slots": getattr(args, "end_slots", None),
+                 "--end-wait": getattr(args, "end_wait", None)}
+    if name != "deploy-collect":
+        given = [flag for flag, value in end_flags.items() if value is not None]
+        if given:
+            raise Usage("%s belong to --procedure deploy-collect" % ", ".join(given))
     if name != "manual-steps":
         given = [flag for flag, value in manual_only.items() if value is not None]
         if given:
@@ -1119,6 +1136,10 @@ def procedure_parameters(args, slots, expect, wait, checklist=None):
     if name == "deploy-collect":
         if target is not None or marker is not None:
             raise Usage("--target-slot and --remaining-marker belong to --procedure leave-rejoin")
+        end = end_marker_parameters(args, slots)
+        if end is not None:
+            # Only with --end-marker: without it the parameters (and the hash) stay R1a's.
+            parameters["endMarker"] = end
         return name, parameters
     if name not in VALIDATED_PROCEDURES and not getattr(args, "unvalidated", False):
         raise Usage("%s has not been validated on real clients yet; add --unvalidated to run it anyway" % name)
@@ -1186,8 +1207,16 @@ def procedure_of(record):
     """The procedure run.json names, checked again before continue acts on it."""
     procedure = record.get("procedure") if isinstance(record.get("procedure"), dict) else {}
     name, parameters = procedure.get("name"), procedure.get("parameters")
-    if name == "deploy-collect":
+    # The parameters must be the ones prepare hashed: a valid but changed value (another
+    # pattern, a shorter wait, a removed endMarker) is refused as well as a malformed one.
+    version = procedure.get("version")
+    if not isinstance(version, str) or procedure.get("sha256") != procedure_hash(name, parameters, version):
+        raise Stop("UNKNOWN", "procedureInvalid", "run.json's procedure is not the one prepare recorded")
+    if name == "deploy-collect" and isinstance(parameters, dict) and (
+            "endMarker" not in parameters or end_marker_ok(parameters["endMarker"], record.get("slots"))):
         return name, parameters
+    if isinstance(parameters, dict) and "endMarker" in parameters:
+        raise Stop("UNKNOWN", "procedureInvalid", "run.json names no procedure this runner can run")
     if name == "manual-steps" and manual_procedure_ok(parameters, record.get("slots")):
         return name, parameters
     slots = record.get("slots")
@@ -1207,8 +1236,8 @@ def procedure_seconds(parameters, name, default):
     return value
 
 
-def procedure_hash(name, parameters):
-    canonical = json.dumps({"procedure": name, "version": RUNNER_VERSION, "parameters": parameters}, sort_keys=True)
+def procedure_hash(name, parameters, version=RUNNER_VERSION):
+    canonical = json.dumps({"procedure": name, "version": version, "parameters": parameters}, sort_keys=True)
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
@@ -1255,6 +1284,11 @@ def prepare(args, owner_pid):
              "A world build match from markers assumes the world does not fake them."]
     procedure = {"name": name, "version": RUNNER_VERSION, "parameters": parameters,
                  "sha256": procedure_hash(name, parameters)}
+    if name == "deploy-collect" and "endMarker" in parameters:
+        results["endMarker"] = None
+        procedure["endMarkerValidated"] = END_MARKER_VALIDATED
+        notes.append("endMarker PASS means each named slot logged a marker line matching --end-marker after it "
+                     "joined; the world wrote that line, and the runner does not judge the test.")
     if name == "leave-rejoin":
         results["leaveRejoin"] = None
         procedure["validated"] = name in VALIDATED_PROCEDURES
@@ -1472,6 +1506,22 @@ def deploy_collect(run):
         raise
     run.end(operation, "PASS")
 
+    end = parameters.get("endMarker") if isinstance(parameters, dict) else None
+    if end is not None:
+        if match == "FAIL":
+            results["endMarker"] = "notReached"  # another build's tag: its end says nothing about this one
+        else:
+            operation = run.begin("waitEndMarker")
+            try:
+                word, why = wait_end_marker(run, slots, fixed, bridge_before, guard, end)
+            except Stop as stop:
+                if stop.result == "UNKNOWN" and stop.reason != "runDeadline":
+                    results["clientReadiness"] = "UNKNOWN"
+                run.end(operation, stop.result, stop.reason, detail=stop.detail)
+                raise
+            results["endMarker"] = word
+            run.end(operation, word, why)
+
     operation = run.begin("collectEvidence")
     try:
         collect_evidence(run, slots, fixed)
@@ -1494,6 +1544,9 @@ def deploy_collect(run):
     if match == "FAIL":
         record["reason"] = "otherBuildTag"
         return "FAIL", fixed, guard
+    if end is not None and results.get("endMarker") != "PASS":
+        record["reason"] = (record.get("endMarker") or {}).get("reason") or "endMarkerNotSeen"
+        return "UNKNOWN", fixed, guard
     return "PASS", fixed, guard
 
 
@@ -1628,6 +1681,198 @@ def new_remaining_markers(run, remaining, fixed, cursor):
                 continue
             texts.append(text)
     return texts, complete
+
+
+# === deploy-collect --end-marker (docs/plans/end-marker-contract.md) ===
+
+def end_marker_parameters(args, slots):
+    """--end-marker, --end-slots and --end-wait from the command line only; None without --end-marker."""
+    pattern = getattr(args, "end_marker", None)
+    chosen = getattr(args, "end_slots", None)
+    wait = getattr(args, "end_wait", None)
+    if pattern is None:
+        if chosen is not None or wait is not None:
+            raise Usage("--end-slots and --end-wait go with --end-marker")
+        return None
+    if not valid_regex(pattern):
+        raise Usage("--end-marker must be a regular expression of 1 to %d characters" % MAX_REGEX_CHARS)
+    if chosen is None:
+        end_slots = list(slots)
+    else:
+        try:
+            end_slots = parse_slots(chosen)
+        except Usage:
+            raise Usage("--end-slots lists different slots from --slots, e.g. 0")
+        if any(slot not in slots for slot in end_slots):
+            raise Usage("--end-slots lists different slots from --slots, e.g. 0")
+    wait = DEFAULT_END_WAIT if wait is None else wait
+    if not MIN_END_WAIT <= wait <= MAX_END_WAIT:
+        raise Usage("--end-wait takes %d to %d seconds" % (MIN_END_WAIT, MAX_END_WAIT))
+    if not END_MARKER_VALIDATED and not getattr(args, "unvalidated", False):
+        raise Usage("--end-marker has not been validated on real clients yet; add --unvalidated to use it anyway")
+    return {"pattern": pattern, "slots": sorted(end_slots), "waitSeconds": wait, "unvalidated": not END_MARKER_VALIDATED}
+
+
+def end_marker_ok(value, slots):
+    """parameters.endMarker as prepare writes it, checked again before continue acts on it."""
+    if not isinstance(value, dict) or set(value) != END_FIELDS or not isinstance(slots, list):
+        return False
+    chosen = value["slots"]
+    return (valid_regex(value["pattern"]) and isinstance(chosen, list) and len(chosen) >= 1
+            and all(is_count(slot, 0, 3) and slot in slots for slot in chosen) and chosen == sorted(set(chosen))
+            and is_count(value["waitSeconds"], MIN_END_WAIT, MAX_END_WAIT)
+            and type(value["unvalidated"]) is bool and (END_MARKER_VALIDATED or value["unvalidated"] is True))
+
+
+FIRST_MATCH_CHILD = (
+    "import resource\n"
+    "resource.setrlimit(resource.RLIMIT_CPU, (3, 3))\n"  # ends itself even when the runner is gone
+    "import json, re, sys\n"
+    "pattern = re.compile(sys.argv[1])\n"
+    "texts = json.loads(sys.stdin.buffer.read().decode('utf-8'))\n"
+    "sys.stdout.write(str(next((i for i, text in enumerate(texts) if pattern.search(text)), -1)))\n")
+
+
+def regex_first(pattern, texts):
+    """The index of the first (untrusted) line that matches the caller's --end-marker, -1 for
+    none, or None when it could not tell: one child per call, with an empty environment, killed
+    after REGEX_SECONDS and limited to 3 s of CPU by itself."""
+    try:
+        result = subprocess.run([sys.executable, "-I", "-c", FIRST_MATCH_CHILD, pattern],
+                                input=json.dumps(texts, ensure_ascii=True).encode("utf-8"), capture_output=True,
+                                timeout=REGEX_SECONDS, env={}, start_new_session=True)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0 or not re.fullmatch(rb"-1|0|[1-9][0-9]{0,4}", result.stdout or b""):
+        return None
+    index = int(result.stdout)
+    return index if index < len(texts) else None
+
+
+def end_marker_round(run, slot, want, through, pattern, timeout):
+    """One look at one end slot's markers after `through`. Returns (word, seq, markers):
+    ("match", the matching line's seq, the markers read), ("none", how far the lines are settled,
+    None), ("incomplete" | "dropped" | "undecided", None, None). Cut, withheld or overlong lines
+    never match. The newest record can still grow (the Bridge publishes an open record), so it is
+    looked at again in the next round."""
+    markers = cli_json(run, "log", str(slot), "--markers", "--json", what="markers", timeout=timeout)
+    header = markers.get("header") if isinstance(markers.get("header"), dict) else {}
+    records = markers.get("records")
+    if (header.get("clientGeneration") != want["clientGeneration"]
+            or header.get("observationEpoch") != want["observationEpoch"] or header.get("catchingUp") is not False
+            or not isinstance(records, list)):
+        return "incomplete", None, None
+    dropped = header.get("droppedThroughSeq") or 0
+    if not is_count(dropped):
+        return "incomplete", None, None
+    if dropped > through:
+        return "dropped", None, None
+    lines, seqs = [], []
+    for record in records:
+        if not isinstance(record, dict) or not is_count(record.get("seq")) or record["seq"] <= through:
+            continue
+        seqs.append(record["seq"])
+        text = record.get("text")
+        if (record.get("truncated") is not False or record.get("withheld") is not False
+                or not isinstance(text, str) or len(text) > MAX_MARKER_TEXT):
+            continue
+        lines.append((record["seq"], text))
+    settled = max([seq for seq in seqs if seq < max(seqs)] or [through]) if seqs else through
+    lines.sort(key=lambda line: line[0])
+    if not lines:
+        return "none", settled, None
+    index = regex_first(pattern, [text for _, text in lines])
+    if index is None:
+        return "undecided", None, None
+    if index >= 0:
+        return "match", lines[index][0], markers
+    return "none", settled, None
+
+
+def wait_end_marker(run, slots, fixed, bridge_before, guard, end):
+    """Waits until every end slot logged a marker matching the pattern in its current join,
+    checking all declared slots each round as recheck does. A line found is taken only once a
+    later recheck shows the client list read through it (the Bridge publishes markers before the
+    list, so until then the line could be of a later join); its markers are saved as evidence
+    then. Returns (PASS, None) or (UNKNOWN, endMarkerTimeout | markersDropped |
+    endMarkerUndecided), after which the evidence is still collected; raises Stop when the
+    clients or the Bridge changed, the observation stayed incomplete, on a cancel or the run's
+    deadline."""
+    state = {"pattern": end["pattern"], "slots": end["slots"], "waitSeconds": end["waitSeconds"],
+             "startedAtUtc": iso(), "endedAtUtc": None, "matched": {}, "incompleteRounds": 0, "reason": None}
+    run.record["endMarker"] = state
+    run.save()
+    base = os.path.join(run.directory, "evidence", "end-marker")
+    through, pending = {}, {}
+    for slot in end["slots"]:
+        want = fixed[slot]
+        through[slot] = want["joinAttemptSeq"] if want["joinAttemptSeq"] is not None else want["joinedSeq"]
+    finish_at = time.monotonic() + min(end["waitSeconds"], END_WAIT_CAP)
+    incomplete_since = None
+
+    def done(word, reason, **fields):
+        state.update(fields, endedAtUtc=iso(), reason=reason)
+        run.save()
+        return word, reason
+
+    while True:
+        run.check()
+        looked = time.monotonic()
+        left = OBSERVATION_GRACE_SECONDS - (looked - incomplete_since) if incomplete_since else OBSERVATION_GRACE_SECONDS
+        short = max(0.5, min(MANUAL_READ_SECONDS, left))
+        complete, outcome = True, None
+        try:
+            _, clients = recheck(run, slots, fixed, bridge_before, "while waiting for the end marker", guard, timeout=short)
+            for slot, (seq, markers) in list(pending.items()):
+                covered = (entry_of(clients, slot) or {}).get("observedThroughSeq")
+                if is_count(covered) and covered >= seq:
+                    private_directory(os.path.join(run.directory, "evidence"))
+                    private_directory(base)
+                    folder = save_markers(run, base, slot, fixed[slot], markers, phase="endMarker")
+                    state["matched"][str(slot)] = {"seq": seq, "seenAtUtc": iso(),
+                                                   "evidence": os.path.relpath(os.path.join(folder, "markers.json"),
+                                                                               run.directory)}
+                    del pending[slot]
+                    run.save()
+                else:
+                    complete = False
+            for slot in end["slots"]:
+                if str(slot) in state["matched"] or slot in pending:
+                    continue
+                found, seq, markers = end_marker_round(run, slot, fixed[slot], through[slot], end["pattern"], short)
+                if found == "match":
+                    pending[slot] = (seq, markers)
+                elif found == "none":
+                    through[slot] = seq
+                elif found == "incomplete":
+                    complete = False
+                else:
+                    outcome = found
+                    break
+            incomplete_since = None
+        except Stop as stop:
+            if stop.result != "UNKNOWN" or stop.reason not in INCOMPLETE_REASONS + ("markersUnavailable", "markersInvalid"):
+                raise
+            complete = False
+            incomplete_since = incomplete_since or looked
+            if time.monotonic() - incomplete_since >= OBSERVATION_GRACE_SECONDS:
+                raise Stop("UNKNOWN", "observationIncomplete",
+                           "while waiting for the end marker: %s" % (stop.detail or stop.reason))
+        if outcome == "dropped":
+            return done("UNKNOWN", "markersDropped")
+        if outcome == "undecided":
+            return done("UNKNOWN", "endMarkerUndecided")
+        if len(state["matched"]) == len(end["slots"]):
+            return done("PASS", None)
+        if not complete:
+            state["incompleteRounds"] += 1
+        missing = [slot for slot in end["slots"] if str(slot) not in state["matched"]]
+        if time.monotonic() >= finish_at:
+            return done("UNKNOWN", "endMarkerTimeout", missing=missing, lastRoundComplete=complete,
+                        unconfirmed=sorted(pending))
+        run.progress("wait", "waiting for the end marker", missing=missing)
+        # A line waiting for the list to catch up is looked at again soon.
+        run.wait(CHECK_SECONDS if pending else END_POLL_SECONDS)
 
 
 def expect_from(info, generation):
@@ -2824,6 +3069,10 @@ def main(argv):
                                                     "launch it again with preconditions (optional)")
         p.add_argument("--answer-wait", type=int, help="manual-steps: seconds to wait for each answer (60-3600, default 1200)")
         p.add_argument("--run-minutes", type=int, help="manual-steps: the whole run's limit (30-120, default 90)")
+        p.add_argument("--end-marker", help="deploy-collect: before collecting, wait until each --end-slots slot "
+                                            "logged a marker matching this regular expression (needs --unvalidated)")
+        p.add_argument("--end-slots", help="deploy-collect: the slots that must log --end-marker (default: --slots)")
+        p.add_argument("--end-wait", type=int, help="deploy-collect: seconds to wait for --end-marker (60-1500, default 900)")
 
     p = sub.add_parser("prepare")
     p.add_argument("--slots", required=True)
