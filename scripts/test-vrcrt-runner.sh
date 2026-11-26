@@ -17,6 +17,8 @@ export VRCRT_RUNNER_TEST_READY=2
 export VRCRT_RUNNER_TEST_TAG=1
 export VRCRT_RUNNER_TEST_LEAVE=2
 export VRCRT_RUNNER_TEST_REJOIN=2
+export VRCRT_RUNNER_TEST_END_WAIT=1.5
+export VRCRT_RUNNER_TEST_END_POLL=0.05
 export VRCRT_BRIDGE_URL="https://192.0.2.1:38443"
 export VRCRT_CERT_SHA256="$(printf 'a%.0s' $(seq 64))"
 fake="$VRCRT_FIXTURE_DIR/fake"
@@ -895,6 +897,173 @@ python3 -I "$runner" prepare --slots 0,1 --procedure manual-steps --checklist "$
     --target-slot 1 --owner-pid $$ --run-root "$root" > "$work/out" 2>&1
 [ $? -eq 3 ] && grep -q slotPreconditionsUnsupported "$work/out" && pass "a leave and rejoin on a Bridge without the feature is refused before the deploy" \
     || { fail "a leave and rejoin on a Bridge without the feature is refused before the deploy"; cat "$work/out"; }
+
+# --- deploy-collect --end-marker (docs/plans/end-marker-contract.md)
+echo "--- end marker"
+# line <seq> <text> [truncated] [withheld]: one marker record
+line() { printf '{"seq":%s,"text":"%s","truncated":%s,"withheld":%s}' "$1" "$2" "${3:-false}" "${4:-false}"; }
+# end_markers <slot> <generation> <epoch> <extra records, comma-separated> [droppedThroughSeq]: the tag line and more, written whole
+end_markers() {
+    MARKERS_OUT="markers-$1.tmp" markers "$1" "$2" "$3" "[{\"seq\":5,\"text\":\"[VRCRT] vrcrt.build=$tag\",\"truncated\":false,\"withheld\":false}${4:+,$4}]" "${5:-0}"
+    mv "$fake/markers-$1.tmp" "$fake/markers-$1.json"
+}
+done0() { line 6 "[VRCRT] OPS_PROBE step=done slot=0"; }
+done1() { line 7 "[VRCRT] OPS_PROBE step=done slot=1"; }
+em_prepare() { prepare_run --unvalidated --end-marker 'step=done' "$@"; ready_clients "$tag"; deploy_result "$run" PASS PASS null "\"$tag\""; }
+op_result() { python3 -I -c 'import json,sys; r=json.load(open(sys.argv[1])); o=[o for o in r["operations"] if o["name"]==sys.argv[2]]; print(o[-1]["result"] if o else "none")' "$run/run.json" "$1"; }
+# until_step <name>: waits (10 s at most) until the run is in that step; until_scanned <slot>: until
+# that slot's markers were read once more after the call (both fail when it never happens).
+until_step() {
+    local i
+    for i in $(seq 1 200); do
+        python3 -I -c 'import json,sys; r=json.load(open(sys.argv[1])); sys.exit(0 if any(o["name"]==sys.argv[2] and o.get("inProgress") for o in r.get("operations",[])) else 1)' \
+            "$run/run.json" "$1" 2>/dev/null && return 0
+        sleep 0.05
+    done
+    return 1
+}
+log_calls() { grep -c "^log $1 " "$fake/calls.log" 2>/dev/null; }
+until_scanned() {
+    local i n; n="$(log_calls "$1")"
+    for i in $(seq 1 200); do [ "$(log_calls "$1")" -gt "$n" ] && return 0; sleep 0.05; done
+    return 1
+}
+runs_count() { ls "$root/runs" 2>/dev/null | wc -l | tr -d ' '; }
+em_refused() {
+    local name="$1"; shift
+    rm -f "$root"/locks/*.json; bridge; before_clients; cursor
+    local before; before="$(runs_count)"
+    python3 -I "$runner" prepare --slots 0,1 --owner-pid $$ --run-root "$root" "$@" > "$work/out" 2>&1
+    [ $? -eq 2 ] && [ "$(runs_count)" = "$before" ] && pass "$name" || { fail "$name"; cat "$work/out"; }
+}
+rm -f "$root"/locks/*.json; bridge; before_clients; cursor
+python3 -I "$runner" prepare --slots 0,1 --owner-pid $$ --run-root "$root" --end-marker 'step=done' > "$work/out" 2>&1
+[ $? -eq 0 ] && pass "--end-marker is validated and needs no --unvalidated" || { fail "--end-marker is validated and needs no --unvalidated"; cat "$work/out"; }
+em_refused "--end-slots without --end-marker is refused" --unvalidated --end-slots 0
+em_refused "--end-wait without --end-marker is refused" --unvalidated --end-wait 120
+em_refused "--end-slots outside --slots is refused" --unvalidated --end-marker x --end-slots 2
+em_refused "repeated --end-slots are refused" --unvalidated --end-marker x --end-slots 0,0
+em_refused "--end-wait below 60 s is refused" --unvalidated --end-marker x --end-wait 30
+em_refused "--end-wait above 1500 s is refused" --unvalidated --end-marker x --end-wait 1501
+em_refused "an --end-marker that does not compile is refused" --unvalidated --end-marker '('
+em_refused "--end-marker with leave-rejoin is refused" --procedure leave-rejoin --target-slot 1 --unvalidated --end-marker x
+em_refused "--end-marker with manual-steps is refused" --procedure manual-steps --checklist "$checklist" --unvalidated --end-marker x
+
+em_prepare
+end_markers 0 111 7 "$(done0)"; end_markers 1 222 8 "$(done1)"
+check "deploy-collect waits for the end marker on every slot" 0 results.endMarker PASS
+[ "$(op_result waitEndMarker)" = PASS ] && [ "$(field "$run/run.json" endMarker.matched.0.seq)" = 6 ] \
+    && [ "$(field "$run/run.json" endMarker.matched.1.seq)" = 7 ] && [ "$(field "$run/run.json" results.evidence)" = PASS ] \
+    && [ -f "$run/evidence/end-marker/slot-0/g111-e7/markers.json" ] && [ -f "$run/evidence/end-marker/slot-1/g222-e8/markers.json" ] \
+    && pass "the matched lines' seq and their markers are kept, then the evidence" || fail "the matched lines' seq and their markers are kept, then the evidence"
+python3 -I -c 'import json,sys; r=json.load(open(sys.argv[1])); p=r["procedure"]["parameters"]["endMarker"]
+sys.exit(0 if p=={"pattern":"step=done","slots":[0,1],"waitSeconds":900,"unvalidated":False} and "step=done slot" not in json.dumps(r) else 1)' "$run/run.json" \
+    && pass "the end marker's parameters are recorded, the matched text is not" || fail "the end marker's parameters are recorded, the matched text is not"
+
+em_prepare --end-slots 0
+end_markers 0 111 7 "$(done0)"
+check "--end-slots 0 waits for slot 0 only" 0 results.endMarker PASS
+
+em_prepare
+check "no end marker before --end-wait is UNKNOWN" 3 reason endMarkerTimeout
+[ "$(field "$run/run.json" results.evidence)" = PASS ] && [ "$(field "$run/run.json" endMarker.missing)" = "[0, 1]" ] \
+    && pass "the evidence is still collected after the end marker's timeout" || fail "the evidence is still collected after the end marker's timeout"
+
+VRCRT_RUNNER_TEST_END_WAIT=10 em_prepare
+( until_step waitEndMarker && until_scanned 0 && end_markers 0 111 7 "$(done0)" && end_markers 1 222 8 "$(done1)" ) &
+VRCRT_RUNNER_TEST_END_WAIT=10 check "an end marker that comes during the wait passes" 0 results.endMarker PASS
+wait
+python3 -I -c 'import json,sys; r=json.load(open(sys.argv[1])); sys.exit(0 if r["endMarker"]["matched"]["0"]["seenAtUtc"] > r["endMarker"]["startedAtUtc"] else 1)' "$run/run.json" \
+    && pass "the marker was taken during the wait" || fail "the marker was taken during the wait"
+
+em_prepare
+end_markers 0 111 7 "$(line 3 "[VRCRT] step=done")"; end_markers 1 222 8 "$(line 4 "[VRCRT] step=done")"
+check "an end marker from before this join does not count" 3 reason endMarkerTimeout
+
+em_prepare
+end_markers 0 111 7 "$(line 6 "[VRCRT] step=done" true)"; end_markers 1 222 8 "$(line 7 "[VRCRT] step=done" false true)"
+check "cut or withheld end marker lines do not count" 3 reason endMarkerTimeout
+
+em_prepare
+end_markers 0 111 7 "$(done0)" 9; end_markers 1 222 8 "$(done1)"
+check "markers dropped past this join leave the end marker unknown" 3 reason markersDropped
+[ "$(field "$run/run.json" results.endMarker)" = UNKNOWN ] && [ "$(field "$run/run.json" results.evidence)" = PASS ] \
+    && pass "dropped markers still collect the evidence" || fail "dropped markers still collect the evidence"
+
+prepare_run --unvalidated --end-marker '^(a+)+$'; ready_clients "$tag"; deploy_result "$run" PASS PASS null "\"$tag\""
+end_markers 0 111 7 "$(line 6 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa!")"; end_markers 1 222 8 "$(done1)"
+started=$(date +%s)
+check "an end marker match that does not finish is UNKNOWN" 3 reason endMarkerUndecided
+[ $(( $(date +%s) - started )) -le 10 ] && pass "the runner does not hang on the end marker's expression" \
+    || fail "the runner does not hang on the end marker's expression"
+
+em_prepare
+end_markers 0 111 7 "$(line 60 "[VRCRT] step=done")"; end_markers 1 222 8 "$(line 61 "[VRCRT] step=done")"
+check "a line the client list has not read through yet is not taken" 3 reason endMarkerTimeout
+[ "$(field "$run/run.json" endMarker.unconfirmed)" = "[0, 1]" ] && pass "the run says which lines were not confirmed" \
+    || fail "the run says which lines were not confirmed"
+
+VRCRT_RUNNER_TEST_END_WAIT=10 em_prepare
+end_markers 0 111 7 "$(line 6 "[VRCRT] OPS_PROBE step=run")"; end_markers 1 222 8 "$(done1)"
+( until_step waitEndMarker && until_scanned 0 && until_scanned 0 \
+    && end_markers 0 111 7 "$(line 6 "[VRCRT] OPS_PROBE step=run\\\\nstep=done")" ) &
+VRCRT_RUNNER_TEST_END_WAIT=10 check "a newest record that grows is looked at again" 0 results.endMarker PASS
+wait
+[ "$(field "$run/run.json" endMarker.matched.0.seq)" = 6 ] && pass "the grown record is the one taken" || fail "the grown record is the one taken"
+
+VRCRT_RUNNER_TEST_END_WAIT=10 em_prepare
+( until_step waitEndMarker && CLIENTS_OUT=clients.tmp clients "__NOW__" "$(client 0 111 7 4 joined false authenticated)" "$(client 1 223 8 4 joined false authenticated)" \
+  && mv "$fake/clients.tmp" "$fake/clients.json" ) &
+VRCRT_RUNNER_TEST_END_WAIT=10 check "a client that changes during the wait stops the run" 3 results.endMarker UNKNOWN
+wait
+[ "$(field "$run/run.json" results.evidence)" = None ] && [ "$(field "$run/run.json" results.clientReadiness)" = UNKNOWN ] \
+    && [ "$(op_result waitEndMarker)" = UNKNOWN ] && [ "$(field "$run/run.json" endMarker.reason)" = unexpectedChange ] \
+    && [ "$(field "$run/run.json" endMarker.endedAtUtc)" != None ] \
+    && pass "a change during the wait collects nothing and closes the wait's record" || fail "a change during the wait collects nothing and closes the wait's record"
+
+VRCRT_RUNNER_TEST_END_WAIT=10 em_prepare
+( until_step waitEndMarker && : > "$run/cancel.request" ) &
+started=$(date +%s)
+VRCRT_RUNNER_TEST_END_WAIT=10 check "a cancel during the end marker's wait is CANCELED" 4 results.endMarker CANCELED
+wait
+[ $(( $(date +%s) - started )) -le 5 ] && [ "$(op_result waitEndMarker)" = CANCELED ] && [ "$(field "$run/run.json" endMarker.reason)" = canceled ] \
+    && pass "the cancel ends the wait soon" || fail "the cancel ends the wait soon"
+
+em_prepare
+: > "$run/cancel.request"
+check "a cancel before the end marker's wait leaves it not reached" 4 results.endMarker notReached
+[ "$(op_result waitEndMarker)" = none ] && pass "a run canceled before the wait never starts it" || fail "a run canceled before the wait never starts it"
+
+em_prepare
+ready_clients OTHERTAG1
+check "another build's tag fails without waiting for the end marker" 1 results.endMarker notReached
+[ "$(op_result waitEndMarker)" = none ] && [ "$(field "$run/run.json" reason)" = otherBuildTag ] \
+    && pass "the other build's run does not wait" || fail "the other build's run does not wait"
+
+for change in pattern wait removed; do
+    em_prepare
+    python3 -I - "$run/run.json" "$change" <<'PY'
+import json, sys
+path, change = sys.argv[1:]
+r = json.load(open(path))
+p = r["procedure"]["parameters"]
+if change == "pattern":
+    p["endMarker"]["pattern"] = "anything"
+elif change == "wait":
+    p["endMarker"]["waitSeconds"] = 60
+else:
+    del p["endMarker"]
+json.dump(r, open(path, "w"))
+PY
+    check "a run.json whose end marker was changed ($change) is not continued" 3 reason procedureInvalid
+done
+
+prepare_run
+python3 -I -c 'import json,sys; r=json.load(open(sys.argv[1])); sys.exit(0 if "endMarker" not in r["results"] and "endMarker" not in r["procedure"]["parameters"] else 1)' "$run/run.json" \
+    && pass "without --end-marker the run has no end marker fields" || fail "without --end-marker the run has no end marker fields"
+ready_clients "$tag"; deploy_result "$run" PASS PASS null "\"$tag\""
+check "without --end-marker deploy-collect is as before" 0 result PASS
+[ "$(op_result waitEndMarker)" = none ] && pass "without --end-marker there is no wait" || fail "without --end-marker there is no wait"
 
 if [ "$failures" -eq 0 ]; then
     echo "all checks passed"

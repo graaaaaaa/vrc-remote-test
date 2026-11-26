@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.14.0] - 2026-11-26
+
+**Update the Unity package only** (the runner is in it); the Bridge does not change. Contract: `docs/plans/end-marker-contract.md`.
+
+### Added (Mac scripts)
+
+- `vrcrt_runner.py --end-marker REGEX [--end-slots LIST] [--end-wait SECONDS]` (deploy-collect only; checked on Windows with two Desktop clients, `docs/validation/end-marker.md`): before collecting the evidence, waits until each named slot logged a marker matching REGEX in its current join (60 to 1500 s, default 900). A line counts once the client list has read through it, and its markers are saved under `evidence/end-marker/` then. `results.endMarker` is PASS, or UNKNOWN (`endMarkerTimeout`, `markersDropped`, `endMarkerUndecided`) with the evidence still collected; another build's tag does not wait. The marker is what the world wrote; the test is still not judged.
+
+### Changed (Mac scripts)
+
+- `continue` refuses a run whose `run.json` procedure no longer matches the hash prepare recorded (`procedureInvalid`), also for a valid but changed value.
+
 ## [0.13.1] - 2026-11-26
 
 **Update the Unity package only**; the runner and the Bridge do not change.
