@@ -8,7 +8,8 @@ set -u
 here="$(CDPATH= cd -P -- "$(dirname -- "$0")" && pwd)"
 runner="$here/../package/Tools~/vrcrt_runner.py"
 work="$(mktemp -d "${TMPDIR:-/tmp}/vrcrt-runner-test.XXXXXX")"
-trap 'rm -rf "$work"' EXIT
+# Background answerers of the manual-steps checks may still be polling at the end.
+trap 'kill $(jobs -p) 2>/dev/null; wait 2>/dev/null; rm -rf "$work"' EXIT
 export VRCRT_FIXTURE_DIR="$work/fixture"
 export VRCRT_RUNNER_TEST_CLI="$work/fake-cli.sh"
 export VRCRT_RUNNER_TEST_POLL=0.05
@@ -536,6 +537,10 @@ owner_marker='{"seq":60,"text":"2026.11.26 00:00:00 Debug - [VRCRT] PRT001 ev=OW
 # result, and what the Bridge does and answers for the close and the launch of slot 1, staged.
 lr_prepare() {
     FEATURE=1 prepare_run --procedure leave-rejoin --target-slot 1 --unvalidated "$@" || return $?
+    lr_stage
+}
+# lr_stage: both clients ready and tagged, a passing deploy result, and the close and launch of slot 1 staged.
+lr_stage() {
     ready_clients "$tag"; deploy_result "$run" PASS PASS null "\"$tag\""
     FEATURE=1 REV=18 BRIDGE_OUT=bridge-after-close.json bridge
     CLIENTS_OUT=clients-after-close.json clients "__NOW__" "$(client 0 111 7 4 joined false authenticated)" \
@@ -646,6 +651,247 @@ elapsed=$(python3 -I -c "import time; print(int(time.monotonic() - $start))")
 [ "$(calls close)" = 1 ] && [ "$(calls launch)" = 0 ] && [ "$(field "$run/run.json" leaveRejoin.close.outcome)" = unknown ] \
     && [ "$elapsed" -lt 15 ] && pass "the close's outcome is recorded as unknown and nothing is sent again" \
     || fail "the close's outcome is recorded as unknown and nothing is sent again (${elapsed} s)"
+
+# --- manual-steps (R3)
+export VRCRT_RUNNER_TEST_ANSWER_WAIT=6
+export VRCRT_RUNNER_TEST_MANUAL_RECHECK=0.2
+export VRCRT_RUNNER_TEST_OBSERVATION_GRACE=0.6
+checklist="$work/checklist.json"
+printf '{"schema":"vrcrt.checklist","schemaVersion":1,"title":"Hand order","items":[{"id":"a","text":"first"},{"id":"b","text":"second \\u001b[31m"},{"id":"c","text":"third"}]}' > "$checklist"
+ms_prepare() {
+    FEATURE=1 prepare_run --procedure manual-steps --checklist "$checklist" --unvalidated "$@" || return $?
+    ready_clients "$tag"; deploy_result "$run" PASS PASS null "\"$tag\""
+    : > "$fake/calls.log"
+}
+# waiting_json: one `waiting --json` of $run (exit status of waiting)
+waiting_json() { python3 -I "$runner" waiting --run "$run" --json 2>/dev/null; }
+jget() { python3 -I -c 'import json,sys; d=json.loads(sys.argv[1]); print(d.get(sys.argv[2]))' "$1" "$2"; }
+# answer_items <answer>...: in the background, answers each item in turn once the run waits for it.
+answer_items() {
+    ( last=""
+      for a in "$@"; do
+          out=""
+          for _ in $(seq 600); do
+              out="$(waiting_json)" && [ "$(jget "$out" waitId)" != "$last" ] && break
+              out=""; sleep 0.05
+          done
+          [ -n "$out" ] || exit 0
+          last="$(jget "$out" waitId)"
+          python3 -I "$runner" answer --run "$run" --wait-id "$last" --item "$(jget "$out" itemId)" "$a" --memo "memo $a" \
+              > /dev/null 2>&1
+      done ) &
+}
+ms_refused() {
+    local name="$1"; shift
+    rm -f "$root"/locks/*.json; bridge; before_clients; cursor
+    python3 -I "$runner" prepare --slots 0,1 --owner-pid $$ --run-root "$root" "$@" > "$work/out" 2>&1
+    [ $? -eq 2 ] && pass "$name" || { fail "$name"; cat "$work/out"; }
+}
+ms_refused "manual-steps needs --unvalidated" --procedure manual-steps --checklist "$checklist"
+ms_refused "manual-steps needs --checklist" --procedure manual-steps --unvalidated
+ms_refused "--checklist belongs to manual-steps" --checklist "$checklist"
+ms_refused "--run-minutes below 30 is refused" --procedure manual-steps --checklist "$checklist" --unvalidated --run-minutes 20
+ms_refused "--answer-wait below 60 is refused" --procedure manual-steps --checklist "$checklist" --unvalidated --answer-wait 5
+ms_refused "--leave-rejoin-after must name an item" --procedure manual-steps --checklist "$checklist" --unvalidated \
+    --leave-rejoin-after zz --target-slot 1
+ms_refused "--leave-rejoin-after needs a target slot in --slots" --procedure manual-steps --checklist "$checklist" --unvalidated \
+    --leave-rejoin-after b --target-slot 2
+ms_refused "--remaining-marker without --leave-rejoin-after is refused" --procedure manual-steps --checklist "$checklist" \
+    --unvalidated --remaining-marker x
+bad="$work/bad-checklist.json"
+for body in '{"schema":"vrcrt.checklist","schemaVersion":1,"title":"t","title":"u","items":[{"id":"a","text":"x"}]}' \
+            '{"schema":"vrcrt.checklist","schemaVersion":1,"title":"t","items":[{"id":"A","text":"x"}]}' \
+            '{"schema":"vrcrt.checklist","schemaVersion":1,"title":"t","items":[{"id":"a","text":"x","extra":1}]}' \
+            '{"schema":"vrcrt.checklist","schemaVersion":1,"title":"t","items":[{"id":"a","text":"\ud800"}]}' \
+            '{"schema":"vrcrt.checklist","schemaVersion":1,"title":"t","items":[]}'; do
+    printf '%s' "$body" > "$bad"
+    ms_refused "a checklist that is not the contract's shape is refused ($(printf '%s' "$body" | cut -c50-80))" \
+        --procedure manual-steps --checklist "$bad" --unvalidated
+done
+python3 -I -c 'import json,sys; json.dump({"schema":"vrcrt.checklist","schemaVersion":1,"title":"t","items":[{"id":"i%d" % n,"text":"x"} for n in range(21)]}, open(sys.argv[1],"w"))' "$bad"
+ms_refused "a checklist of 21 items is refused" --procedure manual-steps --checklist "$bad" --unvalidated
+ln -sf "$checklist" "$work/link-checklist.json"
+ms_refused "a checklist that is a link is refused" --procedure manual-steps --checklist "$work/link-checklist.json" --unvalidated
+
+ms_prepare
+[ "$(stat -f %Lp "$run/checklist.json")" = 600 ] && cmp -s "$checklist" "$run/checklist.json" \
+    && [ "$(field "$run/run.json" manualSteps.items)" != None ] && pass "prepare keeps an owner-only copy of the checklist" \
+    || fail "prepare keeps an owner-only copy of the checklist"
+python3 -I - "$run/run.json" "$root/locks" <<'PY' && pass "a manual-steps run and its claim have one 90-minute deadline" || fail "a manual-steps run and its claim have one 90-minute deadline"
+import glob, json, sys
+from datetime import datetime
+r = json.load(open(sys.argv[1])); c = json.load(open(glob.glob(sys.argv[2] + "/*.json")[0]))
+span = datetime.fromisoformat(r["deadlineUtc"]) - datetime.fromisoformat(r["createdAtUtc"])
+sys.exit(0 if abs(span.total_seconds() - 5400) < 5 and c["deadlineUtc"] == r["deadlineUtc"] else 1)
+PY
+answer_items ok ok ok
+check "manual-steps passes when every item is answered ok" 0 results.manualSteps PASS
+[ "$(field "$run/run.json" result)" = PASS ] && [ "$(field "$run/run.json" testVerdict)" = None ] \
+    && [ "$(field "$run/run.json" results.testVerdict)" = notJudged ] && pass "the run passes and the test is still not judged" \
+    || fail "the run passes and the test is still not judged"
+python3 -I - "$run" <<'PY' && pass "each answer is recorded with its range and markers, and the end evidence is kept" || fail "each answer is recorded with its range and markers, and the end evidence is kept"
+import json, os, sys
+d = sys.argv[1]; r = json.load(open(os.path.join(d, "run.json")))
+items = r["manualSteps"]["items"]
+ok = [i["state"] for i in items] == ["answered"] * 3 and [i["answer"] for i in items] == ["ok"] * 3
+ok = ok and all(i["memo"] == "memo ok" and i["by"] == "cli" and i["seqRange"]["0"] == {"from": 50, "to": 50} for i in items)
+ok = ok and all(os.path.isfile(os.path.join(d, i["evidence"], "slot-1", "g222-e8", "markers.json")) for i in items)
+ok = ok and os.path.isdir(os.path.join(d, "evidence", "manual-steps", "end", "slot-0", "g111-e7"))
+w = json.load(open(os.path.join(d, "waiting.json")))
+sys.exit(0 if ok and w["waiting"] is False and r["results"]["evidence"] == "PASS" else 1)
+PY
+python3 -I "$runner" answer --run "$run" --wait-id "$(printf 'f%.0s' $(seq 32))" --item a ok > /dev/null 2>&1
+[ $? -eq 1 ] && pass "an answer after the run finished is refused" || fail "an answer after the run finished is refused"
+
+ms_prepare; answer_items ng skip ok
+check "an ng among the answers fails the run" 1 results.manualSteps FAIL
+[ "$(field "$run/run.json" reason)" = humanNg ] && [ "$(field "$run/run.json" manualSteps.items)" != None ] \
+    && python3 -I -c 'import json,sys; r=json.load(open(sys.argv[1])); sys.exit(0 if [i["answer"] for i in r["manualSteps"]["items"]]==["ng","skip","ok"] else 1)' "$run/run.json" \
+    && pass "after an ng every item is still asked" || fail "after an ng every item is still asked"
+ms_prepare; answer_items ok skip ok
+check "a skipped item leaves the human result UNKNOWN" 3 reason humanNotAllOk
+
+ms_prepare
+VRCRT_RUNNER_TEST_ANSWER_WAIT=1 check "no answer in time is UNKNOWN" 3 reason answerTimeout
+python3 -I -c 'import json,sys; r=json.load(open(sys.argv[1])); s=[i["state"] for i in r["manualSteps"]["items"]]
+sys.exit(0 if s==["unanswered","notAsked","notAsked"] and r["results"]["manualSteps"]=="UNKNOWN" else 1)' "$run/run.json" \
+    && [ "$(field "$run/waiting.json" waiting)" = False ] && pass "the late item is unanswered, the rest not asked, the wait closed" \
+    || fail "the late item is unanswered, the rest not asked, the wait closed"
+
+ms_prepare
+( for _ in $(seq 400); do waiting_json > /dev/null && break; sleep 0.05; done; touch "$run/cancel.request" ) &
+start=$(python3 -I -c 'import time; print(time.monotonic())')
+check "a cancel while waiting for an answer is CANCELED" 4 results.manualSteps CANCELED
+elapsed=$(python3 -I -c "import time; print(time.monotonic() - $start < 4)")
+[ "$elapsed" = True ] && [ "$(field "$run/run.json" manualSteps.items)" != None ] \
+    && python3 -I -c 'import json,sys; r=json.load(open(sys.argv[1])); sys.exit(0 if r["manualSteps"]["items"][0]["state"]=="interrupted" else 1)' "$run/run.json" \
+    && pass "the cancel takes effect at once and the item is interrupted" || fail "the cancel takes effect at once and the item is interrupted"
+
+ms_prepare
+( for _ in $(seq 400); do waiting_json > /dev/null && break; sleep 0.05; done
+  clients "__NOW__" "$(client 0 111 7 4 joined false authenticated)" "$(RUNNING=false client 1 222 8 4 joined false authenticated)" ) &
+check "a client that leaves while the run waits is UNKNOWN" 3 reason clientChanged
+ms_prepare
+( for _ in $(seq 400); do waiting_json > /dev/null && break; sleep 0.05; done
+  FEATURE=1 REV=18 bridge ) &
+check "a revision that moves while the run waits is UNKNOWN" 3 reason clientChanged
+# statuses: how many times the runner has read /clients so far
+statuses() { grep -c '^status' "$fake/calls.log"; }
+ms_prepare
+( for _ in $(seq 400); do waiting_json > /dev/null && break; sleep 0.05; done
+  clients "2026-01-01T00:00:00+00:00" "$(client 0 111 7 4 joined false authenticated)" "$(client 1 222 8 4 joined false authenticated)"
+  seen=$(statuses); for _ in $(seq 400); do [ "$(statuses)" -gt "$seen" ] && break; sleep 0.05; done
+  : > "$work/stale-seen"
+  ready_clients "$tag"
+  seen=$(statuses); for _ in $(seq 400); do [ "$(statuses)" -gt "$seen" ] && break; sleep 0.05; done
+  answer_items ok ok ok; wait ) &
+rm -f "$work/stale-seen"
+VRCRT_RUNNER_TEST_OBSERVATION_GRACE=3 check "a short gap in the observation does not stop the wait" 0 result PASS
+[ -f "$work/stale-seen" ] && pass "(the runner did read the stale list while it waited)" \
+    || fail "(the runner did read the stale list while it waited)"
+ms_prepare
+( for _ in $(seq 400); do waiting_json > /dev/null && break; sleep 0.05; done
+  clients "2026-01-01T00:00:00+00:00" "$(client 0 111 7 4 joined false authenticated)" "$(client 1 222 8 4 joined false authenticated)" ) &
+check "an observation that stays stale while waiting is UNKNOWN" 3 reason observationIncomplete
+
+# answer's refusals, and answers that are not the runner's
+ms_prepare
+python3 -I "$runner" continue --run "$run" --claim-token "$token" > "$work/out" 2>&1 &
+continue_pid=$!
+out=""; for _ in $(seq 400); do out="$(waiting_json)" && break; sleep 0.05; done
+wait_id="$(jget "$out" waitId)"
+[ "$(jget "$out" title)" = "Hand order" ] && [ "$(jget "$out" index)" = 1 ] && pass "waiting shows the item and the run's title" \
+    || fail "waiting shows the item and the run's title: $out"
+python3 -I "$runner" answer --run "$run" --wait-id "$(printf '0%.0s' $(seq 32))" --item a ok > /dev/null 2>&1
+code1=$?
+python3 -I "$runner" answer --run "$run" --wait-id "$wait_id" --item b ok > /dev/null 2>&1
+code2=$?
+[ "$code1" -eq 1 ] && [ "$code2" -eq 1 ] && [ -z "$(ls "$run"/answer-* 2>/dev/null)" ] \
+    && pass "an answer to another wait or item is refused and nothing is written" || fail "an answer to another wait or item is refused ($code1 $code2)"
+kill -9 "$continue_pid"; wait "$continue_pid" 2>/dev/null
+python3 -I "$runner" answer --run "$run" --wait-id "$wait_id" --item a ok > /dev/null 2>&1
+[ $? -eq 1 ] && [ -z "$(ls "$run"/answer-* 2>/dev/null)" ] && pass "an answer after the runner died is refused" \
+    || fail "an answer after the runner died is refused"
+python3 -I "$runner" recover --run "$run" > /dev/null 2>&1
+python3 -I -c 'import json,sys; r=json.load(open(sys.argv[1])); sys.exit(0 if r["reason"]=="runnerInterrupted" and r["manualSteps"]["items"][0]["state"]=="interrupted" and r["results"]["manualSteps"]=="UNKNOWN" else 1)' "$run/run.json" \
+    && [ "$(field "$run/waiting.json" waiting)" = False ] && pass "recover closes the wait and marks the item interrupted" \
+    || fail "recover closes the wait and marks the item interrupted"
+
+ms_prepare
+python3 -I "$runner" continue --run "$run" --claim-token "$token" > "$work/out" 2>&1 &
+continue_pid=$!
+out=""; for _ in $(seq 400); do out="$(waiting_json)" && break; sleep 0.05; done
+wait_id="$(jget "$out" waitId)"
+python3 -I "$runner" answer --run "$run" --wait-id "$wait_id" --item a ok > /dev/null 2>&1; code1=$?
+python3 -I "$runner" answer --run "$run" --wait-id "$wait_id" --item a ng > /dev/null 2>&1; code2=$?
+touch "$run/cancel.request"; wait "$continue_pid"
+[ "$code1" -eq 0 ] && [ "$code2" -eq 1 ] && [ "$(field "$run/answer-$wait_id.json" answer)" = ok ] \
+    && pass "a second answer to the same wait is refused and the first stays" || fail "a second answer to the same wait is refused ($code1 $code2)"
+
+ms_prepare
+( for _ in $(seq 400); do out="$(waiting_json)" && break; sleep 0.05; done
+  printf '{"schema":"vrcrt.answer"}' > "$run/answer-$(jget "$out" waitId).json" ) &
+check "an answer file that is not the contract's shape is UNKNOWN" 3 reason invalidAnswer
+ms_prepare
+( for _ in $(seq 400); do out="$(waiting_json)" && break; sleep 0.05; done
+  mkfifo "$run/answer-$(jget "$out" waitId).json" ) &
+start=$(python3 -I -c 'import time; print(time.monotonic())')
+check "a FIFO in place of the answer is UNKNOWN without hanging" 3 reason invalidAnswer
+ms_prepare
+( for _ in $(seq 400); do out="$(waiting_json)" && break; sleep 0.05; done
+  printf '{}' > "$work/elsewhere.json"; ln -s "$work/elsewhere.json" "$run/answer-$(jget "$out" waitId).json" ) &
+check "a link in place of the answer is UNKNOWN" 3 reason invalidAnswer
+
+ms_prepare
+( for _ in $(seq 400); do out="$(waiting_json)" && break; sleep 0.05; done
+  python3 -I "$runner" waiting --run "$run" --json > "$work/waiting-b.json" 2>&1
+  python3 -I "$runner" answer --run "$run" --wait-id "$(jget "$out" waitId)" --item a ok > /dev/null 2>&1
+  for _ in $(seq 400); do out2="$(waiting_json)" && [ "$(jget "$out2" itemId)" = b ] && break; sleep 0.05; done
+  printf '%s' "$out2" > "$work/waiting-b.json"; touch "$run/cancel.request" ) &
+check "(a run canceled at its second item)" 4 results.manualSteps CANCELED
+grep -q '\\\\u001b\[31m' "$work/waiting-b.json" && ! grep -q "$(printf '\033')" "$work/waiting-b.json" \
+    && pass "waiting shows an escape character in an item's text as \\u001b" || { fail "waiting shows an escape character as \\u001b"; cat "$work/waiting-b.json"; }
+
+# manual-steps with a leave and rejoin after an item
+ms_lr_prepare() {
+    FEATURE=1 prepare_run --procedure manual-steps --checklist "$checklist" --unvalidated --target-slot 1 "$@" || return $?
+    lr_stage
+}
+ms_lr_prepare --leave-rejoin-after b
+answer_items ok ok ok
+check "manual-steps with a leave and rejoin after an item passes" 0 result PASS
+[ "$(field "$run/run.json" results.leaveRejoin)" = PASS ] && [ "$(calls close)" = 1 ] && [ "$(calls launch)" = 1 ] \
+    && [ -d "$run/evidence/manual-steps/leave-rejoin/after-rejoin/slot-1/g333-e9" ] \
+    && [ -d "$run/evidence/manual-steps/end/slot-1/g333-e9" ] \
+    && python3 -I -c 'import json,sys; r=json.load(open(sys.argv[1])); i=r["manualSteps"]["items"]; sys.exit(0 if i[2]["state"]=="answered" and r["manualSteps"]["fixedAfterRejoin"]["1"]["clientGeneration"]==333 else 1)' "$run/run.json" \
+    && pass "one close and one launch after the item, the next item asked with the new generation" \
+    || fail "one close and one launch after the item, the next item asked with the new generation"
+ms_lr_prepare --leave-rejoin-after c
+answer_items ok ok ok
+check "a leave and rejoin after the last item passes" 0 result PASS
+[ -d "$run/evidence/manual-steps/end/slot-1/g333-e9" ] && pass "the end evidence is of the rejoined generation" \
+    || fail "the end evidence is of the rejoined generation"
+ms_lr_prepare --leave-rejoin-after a
+rm -f "$fake"/*-after-close.json
+printf 'EXIT 1\n{"error":"preconditionFailed","mismatched":["operationRevision"],"current":{"operationRevision":18,"clientGeneration":null},"operationId":"__OPID__"}' > "$fake/close.json"
+answer_items ok ok ok
+check "a 412 for the close after an item is UNKNOWN" 3 reason closePreconditionFailed
+[ "$(calls launch)" = 0 ] && [ "$(field "$run/run.json" manualSteps.leaveRejoin.clientMayBeLeftClosed)" = False ] \
+    && python3 -I -c 'import json,sys; r=json.load(open(sys.argv[1])); s=[i["state"] for i in r["manualSteps"]["items"]]; sys.exit(0 if s==["answered","notAsked","notAsked"] else 1)' "$run/run.json" \
+    && pass "after the 412 nothing is launched and the later items are not asked" \
+    || fail "after the 412 nothing is launched and the later items are not asked"
+ms_lr_prepare --leave-rejoin-after a
+printf 'EXIT 3\n' > "$fake/launch.json"
+answer_items ok ok ok
+check "a launch with no answer after an item is UNKNOWN" 3 reason launchUnavailable
+[ "$(calls launch)" = 1 ] && [ "$(field "$run/run.json" manualSteps.leaveRejoin.clientMayBeLeftClosed)" = True ] \
+    && pass "the launch is not sent again and the run says the client may be left closed" \
+    || fail "the launch is not sent again and the run says the client may be left closed (manual-steps)"
+rm -f "$root"/locks/*.json; bridge; before_clients; cursor; : > "$fake/calls.log"
+python3 -I "$runner" prepare --slots 0,1 --procedure manual-steps --checklist "$checklist" --unvalidated --leave-rejoin-after b \
+    --target-slot 1 --owner-pid $$ --run-root "$root" > "$work/out" 2>&1
+[ $? -eq 3 ] && grep -q slotPreconditionsUnsupported "$work/out" && pass "a leave and rejoin on a Bridge without the feature is refused before the deploy" \
+    || { fail "a leave and rejoin on a Bridge without the feature is refused before the deploy"; cat "$work/out"; }
 
 if [ "$failures" -eq 0 ]; then
     echo "all checks passed"

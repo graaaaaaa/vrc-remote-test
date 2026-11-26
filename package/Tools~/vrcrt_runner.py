@@ -13,11 +13,22 @@ slotPreconditions.v1, Relaunch), wait until it has left while the other slots st
 launch it again with a precondition, wait until the new client is back in the same instance, and
 collect evidence before the close, after the close and after the rejoin. Nothing is sent again.
 
+manual-steps (R3, docs/plans/r3-contract.md; not validated yet, so only with --unvalidated):
+deploy-collect, then ask a person the items of a --checklist file one at a time and wait for each
+answer (ok, ng or skip, with a memo), given with `answer` here or from the Unity window. Each answer
+is recorded with the time, every slot's log position and markers; the slots must stay as they were
+ready while it waits. With --leave-rejoin-after ITEM --target-slot N, leave-rejoin's close and
+launch run after that item's answer. The answers are recorded as given: the runner judges nothing.
+
     vrcrt_runner.py prepare --slots 0,1 [--procedure deploy-collect|leave-rejoin] [--target-slot N
                     [--remaining-marker REGEX]] [--expect-clients ...] [--world-build-wait S] [--owner-pid PID] [--run-root DIR]
     vrcrt_runner.py continue --run DIR --claim-token TOKEN
     vrcrt_runner.py run --build headless --project DIR --scene Assets/... --slots 0,1 [--procedure ... --target-slot N
                     [--remaining-marker REGEX]] [--world-build-wait S] [--unity PATH]
+    vrcrt_runner.py prepare|run ... --procedure manual-steps --checklist FILE --unvalidated
+                    [--leave-rejoin-after ITEM --target-slot N [--remaining-marker REGEX]] [--answer-wait S] [--run-minutes M]
+    vrcrt_runner.py waiting --run DIR [--json]
+    vrcrt_runner.py answer --run DIR --wait-id ID --item ITEM ok|ng|skip [--memo TEXT] [--by unity|cli]
     vrcrt_runner.py recover --run DIR
     vrcrt_runner.py prune --older-than-days N [--run-root DIR]
 
@@ -44,6 +55,7 @@ import re
 import secrets
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -54,7 +66,7 @@ if sys.version_info < (3, 9):
     sys.stderr.write("vrcrt_runner: Python 3.9 or later is needed (this is %d.%d)\n" % sys.version_info[:2])
     sys.exit(2)
 
-RUNNER_VERSION = "0.12.0"
+RUNNER_VERSION = "0.13.0"
 RUN_SCHEMA = "vrcrt.run"
 HERE = os.path.dirname(os.path.realpath(__file__))
 FIXTURE_DIR = os.environ.get("VRCRT_FIXTURE_DIR", "")
@@ -77,7 +89,7 @@ OPERATION_ID = re.compile(r"[A-Za-z0-9_-]{1,64}")
 # A procedure missing here runs only with --unvalidated (docs/plans/r1-automation.md §5.5).
 # leave-rejoin: docs/validation/slot-preconditions.md, 2026-11-26, Bridge 0.12.0+4892f91 (exe SHA-256 a69a379a…bae6e).
 VALIDATED_PROCEDURES = {"deploy-collect": "0.11.0", "leave-rejoin": "0.12.0"}
-PROCEDURES = ("deploy-collect", "leave-rejoin")
+PROCEDURES = ("deploy-collect", "leave-rejoin", "manual-steps")
 
 
 def test_setting(name, default, low, high):
@@ -121,6 +133,20 @@ LAUNCH_CLI_SECONDS = 120  # vrcrt.sh launch-client gives the Bridge 90 s
 REGEX_SECONDS = 2  # one --remaining-marker match over the new marker lines, in a child that is killed
 MAX_REGEX_CHARS = 256
 MAX_MARKER_TEXT = 4096
+# manual-steps (R3), also `proposed` (docs/plans/r3-contract.md §7).
+MAX_ITEMS = 20
+MAX_TITLE_CHARS = 120
+MAX_ITEM_CHARS = 1000
+MAX_CHECKLIST_BYTES = 64 * 1024
+MAX_WAITING_BYTES = 16 * 1024
+MAX_ANSWER_BYTES = 16 * 1024
+MAX_MEMO_CHARS = 2000
+MIN_ANSWER_WAIT, DEFAULT_ANSWER_WAIT, MAX_ANSWER_WAIT = 60, 1200, 3600
+MIN_RUN_MINUTES, DEFAULT_RUN_MINUTES, MAX_RUN_MINUTES = 30, 90, 120
+ANSWER_WAIT_CAP = test_setting("VRCRT_RUNNER_TEST_ANSWER_WAIT", "3600", 0.5, 3600)
+MANUAL_RUN_CAP = test_setting("VRCRT_RUNNER_TEST_MANUAL_RUN", "7200", 1, 7200)
+MANUAL_RECHECK_SECONDS = test_setting("VRCRT_RUNNER_TEST_MANUAL_RECHECK", "5", 0.05, 5)
+OBSERVATION_GRACE_SECONDS = test_setting("VRCRT_RUNNER_TEST_OBSERVATION_GRACE", "15", 0.1, 15)
 
 
 class Stop(Exception):
@@ -410,6 +436,8 @@ class Run:
             results["leaveRejoin"] = "CANCELED" if result == "CANCELED" else "UNKNOWN"
             if not isinstance(self.record.get("leaveRejoin"), dict):
                 self.record["leaveRejoin"] = {"state": "notStarted"}
+        if procedure.get("name") == "manual-steps":
+            finish_manual(self.record, self.directory, result)
         self.save()
         self.progress("finished", result, reason=reason)
 
@@ -710,6 +738,9 @@ def finalize_interrupted(directory):
     if run.record.get("state") != "finished":
         run.finish("UNKNOWN", "runnerInterrupted" if run.record.get("state") in ("running", "building")
                    else "expiredBeforeContinue")
+    elif isinstance(run.record.get("manualSteps"), dict) and run.record["manualSteps"].get("waitNotClosed"):
+        close_lingering_wait(run.record, directory)
+        run.save()
     return True
 
 
@@ -906,17 +937,17 @@ def check_unchanged(entry, want, slot, when):
         raise Stop("UNKNOWN", "unexpectedChange", "slot %d %s" % (slot, when))
 
 
-def recheck(run, slots, fixed, bridge_before, when, guard=None):
+def recheck(run, slots, fixed, bridge_before, when, guard=None, timeout=CLI_SECONDS):
     """All declared slots as they were when they became ready, on the same Bridge host, with
     their logs read through; with a guard (slotPreconditions.v1 in Relaunch) also the same launch
     plan and operation revision. Returns the /bridge and /clients it read."""
     run.check()
-    info = bridge_now(run)
+    info = bridge_now(run, timeout=timeout)
     if not same_bridge(bridge_before, bridge_identity(info)):
         raise Stop("UNKNOWN", "bridgeChanged", when)
     if guard:
         check_guard(info, guard, when)
-    clients = clients_now(run)
+    clients = clients_now(run, timeout=timeout)
     if not list_fresh(clients):
         raise Stop("UNKNOWN", "observationStale", when)
     for slot in slots:
@@ -1069,19 +1100,29 @@ def valid_regex(text):
     return True
 
 
-def procedure_parameters(args, slots, expect, wait):
+def procedure_parameters(args, slots, expect, wait, checklist=None):
     """The procedure's name and parameters from the command line (all recorded and hashed).
-    deploy-collect keeps exactly R1a's parameters."""
+    deploy-collect keeps exactly R1a's parameters, leave-rejoin R1b's. `checklist` is
+    manual-steps' (bytes, title, items), already checked."""
     name = getattr(args, "procedure", None) or "deploy-collect"
     target = getattr(args, "target_slot", None)
     marker = getattr(args, "remaining_marker", None)
+    after = getattr(args, "leave_rejoin_after", None)
+    manual_only = {"--checklist": getattr(args, "checklist", None), "--answer-wait": getattr(args, "answer_wait", None),
+                   "--run-minutes": getattr(args, "run_minutes", None), "--leave-rejoin-after": after}
     parameters = {"slots": slots, "expectClients": expect, "worldBuildWaitSeconds": wait}
+    if name != "manual-steps":
+        given = [flag for flag, value in manual_only.items() if value is not None]
+        if given:
+            raise Usage("%s belong to --procedure manual-steps" % ", ".join(given))
     if name == "deploy-collect":
         if target is not None or marker is not None:
             raise Usage("--target-slot and --remaining-marker belong to --procedure leave-rejoin")
         return name, parameters
     if name not in VALIDATED_PROCEDURES and not getattr(args, "unvalidated", False):
         raise Usage("%s has not been validated on real clients yet; add --unvalidated to run it anyway" % name)
+    if name == "manual-steps":
+        return name, manual_parameters(args, slots, parameters, checklist, target, marker, after)
     if target is None or target not in slots:
         raise Usage("leave-rejoin needs --target-slot N, one of the --slots")
     if len(slots) < 2:
@@ -1094,11 +1135,59 @@ def procedure_parameters(args, slots, expect, wait):
     return name, parameters
 
 
+def manual_parameters(args, slots, parameters, checklist, target, marker, after):
+    if checklist is None:
+        raise Usage("manual-steps needs --checklist FILE")
+    data, _, items = checklist
+    answer = DEFAULT_ANSWER_WAIT if args.answer_wait is None else args.answer_wait
+    if not MIN_ANSWER_WAIT <= answer <= MAX_ANSWER_WAIT:
+        raise Usage("--answer-wait takes %d to %d seconds" % (MIN_ANSWER_WAIT, MAX_ANSWER_WAIT))
+    minutes = DEFAULT_RUN_MINUTES if args.run_minutes is None else args.run_minutes
+    if not MIN_RUN_MINUTES <= minutes <= MAX_RUN_MINUTES:
+        raise Usage("--run-minutes takes %d to %d" % (MIN_RUN_MINUTES, MAX_RUN_MINUTES))
+    parameters.update({"checklistSha256": hashlib.sha256(data).hexdigest(), "itemCount": len(items),
+                       "answerWaitSeconds": answer, "runMinutes": minutes, "leaveRejoinAfter": after,
+                       "targetSlot": target, "remainingMarker": marker,
+                       "unvalidated": "manual-steps" not in VALIDATED_PROCEDURES})
+    if after is None:
+        if target is not None or marker is not None:
+            raise Usage("--target-slot and --remaining-marker go with --leave-rejoin-after")
+        return parameters
+    if after not in [item["id"] for item in items]:
+        raise Usage("--leave-rejoin-after must be the id of one of the checklist's items")
+    if target is None or target not in slots:
+        raise Usage("--leave-rejoin-after needs --target-slot N, one of the --slots")
+    if len(slots) < 2:
+        raise Usage("--leave-rejoin-after needs at least one slot besides --target-slot that stays")
+    if marker is not None and not valid_regex(marker):
+        raise Usage("--remaining-marker must be a regular expression of 1 to %d characters" % MAX_REGEX_CHARS)
+    parameters.update({"leaveWaitSeconds": LEAVE_SECONDS, "rejoinWaitSeconds": REJOIN_SECONDS})
+    return parameters
+
+
+def manual_procedure_ok(parameters, slots):
+    if not isinstance(parameters, dict) or not isinstance(slots, list) or not slots:
+        return False
+    if not (("manual-steps" in VALIDATED_PROCEDURES or parameters.get("unvalidated") is True)
+            and isinstance(parameters.get("checklistSha256"), str) and SHA256.fullmatch(parameters["checklistSha256"])
+            and is_count(parameters.get("itemCount"), 1, MAX_ITEMS)
+            and is_count(parameters.get("answerWaitSeconds"), MIN_ANSWER_WAIT, MAX_ANSWER_WAIT)
+            and is_count(parameters.get("runMinutes"), MIN_RUN_MINUTES, MAX_RUN_MINUTES)):
+        return False
+    after, target, marker = parameters.get("leaveRejoinAfter"), parameters.get("targetSlot"), parameters.get("remainingMarker")
+    if after is None:
+        return target is None and marker is None
+    return (isinstance(after, str) and ITEM_ID.fullmatch(after) is not None and len(slots) >= 2
+            and is_count(target, 0, 3) and target in slots and (marker is None or valid_regex(marker)))
+
+
 def procedure_of(record):
     """The procedure run.json names, checked again before continue acts on it."""
     procedure = record.get("procedure") if isinstance(record.get("procedure"), dict) else {}
     name, parameters = procedure.get("name"), procedure.get("parameters")
     if name == "deploy-collect":
+        return name, parameters
+    if name == "manual-steps" and manual_procedure_ok(parameters, record.get("slots")):
         return name, parameters
     slots = record.get("slots")
     if name == "leave-rejoin" and isinstance(parameters, dict) and isinstance(slots, list) and len(slots) >= 2:
@@ -1145,13 +1234,20 @@ def prepare(args, owner_pid):
     wait = TAG_SECONDS if args.world_build_wait is None else args.world_build_wait
     if not 0 <= wait <= MAX_TAG_WAIT:
         raise Usage("--world-build-wait takes 0 to %d seconds" % MAX_TAG_WAIT)
-    name, parameters = procedure_parameters(args, slots, expect, wait)
+    checklist = None
+    if getattr(args, "procedure", None) == "manual-steps" and getattr(args, "checklist", None) is not None:
+        checklist = load_checklist(args.checklist)
+    name, parameters = procedure_parameters(args, slots, expect, wait, checklist)
     created = utc_now()
     run_id = created.strftime("%Y%m%dT%H%M%SZ") + "-" + secrets.token_hex(4)
-    deadline_utc = iso(created + timedelta(seconds=RUN_SECONDS))
+    # One deadline for the whole run, fixed here: the claim, this Run (a headless build uses it)
+    # and continue all go by it.
+    seconds = min(parameters["runMinutes"] * 60, MANUAL_RUN_CAP) if name == "manual-steps" else RUN_SECONDS
+    deadline_utc = iso(created + timedelta(seconds=seconds))
     directory = os.path.join(root, "runs", run_id)
     os.mkdir(directory, 0o700)
     run = Run(directory)
+    run.deadline = time.monotonic() + seconds
     results = {"deploy": None, "launch": None, "clientReadiness": None, "worldBuildMatch": None,
                "evidence": None, "testVerdict": "notJudged"}
     notes = ["PASS means prepared and collected; the test itself is not judged by the runner.",
@@ -1163,6 +1259,18 @@ def prepare(args, owner_pid):
         procedure["validated"] = name in VALIDATED_PROCEDURES
         notes.append("leave-rejoin PASS means the declared slot left and came back as declared; "
                      "who owns what in the world is not judged by the runner.")
+    manual = None
+    if name == "manual-steps":
+        results["manualSteps"] = None
+        if parameters["leaveRejoinAfter"] is not None:
+            results["leaveRejoin"] = None
+        procedure["validated"] = name in VALIDATED_PROCEDURES
+        notes.append("manualSteps is the human answers as given (ok, ng, skip); the runner does not judge the test. "
+                     "A human OK never turns a tool result into PASS.")
+        _, title, items = checklist
+        manual = {"title": title, "checklistSha256": parameters["checklistSha256"],
+                  "leaveRejoinAfter": parameters["leaveRejoinAfter"], "result": None, "leaveRejoin": None,
+                  "items": [{"index": index, "id": item["id"], "state": "notAsked"} for index, item in enumerate(items, 1)]}
     run.record = {"schema": RUN_SCHEMA, "schemaVersion": 1, "runId": run_id, "createdAtUtc": iso(created),
                   "deadlineUtc": deadline_utc, "state": "preparing",
                   "procedure": procedure,
@@ -1170,6 +1278,9 @@ def prepare(args, owner_pid):
                   "children": [],
                   "results": results,
                   "notes": notes}
+    if manual is not None:
+        run.record["manualSteps"] = manual
+        write_new(os.path.join(directory, "checklist.json"), checklist[0])
     run.save()
     claim = Claim(root)
     token = None
@@ -1193,13 +1304,13 @@ def prepare(args, owner_pid):
         problems = declaration_problems(expect, info)
         if problems:
             raise Stop("UNKNOWN", "declarationMismatch", "; ".join(problems))
-        if name == "leave-rejoin":
+        if name == "leave-rejoin" or (name == "manual-steps" and parameters["leaveRejoinAfter"] is not None):
             # Refused before the deploy: a Bridge without the feature never gets a preconditioned request.
             if not run.record["bridgeBefore"]["slotPreconditions"]:
                 raise Stop("UNKNOWN", "slotPreconditionsUnsupported",
                            "the Bridge does not take preconditioned close/launch (0.12.0 and later); nothing was sent")
             if run.record["bridgeBefore"]["mode"] != "Relaunch":
-                raise Stop("UNKNOWN", "notRelaunch", "leave-rejoin needs VrchatClientMode Relaunch")
+                raise Stop("UNKNOWN", "notRelaunch", "the leave and rejoin needs VrchatClientMode Relaunch")
         clients = clients_now(run, timeout=remaining())
         if not list_fresh(clients):
             raise Stop("UNKNOWN", "observationStale", "before the deploy")
@@ -1249,6 +1360,8 @@ def continue_run(directory, token):
         result, fixed, guard = deploy_collect(run)
         if name == "leave-rejoin" and result == "PASS":
             result = leave_rejoin(run, fixed, guard)
+        elif name == "manual-steps" and result == "PASS":
+            result = manual_steps(run, fixed, guard)
         run.finish(result, run.record.get("reason") if result != "PASS" else None)
         return result
     except Stop as stop:
@@ -1773,11 +1886,14 @@ def previous_markers(run, slot, want):
     return markers
 
 
-def phase_folder(run, state, key, name):
-    """evidence/leave-rejoin/<name>/, recorded in run.json's leaveRejoin.evidence."""
-    base = os.path.join(run.directory, "evidence", "leave-rejoin")
-    private_directory(os.path.dirname(base))
+def phase_folder(run, state, key, name, under=("leave-rejoin",)):
+    """evidence/<under...>/<name>/ (evidence/leave-rejoin/<name>/ for leave-rejoin), recorded in
+    the state's evidence."""
+    base = os.path.join(run.directory, "evidence")
     private_directory(base)
+    for part in under:
+        base = os.path.join(base, part)
+        private_directory(base)
     folder = os.path.join(base, name)
     private_directory(folder)
     state["evidence"][key] = os.path.relpath(folder, run.directory)
@@ -1794,7 +1910,7 @@ def leave_rejoin(run, fixed, guard):
                                      "remainingMarker": parameters.get("remainingMarker"),
                                      "clientMayBeLeftClosed": False, "evidence": {}, "evidenceGaps": []}
     try:
-        word, reason = leave_rejoin_steps(run, state, fixed, guard, target, remaining, parameters)
+        word, reason, _, _ = leave_rejoin_steps(run, state, fixed, guard, target, remaining, parameters)
     except (Stop, KeyboardInterrupt) as error:
         record["results"]["leaveRejoin"] = error.result if isinstance(error, Stop) else "CANCELED"
         state["state"] = "stopped"
@@ -1811,7 +1927,9 @@ def leave_rejoin(run, fixed, guard):
     return word
 
 
-def leave_rejoin_steps(run, state, fixed, guard, target, remaining, parameters):
+def leave_rejoin_steps(run, state, fixed, guard, target, remaining, parameters, under=("leave-rejoin",)):
+    """Returns (word, reason, final fixed, final guard): the slots as they were, the target as its
+    new generation, and the guard at the revision of this run's own launch."""
     record = run.record
     slots = record["slots"]
     bridge_before = record["bridgeBefore"]
@@ -1830,7 +1948,7 @@ def leave_rejoin_steps(run, state, fixed, guard, target, remaining, parameters):
     # 2. Before the close: every slot's markers and full log, then /bridge and /clients once more;
     # the precondition comes from that /bridge, the marker cursor from those snapshots.
     with step(run, "snapshotBeforeClose"):
-        folder = phase_folder(run, state, "beforeClose", "before-close")
+        folder = phase_folder(run, state, "beforeClose", "before-close", under)
         markers = {slot: collect_slot(run, folder, slot, fixed[slot], "beforeClose") for slot in slots}
         info, clients = recheck(run, slots, fixed, bridge_before, "after the snapshot before the close", guard)
         save_lists(run, folder, clients, info, "beforeClose")
@@ -1856,7 +1974,7 @@ def leave_rejoin_steps(run, state, fixed, guard, target, remaining, parameters):
 
     # 5. After the close: the others' markers, the closed client's last markers, the lists.
     with step(run, "snapshotAfterClose"):
-        folder = phase_folder(run, state, "afterClose", "after-close")
+        folder = phase_folder(run, state, "afterClose", "after-close", under)
         for slot in remaining:
             markers = cli_json(run, "log", str(slot), "--markers", "--json", what="markers")
             header = markers.get("header") if isinstance(markers.get("header"), dict) else {}
@@ -1913,19 +2031,593 @@ def leave_rejoin_steps(run, state, fixed, guard, target, remaining, parameters):
         info, clients = recheck(run, record["slots"], final, bridge_before, "after the rejoin", guard)
         check_windows_disk(info)
     with step(run, "snapshotAfterRejoin"):
-        folder = phase_folder(run, state, "afterRejoin", "after-rejoin")
+        folder = phase_folder(run, state, "afterRejoin", "after-rejoin", under)
         for slot in slots:
             collect_slot(run, folder, slot, final[slot], "afterRejoin")
         save_lists(run, folder, clients_now(run), bridge_now(run), "afterRejoin")
     with step(run, "leaveRejoinFinalCheck"):
         recheck(run, slots, final, bridge_before, "at the end of leave-rejoin", guard)
     if match == "FAIL":
-        return "FAIL", "otherBuildTagAfterRejoin"
+        return "FAIL", "otherBuildTagAfterRejoin", final, guard
     if match == "UNKNOWN":
-        return "UNKNOWN", "buildTagAfterRejoinUnknown"
+        return "UNKNOWN", "buildTagAfterRejoinUnknown", final, guard
     if state["evidenceGaps"]:
-        return "UNKNOWN", "evidenceIncomplete"
-    return "PASS", None
+        return "UNKNOWN", "evidenceIncomplete", final, guard
+    return "PASS", None, final, guard
+
+
+# === manual-steps (R3, docs/plans/r3-contract.md) ===
+
+CHECKLIST_SCHEMA = "vrcrt.checklist"
+WAITING_SCHEMA = "vrcrt.waiting"
+ANSWER_SCHEMA = "vrcrt.answer"
+ITEM_ID = re.compile(r"[a-z0-9][a-z0-9_-]{0,31}")
+ANSWERS = ("ok", "ng", "skip")
+ITEM_STATES = ("notAsked", "waiting", "answered", "unanswered", "interrupted")
+# Characters shown as \uXXXX: C0 but newline, DEL, C1, line/paragraph separators, bidi controls.
+HIDDEN = re.compile("[\x00-\x09\x0b-\x1f\x7f-\x9f  ‪-‮⁦-⁩]")
+
+
+def strict_json(data):
+    """JSON with no duplicate names and no NaN/Infinity, from bytes that must be UTF-8."""
+    def pairs(items):
+        names = [name for name, _ in items]
+        if len(names) != len(set(names)):
+            raise ValueError("a name appears twice")
+        return dict(items)
+
+    def constant(name):
+        raise ValueError("%s is not JSON" % name)
+
+    return json.loads(data.decode("utf-8"), object_pairs_hook=pairs, parse_constant=constant)
+
+
+def read_owned(path, limit):
+    """The bytes of an ordinary file of this user that no one else may write, read without
+    following a link and without blocking on a FIFO: checked on the descriptor it reads."""
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode):
+            raise ValueError("%s is not an ordinary file" % os.path.basename(path))
+        if info.st_uid != os.getuid() or info.st_mode & 0o022:
+            raise ValueError("%s is not this user's own file" % os.path.basename(path))
+        chunks, size = [], 0
+        while True:
+            chunk = os.read(descriptor, min(65536, limit + 1 - size))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            size += len(chunk)
+            if size > limit:
+                raise ValueError("%s is larger than %d bytes" % (os.path.basename(path), limit))
+    finally:
+        os.close(descriptor)
+    return b"".join(chunks)
+
+
+def plain_text(value, low, high):
+    """A string of low..high code points with no surrogates (JSON escapes can make lone ones)."""
+    return (isinstance(value, str) and low <= len(value) <= high
+            and not any("\ud800" <= ch <= "\udfff" for ch in value))
+
+
+def check_checklist(data):
+    """The checklist's bytes as r3-contract.md §1 allows them; returns (title, items)."""
+    if len(data) > MAX_CHECKLIST_BYTES:
+        raise ValueError("the checklist is larger than %d bytes" % MAX_CHECKLIST_BYTES)
+    try:
+        value = strict_json(data)
+    except (ValueError, UnicodeDecodeError, RecursionError) as error:
+        raise ValueError("the checklist is not strict UTF-8 JSON: %s" % error)
+    if not isinstance(value, dict) or set(value) != {"schema", "schemaVersion", "title", "items"}:
+        raise ValueError("the checklist has exactly schema, schemaVersion, title and items")
+    if value["schema"] != CHECKLIST_SCHEMA or type(value["schemaVersion"]) is not int or value["schemaVersion"] != 1:
+        raise ValueError("the checklist is not %s version 1" % CHECKLIST_SCHEMA)
+    if not plain_text(value["title"], 1, MAX_TITLE_CHARS):
+        raise ValueError("the checklist title has 1 to %d characters" % MAX_TITLE_CHARS)
+    items = value["items"]
+    if not isinstance(items, list) or not 1 <= len(items) <= MAX_ITEMS:
+        raise ValueError("the checklist has 1 to %d items" % MAX_ITEMS)
+    seen = set()
+    for index, item in enumerate(items, 1):
+        if not isinstance(item, dict) or set(item) != {"id", "text"}:
+            raise ValueError("item %d has exactly id and text" % index)
+        if not isinstance(item["id"], str) or not ITEM_ID.fullmatch(item["id"]) or item["id"] in seen:
+            raise ValueError("item %d's id must match [a-z0-9][a-z0-9_-]{0,31} and be unique" % index)
+        seen.add(item["id"])
+        if not plain_text(item["text"], 1, MAX_ITEM_CHARS):
+            raise ValueError("item %d's text has 1 to %d characters" % (index, MAX_ITEM_CHARS))
+    return value["title"], items
+
+
+def visible(text):
+    """Display only: what could hide or reorder text becomes \\uXXXX."""
+    return HIDDEN.sub(lambda match: "\\u%04x" % ord(match.group(0)), text)
+
+
+def load_checklist(path):
+    try:
+        data = read_owned(path, MAX_CHECKLIST_BYTES)
+        title, items = check_checklist(data)
+    except (OSError, ValueError) as error:
+        raise Usage("--checklist: %s" % error)
+    return data, title, items
+
+
+class AnswerLock:
+    """answer.lock in the run folder: the runner's opening, reading and closing of a wait and
+    `answer`'s publishing take turns (flock; the kernel drops it when its holder dies)."""
+
+    def __init__(self, directory):
+        self.path = os.path.join(directory, "answer.lock")
+        self._descriptor = None
+
+    def __enter__(self):
+        self._descriptor = os.open(self.path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        fcntl.flock(self._descriptor, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *exc):
+        os.close(self._descriptor)
+        self._descriptor = None
+
+
+def waiting_path(directory):
+    return os.path.join(directory, "waiting.json")
+
+
+def answer_path(directory, wait_id):
+    return os.path.join(directory, "answer-%s.json" % wait_id)
+
+
+def read_waiting(directory):
+    try:
+        value = strict_json(read_owned(waiting_path(directory), MAX_WAITING_BYTES))
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError, UnicodeDecodeError, RecursionError):
+        return {"unreadable": True}
+    return value if isinstance(value, dict) else {"unreadable": True}
+
+
+def open_wait(run, index, count, item_id, deadline):
+    """Under answer.lock: a new wait for one item. Returns the waitId."""
+    wait_id = secrets.token_hex(16)
+    with AnswerLock(run.directory):
+        write_json(waiting_path(run.directory), {
+            "schema": WAITING_SCHEMA, "schemaVersion": 1, "runId": run.record["runId"], "waiting": True,
+            "waitId": wait_id, "index": index, "count": count, "itemId": item_id,
+            "startedAtUtc": iso(), "deadlineUtc": iso(deadline)})
+    return wait_id
+
+
+def close_wait_locked(run, wait_id):
+    write_json(waiting_path(run.directory), {"schema": WAITING_SCHEMA, "schemaVersion": 1,
+                                             "runId": run.record["runId"], "waiting": False,
+                                             "closedAtUtc": iso(), "lastWaitId": wait_id})
+
+
+def take_answer_locked(run, wait_id, item_id):
+    """With answer.lock held: the published answer to this wait, None when there is none yet.
+    Anything there that is not exactly this wait's answer stops the run (invalidAnswer)."""
+    path = answer_path(run.directory, wait_id)
+    if not os.path.lexists(path):
+        return None
+    try:
+        value = strict_json(read_owned(path, MAX_ANSWER_BYTES))
+    except (OSError, ValueError, UnicodeDecodeError, RecursionError) as error:
+        raise Stop("UNKNOWN", "invalidAnswer", str(error)[:300])
+    keys = {"schema", "schemaVersion", "runId", "waitId", "itemId", "answer", "memo", "by", "writtenAtUtc"}
+    if (not isinstance(value, dict) or set(value) != keys or value["schema"] != ANSWER_SCHEMA
+            or type(value["schemaVersion"]) is not int or value["schemaVersion"] != 1
+            or value["runId"] != run.record["runId"] or value["waitId"] != wait_id or value["itemId"] != item_id
+            or value["answer"] not in ANSWERS or value["by"] not in ("unity", "cli")
+            or not plain_text(value["memo"], 0, MAX_MEMO_CHARS) or parse_utc(value["writtenAtUtc"]) is None):
+        raise Stop("UNKNOWN", "invalidAnswer", "the answer to %s is not this wait's" % item_id)
+    return value
+
+
+def clean_memo(text):
+    return "".join(ch for ch in text if ch in "\n\t" or not (ch < " " or "\x7f" <= ch <= "\x9f"))
+
+
+def wait_valid(directory, record, waiting):
+    """r3-contract.md §3.3: the wait is open, the run is running, its claim's owner is alive, and
+    neither the item's nor the run's deadline has passed. Returns (valid, why)."""
+    if not isinstance(waiting, dict) or waiting.get("unreadable"):
+        return False, "waiting.json is not readable"
+    if waiting.get("schema") != WAITING_SCHEMA or waiting.get("waiting") is not True:
+        return False, "nothing is waiting for an answer"
+    if not isinstance(record, dict) or waiting.get("runId") != record.get("runId"):
+        return False, "waiting.json is not this run's"
+    if record.get("state") != "running":
+        return False, "the run is %s" % record.get("state")
+    key = record.get("claimKey")
+    try:
+        claim = Claim(os.path.dirname(os.path.dirname(directory)), key).read() if isinstance(key, str) else None
+    except Usage:
+        claim = None
+    if not isinstance(claim, dict) or claim.get("runId") != record.get("runId"):
+        return False, "the run does not hold the Bridge's claim"
+    owner = claim.get("owner") or {}
+    if not same_process(owner.get("pid"), owner.get("start")):
+        return False, "the run's runner is not running"
+    now = utc_now()
+    for name, holder in (("item", waiting), ("run", record)):
+        deadline = parse_utc(holder.get("deadlineUtc"))
+        if deadline is None or now >= deadline:
+            return False, "the %s's deadline has passed" % name
+    return True, None
+
+
+def checklist_of(directory):
+    """The run's own copy (title, items), or None."""
+    try:
+        return check_checklist(read_owned(os.path.join(directory, "checklist.json"), MAX_CHECKLIST_BYTES))
+    except (OSError, ValueError):
+        return None
+
+
+def waiting_report(directory):
+    record = read_json(os.path.join(directory, "run.json"))
+    waiting = read_waiting(directory)
+    valid, why = wait_valid(directory, record, waiting)
+    checklist = checklist_of(directory)
+    title, items = checklist if checklist else (None, [])
+    texts = {item["id"]: item["text"] for item in items}
+    state = (record.get("manualSteps") or {}) if isinstance(record, dict) else {}
+    report = {"runId": record.get("runId") if isinstance(record, dict) else None,
+              "waiting": isinstance(waiting, dict) and waiting.get("waiting") is True,
+              "valid": valid, "why": why,
+              "title": visible(title) if title else None,
+              "items": [{"id": item.get("id"), "state": item.get("state"), "answer": item.get("answer")}
+                        for item in state.get("items") or [] if isinstance(item, dict)]}
+    if report["waiting"]:
+        item_id = waiting.get("itemId")
+        report.update({"waitId": waiting.get("waitId"), "index": waiting.get("index"), "count": waiting.get("count"),
+                       "itemId": item_id, "text": visible(texts[item_id]) if item_id in texts else None,
+                       "startedAtUtc": waiting.get("startedAtUtc"), "deadlineUtc": waiting.get("deadlineUtc")})
+    return report
+
+
+def publish_answer(directory, wait_id, item_id, answer, memo, by):
+    """`answer`: under answer.lock, only to a valid wait with these ids and no answer yet; written
+    to a temporary file, flushed, then linked to answer-<waitId>.json (never replacing one)."""
+    record = read_json(os.path.join(directory, "run.json"))
+    with AnswerLock(directory):
+        waiting = read_waiting(directory)
+        valid, why = wait_valid(directory, record, waiting)
+        if not valid:
+            raise Stop("UNKNOWN", "notWaiting", why)
+        if waiting.get("waitId") != wait_id or waiting.get("itemId") != item_id:
+            raise Stop("UNKNOWN", "otherWait", "the run is waiting for item %s (%s), not this one"
+                       % (waiting.get("itemId"), waiting.get("waitId")))
+        final = answer_path(directory, wait_id)
+        if os.path.lexists(final):
+            raise Stop("UNKNOWN", "alreadyAnswered", "item %s has an answer already" % item_id)
+        value = {"schema": ANSWER_SCHEMA, "schemaVersion": 1, "runId": record["runId"], "waitId": wait_id,
+                 "itemId": item_id, "answer": answer, "memo": memo, "by": by, "writtenAtUtc": iso()}
+        data = json.dumps(value, ensure_ascii=False).encode("utf-8")
+        if len(data) > MAX_ANSWER_BYTES:
+            raise Stop("UNKNOWN", "answerTooLarge", "the answer would be %d bytes" % len(data))
+        temporary = os.path.join(directory, ".answer-%s.%s.part" % (wait_id, secrets.token_hex(8)))
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        try:
+            with os.fdopen(descriptor, "wb") as stream:
+                stream.write(data)
+                stream.flush()
+                os.fsync(stream.fileno())
+            # Once more right before the link (the time the answer is taken): a deadline may have
+            # passed while it was written.
+            valid, why = wait_valid(directory, read_json(os.path.join(directory, "run.json")), read_waiting(directory))
+            if not valid or read_waiting(directory).get("waitId") != wait_id:
+                raise Stop("UNKNOWN", "notWaiting", why or "the wait changed")
+            os.link(temporary, final)
+        finally:
+            os.unlink(temporary)
+
+
+def sample_cursor(clients, slot, want, markers):
+    """max(marker_cut, observedThroughSeq) of one slot's fixed generation and epoch, or
+    (None, why) when the sample is not of them or not read through."""
+    entry = entry_of(clients, slot) or {}
+    header = markers.get("header") if isinstance(markers.get("header"), dict) else {}
+    if (header.get("clientGeneration") != want["clientGeneration"]
+            or header.get("observationEpoch") != want["observationEpoch"]
+            or entry.get("clientGeneration") != want["clientGeneration"]
+            or entry.get("observationEpoch") != want["observationEpoch"]):
+        return None, "markersChanged"
+    if header.get("catchingUp") is not False or entry.get("catchingUp"):
+        return None, "catchingUp"
+    if not list_fresh(clients):
+        return None, "observationStale"
+    through = entry.get("observedThroughSeq")
+    if not is_count(through):
+        return None, "noCursor"
+    return max(marker_cut(markers), through), None
+
+
+def item_cursor(run, slots, fixed):
+    """Per slot, where an item's range starts (None with a reason when it cannot be told)."""
+    clients = clients_now(run)
+    cursor = {}
+    for slot in slots:
+        markers = cli_json(run, "log", str(slot), "--markers", "--json", what="markers")
+        cursor[slot] = sample_cursor(clients, slot, fixed[slot], markers)
+    return cursor
+
+
+INCOMPLETE_REASONS = ("observationStale", "observationIncomplete", "clientsUnavailable", "clientsInvalid",
+                      "bridgeUnavailable", "bridgeInvalid", "childDeadline")
+MANUAL_READ_SECONDS = 5  # one look while waiting: short, so an answer and the grace are not held up
+
+
+def manual_wait(run, item, wait_id, item_id, deadline_monotonic, slots, fixed, guard):
+    """Waits for this wait's answer; checks the slots every MANUAL_RECHECK_SECONDS. Returns the
+    answer, or raises Stop (answerTimeout, clientChanged, observationIncomplete, invalidAnswer,
+    CANCELED, runDeadline). The wait is closed under answer.lock whichever way it ends."""
+    bridge_before = run.record["bridgeBefore"]
+    next_check = time.monotonic() + MANUAL_RECHECK_SECONDS
+    incomplete_since = None
+    try:
+        while True:
+            run.check()  # a cancel and the run's deadline come before an answer
+            with AnswerLock(run.directory):
+                answer = take_answer_locked(run, wait_id, item_id)
+                if answer is not None or time.monotonic() >= deadline_monotonic:
+                    close_wait_locked(run, wait_id)
+                    if answer is not None:
+                        return answer
+                    raise Stop("UNKNOWN", "answerTimeout", "no answer to item %s" % item_id)
+            if time.monotonic() >= next_check:
+                looked = time.monotonic()
+                # A look never runs past what is left of the grace (it counts from the first look
+                # that failed), and stays short so the answer is seen soon after.
+                left = OBSERVATION_GRACE_SECONDS - (looked - incomplete_since) if incomplete_since else OBSERVATION_GRACE_SECONDS
+                try:
+                    recheck(run, slots, fixed, bridge_before, "while waiting for item %s" % item_id, guard,
+                            timeout=max(0.5, min(MANUAL_READ_SECONDS, left)))
+                    incomplete_since = None
+                except Stop as stop:
+                    if stop.result != "UNKNOWN" or stop.reason not in INCOMPLETE_REASONS:
+                        if stop.result == "UNKNOWN" and stop.reason != "runDeadline":
+                            raise Stop("UNKNOWN", "clientChanged", "%s: %s" % (stop.reason, stop.detail))
+                        raise
+                    incomplete_since = incomplete_since or looked
+                    if time.monotonic() - incomplete_since >= OBSERVATION_GRACE_SECONDS:
+                        raise Stop("UNKNOWN", "observationIncomplete",
+                                   "while waiting for item %s: %s" % (item_id, stop.detail or stop.reason))
+                next_check = time.monotonic() + MANUAL_RECHECK_SECONDS
+            time.sleep(CHECK_SECONDS)
+    except BaseException:
+        close_wait(run, wait_id)
+        raise
+
+
+def close_wait(run, wait_id):
+    """Closes the wait when it is still this one's (finish, recover and stops call this)."""
+    with AnswerLock(run.directory):
+        waiting = read_waiting(run.directory)
+        if isinstance(waiting, dict) and waiting.get("waiting") is True and waiting.get("waitId") == wait_id:
+            close_wait_locked(run, wait_id)
+
+
+def item_snapshot(run, item, folder, slots, fixed, start):
+    """After an answer: every slot's markers in evidence/manual-steps/<i>-<id>/, the (from, to]
+    range of each and any gap. A gap marks evidence UNKNOWN; the run goes on."""
+    clients = clients_now(run)
+    item["seqRange"], item["evidenceGap"] = {}, []
+    for slot in slots:
+        want = fixed[slot]
+        markers = cli_json(run, "log", str(slot), "--markers", "--json", what="markers")
+        header = markers.get("header") if isinstance(markers.get("header"), dict) else {}
+        start_seq, start_gap = start[slot]
+        end_seq, end_gap = sample_cursor(clients, slot, want, markers)
+        gap = start_gap or end_gap
+        dropped = header.get("droppedThroughSeq") or 0
+        if gap is None and end_seq < start_seq:
+            gap = "cursorWentBack"
+        elif gap is None and (not isinstance(dropped, int) or dropped > start_seq):
+            gap = "markersDropped"
+        item["seqRange"][str(slot)] = {"from": start_seq, "to": end_seq if gap in (None, "markersDropped") else None}
+        if gap:
+            item["evidenceGap"].append({"slot": slot, "reason": gap})
+        if (header.get("clientGeneration") == want["clientGeneration"]
+                and header.get("observationEpoch") == want["observationEpoch"]):
+            save_markers(run, folder, slot, want, markers, "item:" + item["id"])
+    item["markersTakenAtUtc"] = iso()
+    if item["evidenceGap"]:
+        run.record["results"]["evidence"] = "UNKNOWN"
+    run.save()
+
+
+def manual_items_result(items):
+    answers = [item.get("answer") if item.get("state") == "answered" else None for item in items]
+    if "ng" in answers:
+        return "FAIL"
+    if all(answer == "ok" for answer in answers):
+        return "PASS"
+    return "UNKNOWN"
+
+
+def manual_steps(run, fixed, guard):
+    """r3-contract.md §4, after deploy-collect passed in the same continue. Returns the word for
+    the whole run (and sets record.reason)."""
+    record = run.record
+    parameters = record["procedure"]["parameters"]
+    slots = record["slots"]
+    state = record["manualSteps"]
+    try:
+        data = read_owned(os.path.join(run.directory, "checklist.json"), MAX_CHECKLIST_BYTES)
+        title, items = check_checklist(data)
+    except (OSError, ValueError):
+        raise Stop("UNKNOWN", "procedureInvalid", "the run's checklist.json is missing or changed")
+    if hashlib.sha256(data).hexdigest() != parameters.get("checklistSha256"):
+        raise Stop("UNKNOWN", "procedureInvalid", "the run's checklist.json is not the one prepared")
+    answer_seconds = min(procedure_seconds(parameters, "answerWaitSeconds", MAX_ANSWER_WAIT), ANSWER_WAIT_CAP)
+    after = parameters.get("leaveRejoinAfter")
+    base = os.path.join(run.directory, "evidence")
+    private_directory(base)
+    base = os.path.join(base, "manual-steps")
+    private_directory(base)
+    operation = run.begin("manualSteps", items=len(items))
+    try:
+        for index, entry in enumerate(state["items"], 1):
+            run.check()
+            item_id = entry["id"]
+            start = item_cursor(run, slots, fixed)
+            deadline = min(utc_now() + timedelta(seconds=answer_seconds), parse_utc(record["deadlineUtc"]))
+            entry.update({"state": "waiting", "askedAtUtc": iso()})
+            wait_id = entry["waitId"] = open_wait(run, index, len(items), item_id, deadline)
+            run.save()
+            run.progress("ask", item_id, index=index, count=len(items), waitId=wait_id)
+            try:
+                answer = manual_wait(run, entry, wait_id, item_id,
+                                     time.monotonic() + max(0.0, (deadline - utc_now()).total_seconds()),
+                                     slots, fixed, guard)
+            except Stop as stop:
+                entry["state"] = "unanswered" if stop.reason == "answerTimeout" else "interrupted"
+                raise
+            except KeyboardInterrupt:
+                entry["state"] = "interrupted"
+                raise
+            entry.update({"state": "answered", "answer": answer["answer"], "memo": answer["memo"],
+                          "by": answer["by"], "answeredAtUtc": answer["writtenAtUtc"]})
+            run.save()
+            run.progress("answered", item_id, index=index, answer=answer["answer"])
+            folder = os.path.join(base, "%d-%s" % (index, item_id))
+            private_directory(folder)
+            entry["evidence"] = os.path.relpath(folder, run.directory)
+            item_snapshot(run, entry, folder, slots, fixed, start)
+            if item_id == after:
+                run.end(operation, "PASS")
+                fixed, guard = manual_leave_rejoin(run, fixed, guard)
+                operation = run.begin("manualSteps", items=len(items), afterLeaveRejoin=True)
+    except Stop as stop:
+        if operation.get("inProgress"):
+            run.end(operation, stop.result, stop.reason, detail=stop.detail)
+        raise
+    state["result"] = manual_items_result(state["items"])
+    record["results"]["manualSteps"] = state["result"]
+    run.end(operation, "PASS")
+    with step(run, "endSnapshot"):
+        info = bridge_now(run)
+        check_windows_disk(info)
+        folder = os.path.join(base, "end")
+        private_directory(folder)
+        for slot in slots:
+            collect_slot(run, folder, slot, fixed[slot], "end")
+        save_lists(run, folder, clients_now(run), bridge_now(run), "end")
+    with step(run, "manualStepsFinalCheck"):
+        recheck(run, slots, fixed, record["bridgeBefore"], "at the end of manual-steps", guard)
+    return manual_overall(record)
+
+
+def manual_overall(record):
+    """r3-contract.md §5: the tools' results first, the human answers last; UNKNOWN before FAIL."""
+    results = record["results"]
+    words = []
+    if results.get("worldBuildMatch") == "FAIL":
+        words.append(("FAIL", "otherBuildTag"))
+    if record["procedure"]["parameters"].get("leaveRejoinAfter") is not None and results.get("leaveRejoin") != "PASS":
+        words.append((results.get("leaveRejoin") or "UNKNOWN", record.get("reason") or "leaveRejoinNotPassed"))
+    if results.get("evidence") != "PASS":
+        words.append(("UNKNOWN", "evidenceIncomplete"))
+    human = results.get("manualSteps")
+    if human == "FAIL":
+        words.append(("FAIL", "humanNg"))
+    elif human != "PASS":
+        words.append(("UNKNOWN", "humanNotAllOk"))
+    for word in ("UNKNOWN", "FAIL"):
+        for found, reason in words:
+            if found == word:
+                record["reason"] = reason
+                return word
+    record["reason"] = None
+    return "PASS"
+
+
+def manual_leave_rejoin(run, fixed, guard):
+    """The R1b steps after the declared item, with their evidence under manual-steps/leave-rejoin.
+    PASS hands on the rejoined slot's new generation and this run's own revision; anything else
+    stops the run (nothing is sent again)."""
+    record = run.record
+    parameters = record["procedure"]["parameters"]
+    target = parameters["targetSlot"]
+    remaining = [slot for slot in record["slots"] if slot != target]
+    state = record["manualSteps"]["leaveRejoin"] = {
+        "state": "started", "afterItem": parameters["leaveRejoinAfter"], "targetSlot": target,
+        "remainingSlots": remaining, "remainingMarker": parameters.get("remainingMarker"),
+        "clientMayBeLeftClosed": False, "evidence": {}, "evidenceGaps": []}
+    try:
+        word, reason, final, final_guard = leave_rejoin_steps(run, state, fixed, guard, target, remaining, parameters,
+                                                              under=("manual-steps", "leave-rejoin"))
+    except (Stop, KeyboardInterrupt) as error:
+        record["results"]["leaveRejoin"] = error.result if isinstance(error, Stop) else "CANCELED"
+        state["state"] = "stopped"
+        if state["clientMayBeLeftClosed"]:
+            state["note"] = ("slot %d may be left closed (or a client may have started): check `vrcrt.sh status` and "
+                             "use Close/Launch to go on; nothing was sent again" % target)
+            if isinstance(error, Stop) and error.result != "CANCELED":
+                reread(run, state)
+        raise
+    record["results"]["leaveRejoin"] = word
+    state["state"] = "finished"
+    if word != "PASS":
+        raise Stop(word, reason or "leaveRejoinNotPassed", "the leave and rejoin after item %s" % parameters["leaveRejoinAfter"])
+    record["manualSteps"]["fixedAfterRejoin"] = {str(k): v for k, v in final.items()}
+    run.save()
+    return final, final_guard
+
+
+def close_lingering_wait(record, directory):
+    """An open wait left by a run that ended: closed, and the item it was for interrupted (from
+    waiting.json's own index and id, so an item asked just before a crash is found too). A wait
+    that cannot be closed now is recorded, and recover tries again. True when none is left open."""
+    state = record.get("manualSteps")
+    if not isinstance(state, dict):
+        return True
+    try:
+        with AnswerLock(directory):
+            waiting = read_waiting(directory)
+            if isinstance(waiting, dict) and waiting.get("waiting") is True:
+                index, item_id = waiting.get("index"), waiting.get("itemId")
+                for item in state.get("items") or []:
+                    if (isinstance(item, dict) and item.get("index") == index and item.get("id") == item_id
+                            and item.get("state") in ("notAsked", "waiting")):
+                        item["state"] = "interrupted"
+                write_json(waiting_path(directory), {"schema": WAITING_SCHEMA, "schemaVersion": 1,
+                                                     "runId": record.get("runId"), "waiting": False,
+                                                     "closedAtUtc": iso(), "lastWaitId": waiting.get("waitId")})
+    except OSError as error:
+        state["waitNotClosed"] = str(error)[:300]
+        return False
+    state.pop("waitNotClosed", None)
+    return True
+
+
+def finish_manual(record, directory, result):
+    """Run.finish for manual-steps: an open wait closed, the item it was for interrupted, and the
+    human result: CANCELED when the run was, otherwise from the answers as given."""
+    state = record.get("manualSteps")
+    if not isinstance(state, dict):
+        return
+    close_lingering_wait(record, directory)
+    for item in state.get("items") or []:
+        if isinstance(item, dict) and item.get("state") == "waiting":
+            item["state"] = "interrupted"
+    results = record.get("results")
+    if isinstance(results, dict):
+        if result == "CANCELED":
+            results["manualSteps"] = "CANCELED"
+        elif results.get("manualSteps") is None:
+            results["manualSteps"] = manual_items_result(state.get("items") or [])
+        state["result"] = results["manualSteps"]
+    if isinstance(results, dict) and state.get("leaveRejoin") is None \
+            and (record.get("procedure") or {}).get("parameters", {}).get("leaveRejoinAfter") is not None \
+            and results.get("leaveRejoin") is None:
+        results["leaveRejoin"] = "CANCELED" if result == "CANCELED" else "UNKNOWN"
 
 
 def recover(directory):
@@ -2126,6 +2818,11 @@ def main(argv):
                                                   "after the close (optional)")
         p.add_argument("--unvalidated", action="store_true",
                        help="run a procedure that has not been validated on real clients yet")
+        p.add_argument("--checklist", help="manual-steps: the items to ask (vrcrt.checklist JSON)")
+        p.add_argument("--leave-rejoin-after", help="manual-steps: after this item's answer, close --target-slot and "
+                                                    "launch it again with preconditions (optional)")
+        p.add_argument("--answer-wait", type=int, help="manual-steps: seconds to wait for each answer (60-3600, default 1200)")
+        p.add_argument("--run-minutes", type=int, help="manual-steps: the whole run's limit (30-120, default 90)")
 
     p = sub.add_parser("prepare")
     p.add_argument("--slots", required=True)
@@ -2152,6 +2849,16 @@ def main(argv):
     p.add_argument("--run-root")
     p = sub.add_parser("recover")
     p.add_argument("--run", required=True)
+    p = sub.add_parser("waiting", help="manual-steps: what the run is waiting for (read only)")
+    p.add_argument("--run", required=True)
+    p.add_argument("--json", action="store_true")
+    p = sub.add_parser("answer", help="manual-steps: answer the item the run is waiting for")
+    p.add_argument("--run", required=True)
+    p.add_argument("--wait-id", required=True)
+    p.add_argument("--item", required=True)
+    p.add_argument("answer", choices=ANSWERS)
+    p.add_argument("--memo", default="")
+    p.add_argument("--by", choices=("unity", "cli"), default="cli")
     p = sub.add_parser("prune")
     p.add_argument("--older-than-days", type=int, required=True)
     p.add_argument("--run-root")
@@ -2202,6 +2909,41 @@ def main(argv):
             result = recover(directory)
             print(json.dumps(summary(directory)))
             return EXIT_FOR.get(result, 3)
+        if args.command == "waiting":
+            directory = run_directory(args.run)
+            try:
+                report = waiting_report(directory)
+            except (OSError, ValueError) as error:
+                raise Usage("%s: %s" % (directory, error))
+            if args.json:
+                print(json.dumps(report, ensure_ascii=True))
+            elif report.get("waiting"):
+                print("run %s item %s/%s %s%s" % (report["runId"], report.get("index"), report.get("count"),
+                                                  report.get("itemId"), "" if report["valid"] else " (%s)" % report["why"]))
+                print(report.get("text") or "")
+                print("answer before %s" % report.get("deadlineUtc"))
+            else:
+                print("run %s is not waiting for an answer" % report.get("runId"))
+            return 0 if report.get("valid") else 1
+        if args.command == "answer":
+            directory = run_directory(args.run)
+            if not TOKEN.fullmatch(args.wait_id) or not ITEM_ID.fullmatch(args.item):
+                raise Usage("--wait-id and --item are the ones `waiting` prints")
+            if len(args.memo) > MAX_MEMO_CHARS:
+                raise Usage("--memo takes up to %d characters" % MAX_MEMO_CHARS)
+            memo = clean_memo(args.memo)
+            if not plain_text(memo, 0, MAX_MEMO_CHARS):
+                raise Usage("--memo is not plain text")
+            try:
+                publish_answer(directory, args.wait_id, args.item, args.answer, memo, args.by)
+            except Stop as stop:
+                sys.stderr.write("vrcrt_runner: not answered: %s%s\n" % (stop.reason, (" (%s)" % stop.detail) if stop.detail else ""))
+                return 1
+            except (OSError, ValueError) as error:
+                sys.stderr.write("vrcrt_runner: not answered: %s\n" % error)
+                return 1
+            print(json.dumps({"published": True, "waitId": args.wait_id, "itemId": args.item, "answer": args.answer}))
+            return 0
         if args.command == "prune":
             if args.older_than_days < 1:
                 raise Usage("--older-than-days must be at least 1")
