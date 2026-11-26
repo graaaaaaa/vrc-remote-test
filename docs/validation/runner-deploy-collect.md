@@ -102,9 +102,9 @@ Mac のエージェントが computer use で試験用のプロジェクトの U
 
 ## 気づいたこと
 
-- 目印を出さないワールドでは、worldBuildMatch の待ちで上限の 120 s を毎回使い切る。run の所要時間の6〜8割がこれ。tag を使わないワールドのために、待ちを省く引数（例 `--world-build-timeout 0`）と画面の切り替えを足すかを、次の段で決める。目印を出すワールドでは待ちは 1 s 以内だった。
+- 目印を出さないワールドでは、worldBuildMatch の待ちで上限の 120 s を毎回使い切る。run の所要時間の6〜8割がこれ。tag を使わないワールドのために、`--world-build-wait 0` と画面の `Wait for the build tag` を足した（0.11.0 のあと）。目印を出すワールドでは待ちは 1 s 以内だった。
 - close の直後は、Bridge の台の一覧が更新されるまで（約10 s）、`status` も画面の表も閉じる前の状態を出す。画面ではそのあいだ同じ台の `Close` をもう一度押せる（Bridge が notRunning で断るはず。押してはいない）。R1b の leave-rejoin は一覧の時刻（`updatedAtUtc`）が操作より後になるまで待つ必要がある。
-- 画面の表は、Bridge がこのホストの起動以来 launch していない slot（今回は profile の無い slot 2・3）にも `Launch` を押せる形で出す。Bridge は `NoLaunchPlan` で断るので害は無いが、押せないようにするかは次の段で決める（Bridge の起動の計画は画面からは見えない）。
+- 画面の表は、Bridge がこのホストの起動以来 launch していない slot（今回は profile の無い slot 2・3）にも `Launch` を押せる形で出す。Bridge は `NoLaunchPlan` で断るので害は無い。設定の profile の数を越える slot の Launch は押せないようにした（0.11.0 のあと。Bridge の起動の計画そのものは画面からは見えないので、設定を変えた直後の slot はまだ押せて、Bridge が断る）。
 - `vrcrt.sh config set` で Reload に切り替えるとき、`VrchatProfiles=null` が要る（手順を直した）。
 - ビルド中の Cancel は、小さなシーンでは SDK のビルドが数秒で終わるので押す間が無い。大きなシーンでの確認は別の機会に。
 - 試験用の Unity プロジェクトから、利用者のプロジェクト（`~/Documents/VRChatProjects/Vrc-remote-test`）の SDK パッケージを `file:` で参照すると、SDK がそこにサンプルなどのファイルを作る。試験用のプロジェクトには SDK を写して入れること（今回作られた70件は、利用者の了承を得てゴミ箱へ移した）。

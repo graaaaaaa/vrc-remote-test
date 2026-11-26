@@ -6,15 +6,17 @@ result, wait until every declared client is ready (and, for worlds that log one,
 client shows this build's tag), collect evidence per client generation, and write the whole run
 to run.json. It never closes or launches a client. Whether a test passed is not decided here.
 
-    vrcrt_runner.py prepare --slots 0,1 [--expect-clients ...] [--owner-pid PID] [--run-root DIR]
+    vrcrt_runner.py prepare --slots 0,1 [--expect-clients ...] [--world-build-wait S] [--owner-pid PID] [--run-root DIR]
     vrcrt_runner.py continue --run DIR --claim-token TOKEN
-    vrcrt_runner.py run --build headless --project DIR --scene Assets/... --slots 0,1 [--unity PATH]
+    vrcrt_runner.py run --build headless --project DIR --scene Assets/... --slots 0,1 [--world-build-wait S] [--unity PATH]
     vrcrt_runner.py recover --run DIR
     vrcrt_runner.py prune --older-than-days N [--run-root DIR]
 
 prepare prints one JSON line (runId, runDir, worldBuildTag, claimToken). The caller then builds
 with RemoteBuildApi in its open Editor, passing runDir and worldBuildTag, and calls continue.
 `run` does the three steps itself with a headless Unity, refusing when the project is open.
+--world-build-wait (0-600 s, default 120) is how long to wait for the build tag after the clients
+are ready; 0 looks once, for worlds that log no tag (their match stays UNKNOWN either way).
 
 Results are PASS, FAIL, UNKNOWN or CANCELED, also the exit codes 0, 1, 3 and 4 (2: usage). A
 missing or stale observation, a full disk or a lost answer is never counted as success.
@@ -72,7 +74,8 @@ def test_setting(name, default, low, high):
 # Limits: all `proposed` in docs/plans/r1-automation.md §4.8 until measured.
 READY_SECONDS = test_setting("VRCRT_RUNNER_TEST_READY", "300", 0.5, 300)
 READY_SECONDS_FOUR = test_setting("VRCRT_RUNNER_TEST_READY", "420", 0.5, 420)
-TAG_SECONDS = test_setting("VRCRT_RUNNER_TEST_TAG", "120", 0.5, 120)
+TAG_SECONDS = test_setting("VRCRT_RUNNER_TEST_TAG", "120", 0.5, 120)  # the default of --world-build-wait
+MAX_TAG_WAIT = 600
 EXPORT_SECONDS = 120
 RUN_SECONDS = test_setting("VRCRT_RUNNER_TEST_RUN", "1800", 1, 1800)
 CLI_SECONDS = 60
@@ -816,14 +819,15 @@ def build_tags(text):
     return [field[len("vrcrt.build="):] for field in text.split() if field.startswith("vrcrt.build=")]
 
 
-def wait_world_build(run, slots, fixed, tag):
+def wait_world_build(run, slots, fixed, tag, seconds):
     """Each slot shows this build's tag in its current join (fixed generation and epoch, after
     the join's Joining line, or after joinedSeq when the Bridge does not report that line), read
     through. PASS only when every tag seen there is this one; any other tag is FAIL; nothing, two
-    tags on a line, or only cut or withheld lines is UNKNOWN."""
+    tags on a line, or only cut or withheld lines is UNKNOWN. Every slot is read at least once,
+    then again until `seconds` have passed."""
     if not tag:
         return "UNKNOWN", "noTagForTheseBytes"
-    end = time.monotonic() + TAG_SECONDS
+    end = time.monotonic() + seconds
     while True:
         run.check()
         matched, ambiguous = set(), False
@@ -974,7 +978,10 @@ def prepare(args, owner_pid):
     deadline_utc = iso(created + timedelta(seconds=RUN_SECONDS))
     directory = os.path.join(root, "runs", run_id)
     os.mkdir(directory, 0o700)
-    parameters = {"slots": slots, "expectClients": expect}
+    wait = TAG_SECONDS if args.world_build_wait is None else args.world_build_wait
+    if not 0 <= wait <= MAX_TAG_WAIT:
+        raise Usage("--world-build-wait takes 0 to %d seconds" % MAX_TAG_WAIT)
+    parameters = {"slots": slots, "expectClients": expect, "worldBuildWaitSeconds": wait}
     run = Run(directory)
     run.record = {"schema": RUN_SCHEMA, "schemaVersion": 1, "runId": run_id, "createdAtUtc": iso(created),
                   "deadlineUtc": deadline_utc, "state": "preparing",
@@ -1122,7 +1129,11 @@ def deploy_collect(run):
     run.end(operation, "PASS")
 
     operation = run.begin("waitWorldBuild")
-    match, reason = wait_world_build(run, slots, fixed, tag)
+    parameters = (record.get("procedure") or {}).get("parameters")
+    wait = parameters.get("worldBuildWaitSeconds", TAG_SECONDS) if isinstance(parameters, dict) else TAG_SECONDS
+    if isinstance(wait, bool) or not isinstance(wait, (int, float)) or not 0 <= wait <= MAX_TAG_WAIT:
+        wait = TAG_SECONDS  # run.json is this runner's own file; anything else falls back to the default
+    match, reason = wait_world_build(run, slots, fixed, tag, wait)
     results["worldBuildMatch"] = match
     run.end(operation, match, reason)
 
@@ -1409,6 +1420,7 @@ def main(argv):
     p = sub.add_parser("prepare")
     p.add_argument("--slots", required=True)
     p.add_argument("--expect-clients", nargs="*")
+    p.add_argument("--world-build-wait", type=int, help="seconds to wait for the build tag (0-600, default 120; 0 looks once)")
     p.add_argument("--owner-pid", type=int)
     p.add_argument("--run-root")
     p = sub.add_parser("continue")
@@ -1422,6 +1434,7 @@ def main(argv):
     p.add_argument("--scene", required=True)
     p.add_argument("--slots", required=True)
     p.add_argument("--expect-clients", nargs="*")
+    p.add_argument("--world-build-wait", type=int, help="seconds to wait for the build tag (0-600, default 120; 0 looks once)")
     p.add_argument("--unity")
     p.add_argument("--timeout", type=int, default=900)
     p.add_argument("--run-root")

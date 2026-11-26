@@ -1,5 +1,18 @@
 # Changelog
 
+## [Unreleased]
+
+Two small changes found in the Windows check of 0.11.0. The Bridge has no changes.
+
+### Changed (Unity)
+
+- Deploy and Collect has **Wait for the build tag** (on by default). Off, the runner looks for the tag once instead of waiting up to 120 s, for worlds that log none; their world build match stays UNKNOWN either way.
+- In the VRChat Clients table, Launch is off for a slot past the configured profiles (the Bridge starts only the slots of its last deploy and would refuse). A running client of such a slot can still be closed.
+
+### Changed (Mac scripts)
+
+- `vrcrt_runner.py prepare` and `run` take `--world-build-wait SECONDS` (0 to 600, default 120; 0 looks once). It is recorded with the procedure in `run.json`.
+
 ## [0.11.0] - 2026-11-26
 
 Deploy, wait until every listed VRChat client is ready, and collect the evidence with one button in the Unity window (or one command), with a structured record of what happened. The Bridge has no changes, but the Remote Test window warns while their versions differ, so **update both the Unity package and the Windows Bridge** (`docs/setup-windows.md`, step 1, "版を入れ替える"). An existing `config.json` and pairing keep working. Checked on Windows with Bridge 0.10.0 and two VRChat clients (`docs/validation/runner-deploy-collect.md`); four clients are not checked yet. The plan behind this release is `docs/plans/r1-automation.md` (R1a).

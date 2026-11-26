@@ -81,11 +81,12 @@ namespace VRCRemoteTest
         /// <summary>Whether a slot's Close and Launch buttons may be pressed, and why not.</summary>
         internal readonly struct SlotActions
         {
-            internal SlotActions(bool canClose, bool canLaunch, string blocked)
+            internal SlotActions(bool canClose, bool canLaunch, string blocked, string launchOff = null)
             {
                 CanClose = canClose;
                 CanLaunch = canLaunch;
                 Blocked = blocked;
+                LaunchOff = launchOff;
             }
 
             internal bool CanClose { get; }
@@ -93,12 +94,17 @@ namespace VRCRemoteTest
 
             /// <summary>Why neither can be pressed now; null when one can.</summary>
             internal string Blocked { get; }
+
+            /// <summary>Why only Launch is off for this slot (it is not one the configuration starts); else null.</summary>
+            internal string LaunchOff { get; }
         }
 
         /// <summary>
         /// Close needs a running client, Launch one that has exited; both need Relaunch, a Bridge
         /// from v0.10.0 (an unknown version is allowed: an older one answers 404), a client list
-        /// read in the last 15 s, and no other build or Bridge change.
+        /// read in the last 15 s, and no other build or Bridge change. Launch is also off for a slot
+        /// past the configured profiles: the Bridge starts only the slots of its last deploy and
+        /// would refuse (NoLaunchPlan).
         /// </summary>
         internal static SlotActions ActionsFor(VrchatClientEntry entry, VrchatClientSettings active, string bridgeVersion,
             DateTimeOffset listUpdatedAtUtc, DateTimeOffset nowUtc, bool busy)
@@ -126,9 +132,14 @@ namespace VRCRemoteTest
                 blocked = "the Bridge cannot tell now whether it runs";
             }
 
-            return blocked != null
-                ? new SlotActions(false, false, blocked)
-                : new SlotActions(entry.Running == true, entry.Running == false, null);
+            if (blocked != null)
+            {
+                return new SlotActions(false, false, blocked);
+            }
+
+            var configured = entry.Slot >= 0 && entry.Slot < active.Profiles.Count;
+            return new SlotActions(entry.Running == true, entry.Running == false && configured, null,
+                configured ? null : "slot " + entry.Slot + " is not one of the " + active.Profiles.Count + " configured profiles");
         }
 
         /// <summary>"PID 1234 · profile 0 · joined · local:wrld_… · logged in · gen 1234 · epoch 5", sanitized.</summary>
