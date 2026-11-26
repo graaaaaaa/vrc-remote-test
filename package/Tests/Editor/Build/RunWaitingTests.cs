@@ -256,6 +256,19 @@ namespace VRCRemoteTest.Tests
             Assert.IsNull(report.ItemState("missing"));
         }
 
+        [Test]
+        public void A_deadline_as_the_runner_writes_it_is_read()
+        {
+            // Python's isoformat: microseconds and +00:00, not Z (found on Windows, 2026-11-26).
+            var report = WaitingReport.Parse(WaitingJson(deadline: "\"2026-11-26T02:30:00.331676+00:00\""));
+            Assert.IsTrue(report.ShowableFor(RunId));
+            Assert.AreEqual(new DateTime(2026, 11, 26, 2, 30, 0, DateTimeKind.Utc).AddTicks(3316760), report.DeadlineUtc);
+            Assert.AreEqual(DateTimeKind.Utc, report.DeadlineUtc.Value.Kind);
+
+            var tokyo = WaitingReport.Parse(WaitingJson(deadline: "\"2026-11-26T11:30:00+09:00\""));
+            Assert.AreEqual(new DateTime(2026, 11, 26, 2, 30, 0, DateTimeKind.Utc), tokyo.DeadlineUtc);
+        }
+
         [TestCase("false")]
         [TestCase("\"true\"")]
         [TestCase("1")]
@@ -606,10 +619,11 @@ namespace VRCRemoteTest.Tests
         // --- 6.3: procedures -------------------------------------------------------------------
 
         [Test]
-        public void The_window_offers_deploy_collect_only_until_manual_steps_is_validated()
+        public void The_window_offers_deploy_collect_only_until_starting_manual_steps_here_is_checked()
         {
+            // manual-steps is validated from the terminal; this window's start for it is not checked yet.
             CollectionAssert.AreEqual(new[] { "deploy-collect" }, RunProcedures.Offered());
-            CollectionAssert.DoesNotContain(RunProcedures.Validated, "manual-steps");
+            CollectionAssert.Contains(RunProcedures.Validated, "manual-steps");
         }
 
         [Test]

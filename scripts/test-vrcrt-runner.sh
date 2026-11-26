@@ -687,7 +687,10 @@ ms_refused() {
     python3 -I "$runner" prepare --slots 0,1 --owner-pid $$ --run-root "$root" "$@" > "$work/out" 2>&1
     [ $? -eq 2 ] && pass "$name" || { fail "$name"; cat "$work/out"; }
 }
-ms_refused "manual-steps needs --unvalidated" --procedure manual-steps --checklist "$checklist"
+rm -f "$root"/locks/*.json; bridge; before_clients; cursor
+python3 -I "$runner" prepare --slots 0,1 --procedure manual-steps --checklist "$checklist" --owner-pid $$ --run-root "$root" > "$work/out" 2>&1
+[ $? -ne 2 ] && ! grep -q -- --unvalidated "$work/out" && pass "manual-steps, validated on Windows, needs no --unvalidated" \
+    || { fail "manual-steps, validated on Windows, needs no --unvalidated"; cat "$work/out"; }
 ms_refused "manual-steps needs --checklist" --procedure manual-steps --unvalidated
 ms_refused "--checklist belongs to manual-steps" --checklist "$checklist"
 ms_refused "--run-minutes below 30 is refused" --procedure manual-steps --checklist "$checklist" --unvalidated --run-minutes 20

@@ -361,16 +361,17 @@ namespace VRCRemoteTest
         private static int Int(JToken token) =>
             token != null && token.Type == JTokenType.Integer && (long)token >= 0 && (long)token <= 1000 ? (int)(long)token : 0;
 
+        /// An ISO 8601 time with its zone stated: "...Z" or "...+00:00" (Python's isoformat, which
+        /// the runner writes). A time without a zone is refused rather than guessed.
         internal static DateTime? Utc(string text)
         {
-            if (text == null || !text.EndsWith("Z", StringComparison.Ordinal))
+            if (text == null || !System.Text.RegularExpressions.Regex.IsMatch(text, @"(Z|[+-]\d{2}:\d{2})\z"))
             {
                 return null;
             }
 
-            return DateTime.TryParse(text, CultureInfo.InvariantCulture,
-                DateTimeStyles.AdjustToUniversal | DateTimeStyles.AssumeUniversal, out var value)
-                ? value
+            return DateTimeOffset.TryParse(text, CultureInfo.InvariantCulture, DateTimeStyles.None, out var value)
+                ? value.UtcDateTime
                 : (DateTime?)null;
         }
     }
@@ -896,9 +897,10 @@ namespace VRCRemoteTest
         internal const string ManualSteps = "manual-steps";
 
         /// <summary>The runner's VALIDATED_PROCEDURES (package/Tools~/vrcrt_runner.py).</summary>
-        internal static readonly string[] Validated = { DeployCollect, LeaveRejoin };
+        internal static readonly string[] Validated = { DeployCollect, LeaveRejoin, ManualSteps };
 
-        /// <summary>Set to true once manual-steps is in the runner's VALIDATED_PROCEDURES (and in <see cref="Validated"/>).</summary>
+        /// <summary>manual-steps is validated from the terminal (docs/validation/manual-steps.md); starting it
+        /// from this window (the checklist picker and its prepare) is not checked on real clients yet.</summary>
         internal const bool ManualStepsStartEnabled = false;
 
         /// <summary>What the window's procedure choice lists, in order.</summary>

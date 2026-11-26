@@ -1401,9 +1401,11 @@ namespace VRCRemoteTest
             var waitId = _waitingSnapshot.Shown?.WaitId;
             if (waitId != _waitingMemoWaitId)
             {
-                // A new item starts with an empty memo.
+                // A new item starts with an empty memo. The text area keeps its own copy of the
+                // text while it has keyboard focus, so the focus goes too (seen on Windows, 2026-11-26).
                 _waitingMemoWaitId = waitId;
                 _waitingMemo = string.Empty;
+                GUIUtility.keyboardControl = 0;
             }
 
             if (_requestedRunProcedureIndex >= 0)

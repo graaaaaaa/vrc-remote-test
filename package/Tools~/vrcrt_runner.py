@@ -13,7 +13,7 @@ slotPreconditions.v1, Relaunch), wait until it has left while the other slots st
 launch it again with a precondition, wait until the new client is back in the same instance, and
 collect evidence before the close, after the close and after the rejoin. Nothing is sent again.
 
-manual-steps (R3, docs/plans/r3-contract.md; not validated yet, so only with --unvalidated):
+manual-steps (R3, docs/plans/r3-contract.md; validated on Windows with two Desktop clients):
 deploy-collect, then ask a person the items of a --checklist file one at a time and wait for each
 answer (ok, ng or skip, with a memo), given with `answer` here or from the Unity window. Each answer
 is recorded with the time, every slot's log position and markers; the slots must stay as they were
@@ -25,7 +25,7 @@ launch run after that item's answer. The answers are recorded as given: the runn
     vrcrt_runner.py continue --run DIR --claim-token TOKEN
     vrcrt_runner.py run --build headless --project DIR --scene Assets/... --slots 0,1 [--procedure ... --target-slot N
                     [--remaining-marker REGEX]] [--world-build-wait S] [--unity PATH]
-    vrcrt_runner.py prepare|run ... --procedure manual-steps --checklist FILE --unvalidated
+    vrcrt_runner.py prepare|run ... --procedure manual-steps --checklist FILE
                     [--leave-rejoin-after ITEM --target-slot N [--remaining-marker REGEX]] [--answer-wait S] [--run-minutes M]
     vrcrt_runner.py waiting --run DIR [--json]
     vrcrt_runner.py answer --run DIR --wait-id ID --item ITEM ok|ng|skip [--memo TEXT] [--by unity|cli]
@@ -88,7 +88,8 @@ OPERATION_ID = re.compile(r"[A-Za-z0-9_-]{1,64}")
 # Procedures that were checked on real Windows clients, with the runner version that was checked.
 # A procedure missing here runs only with --unvalidated (docs/plans/r1-automation.md §5.5).
 # leave-rejoin: docs/validation/slot-preconditions.md, 2026-11-26, Bridge 0.12.0+4892f91 (exe SHA-256 a69a379a…bae6e).
-VALIDATED_PROCEDURES = {"deploy-collect": "0.11.0", "leave-rejoin": "0.12.0"}
+# manual-steps: docs/validation/manual-steps.md, 2026-11-26, Bridge 0.12.0+4892f91, two Desktop clients (VR not checked).
+VALIDATED_PROCEDURES = {"deploy-collect": "0.11.0", "leave-rejoin": "0.12.0", "manual-steps": "0.13.0"}
 PROCEDURES = ("deploy-collect", "leave-rejoin", "manual-steps")
 
 
