@@ -23,7 +23,7 @@
 - `--end-slots LIST`: その目印を待つ台。`--slots` の部分集合（重複なし、1 台以上）。省略すると `--slots` の全部。
 - `--end-wait SECONDS`: 目印を待つ上限。60〜1500、既定 900（`proposed`）。
 - `--end-slots` と `--end-wait` は `--end-marker` があるときだけ。どれも `--procedure deploy-collect` だけ（leave-rejoin と manual-steps に付けると使い方の誤り、終了コード 2）。
-- 実機で確かめるまでは `--unvalidated` が要る（無ければ終了コード 2）。確かめた commit で外す。
+- 実機で確かめるまでは `--unvalidated` が要った。2026-11-26 に確かめ（`docs/validation/end-marker.md`）、外した。
 - どれも CLI の引数だけから決める。ログ・目印・ワールドの中身からは、待つ台も、パターンも、次の手順も決めない。
 - run の期限は 30 分のまま。`--end-wait` が長く、配備と準備に時間がかかれば、run の期限で UNKNOWN `runDeadline` になる。
 

@@ -919,7 +919,9 @@ em_refused() {
     python3 -I "$runner" prepare --slots 0,1 --owner-pid $$ --run-root "$root" "$@" > "$work/out" 2>&1
     [ $? -eq 2 ] && [ "$(runs_count)" = "$before" ] && pass "$name" || { fail "$name"; cat "$work/out"; }
 }
-em_refused "--end-marker needs --unvalidated until it is checked" --end-marker 'step=done'
+rm -f "$root"/locks/*.json; bridge; before_clients; cursor
+python3 -I "$runner" prepare --slots 0,1 --owner-pid $$ --run-root "$root" --end-marker 'step=done' > "$work/out" 2>&1
+[ $? -eq 0 ] && pass "--end-marker is validated and needs no --unvalidated" || { fail "--end-marker is validated and needs no --unvalidated"; cat "$work/out"; }
 em_refused "--end-slots without --end-marker is refused" --unvalidated --end-slots 0
 em_refused "--end-wait without --end-marker is refused" --unvalidated --end-wait 120
 em_refused "--end-slots outside --slots is refused" --unvalidated --end-marker x --end-slots 2
@@ -938,7 +940,7 @@ check "deploy-collect waits for the end marker on every slot" 0 results.endMarke
     && [ -f "$run/evidence/end-marker/slot-0/g111-e7/markers.json" ] && [ -f "$run/evidence/end-marker/slot-1/g222-e8/markers.json" ] \
     && pass "the matched lines' seq and their markers are kept, then the evidence" || fail "the matched lines' seq and their markers are kept, then the evidence"
 python3 -I -c 'import json,sys; r=json.load(open(sys.argv[1])); p=r["procedure"]["parameters"]["endMarker"]
-sys.exit(0 if p=={"pattern":"step=done","slots":[0,1],"waitSeconds":900,"unvalidated":True} and "step=done slot" not in json.dumps(r) else 1)' "$run/run.json" \
+sys.exit(0 if p=={"pattern":"step=done","slots":[0,1],"waitSeconds":900,"unvalidated":False} and "step=done slot" not in json.dumps(r) else 1)' "$run/run.json" \
     && pass "the end marker's parameters are recorded, the matched text is not" || fail "the end marker's parameters are recorded, the matched text is not"
 
 em_prepare --end-slots 0

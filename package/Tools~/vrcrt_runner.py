@@ -148,9 +148,9 @@ ANSWER_WAIT_CAP = test_setting("VRCRT_RUNNER_TEST_ANSWER_WAIT", "3600", 0.5, 360
 MANUAL_RUN_CAP = test_setting("VRCRT_RUNNER_TEST_MANUAL_RUN", "7200", 1, 7200)
 MANUAL_RECHECK_SECONDS = test_setting("VRCRT_RUNNER_TEST_MANUAL_RECHECK", "5", 0.05, 5)
 OBSERVATION_GRACE_SECONDS = test_setting("VRCRT_RUNNER_TEST_OBSERVATION_GRACE", "15", 0.1, 15)
-# deploy-collect --end-marker, also `proposed` (docs/plans/end-marker-contract.md). It needs
-# --unvalidated until it is checked on real clients.
-END_MARKER_VALIDATED = False
+# deploy-collect --end-marker, also `proposed` (docs/plans/end-marker-contract.md). Checked on
+# real clients: docs/validation/end-marker.md, 2026-11-26, Bridge 0.12.0+4892f91, two Desktop clients.
+END_MARKER_VALIDATED = True
 MIN_END_WAIT, DEFAULT_END_WAIT, MAX_END_WAIT = 60, 900, 1500
 END_WAIT_CAP = test_setting("VRCRT_RUNNER_TEST_END_WAIT", "1500", 0.5, 1500)
 END_POLL_SECONDS = test_setting("VRCRT_RUNNER_TEST_END_POLL", "5", 0.05, 5)
@@ -3070,7 +3070,7 @@ def main(argv):
         p.add_argument("--answer-wait", type=int, help="manual-steps: seconds to wait for each answer (60-3600, default 1200)")
         p.add_argument("--run-minutes", type=int, help="manual-steps: the whole run's limit (30-120, default 90)")
         p.add_argument("--end-marker", help="deploy-collect: before collecting, wait until each --end-slots slot "
-                                            "logged a marker matching this regular expression (needs --unvalidated)")
+                                            "logged a marker matching this regular expression")
         p.add_argument("--end-slots", help="deploy-collect: the slots that must log --end-marker (default: --slots)")
         p.add_argument("--end-wait", type=int, help="deploy-collect: seconds to wait for --end-marker (60-1500, default 900)")
 

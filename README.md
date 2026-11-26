@@ -110,6 +110,7 @@ python3 package/Tools~/vrcrt_runner.py run --build headless \
 - 開いている Editor から自分のコードで使うときは、`prepare --slots 0,1` が出す `runDir` と `worldBuildTag` を `RemoteBuildApi` に渡して建て、そのあと `continue --run <runDir> --claim-token <token>` を呼びます。
 - 終了コードは 0 PASS（準備と回収ができた。試験の合格ではない）、1 FAIL、2 使い方の誤り、3 UNKNOWN、4 CANCELED。結果と理由は `run.json` の `result`・`reason`・`results` にあります。
 - ワールドが読み込み時に `vrcrt.build=<tag>` を含む目印（Bridge の `LogMarkerPrefixes` の行）を出せば、各台がこの回のビルドに入ったかを照らします（`worldBuildMatch`）。出さないワールドでは UNKNOWN のままで、ほかは使えます。そのときは `--world-build-wait 0`（Unity では `Wait for the build tag` を外す）で、120 s の待ちを1回見るだけにできます。
+- ワールドの中の試験が終わるのを待ってから証拠を集めるには、`--end-marker 'OPS_PROBE step=done'`（0.14.0 以降）を付けます。各台が今の join のあとに、この正規表現に当たる目印を出すまで待ちます（`--end-slots 0` で待つ台を選ぶ、`--end-wait` で 60〜1500 s、既定 900 s）。出なければ UNKNOWN（それでも証拠は集めます）。目印が出たことはワールドがそう書いただけで、試験の合否ではありません（`results.endMarker`、契約は `docs/plans/end-marker-contract.md`）。
 - 止めるには run のフォルダーに `cancel.request` を作るか、Ctrl-C。runner が落ちた run は `recover --run <runDir>` で UNKNOWN に確定できます。古い run は `prune --older-than-days 30` で消します（自動では消しません）。
 - 試験は `bash scripts/test-vrcrt.sh`（runner と `vrcrt-run.py` の試験も呼びます）。
 
