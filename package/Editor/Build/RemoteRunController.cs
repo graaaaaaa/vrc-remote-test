@@ -103,7 +103,9 @@ namespace VRCRemoteTest
         }
 
         /// <param name="waitForTag">false: look for the build tag once instead of waiting up to 120 s, for worlds that log none.</param>
-        internal async void Start(string slots, bool useLastBuild, string bridgeUrl, string fingerprint, bool waitForTag = true)
+        /// <param name="procedureArguments">From <see cref="RunProcedures.PrepareArguments"/>; none for deploy-collect.</param>
+        internal async void Start(string slots, bool useLastBuild, string bridgeUrl, string fingerprint, bool waitForTag = true,
+            IReadOnlyList<string> procedureArguments = null)
         {
             if (Active)
             {
@@ -150,6 +152,11 @@ namespace VRCRemoteTest
 
                 Status = "Saving the state before the deploy...";
                 var arguments = new List<string> { "-I", runner, "prepare", "--slots", slots, "--owner-pid", owner.ToString() };
+                if (procedureArguments != null)
+                {
+                    arguments.AddRange(procedureArguments);
+                }
+
                 if (!waitForTag)
                 {
                     arguments.Add("--world-build-wait");
@@ -358,11 +365,11 @@ namespace VRCRemoteTest
             try
             {
                 var root = DeployResultWriter.DefaultRoot();
-                var claim = BridgeMessages.Parse<JObject>(File.ReadAllText(Path.Combine(root, "locks", ClaimKey(BridgeUrl, BridgePin) + ".json")));
-                var owner = claim?["owner"]?["pid"];
-                var runId = claim?["runId"]?.Type == JTokenType.String ? (string)claim["runId"] : null;
-                if (owner == null || owner.Type != JTokenType.Integer || (int)owner != System.Diagnostics.Process.GetCurrentProcess().Id
-                    || runId == null || !System.Text.RegularExpressions.Regex.IsMatch(runId, @"^\d{8}T\d{6}Z-[0-9a-f]{8}$"))
+                var claim = RunFiles.ReadObject(Path.Combine(root, "locks", ClaimKey(BridgeUrl, BridgePin) + ".json"), RunFiles.MaxClaimBytes, out _);
+                var owner = (claim?["owner"] as JObject)?["pid"];
+                var runId = RunFiles.String(claim?["runId"]);
+                if (owner == null || owner.Type != JTokenType.Integer || (long)owner != System.Diagnostics.Process.GetCurrentProcess().Id
+                    || !RunFiles.IsRunId(runId))
                 {
                     return false;
                 }
@@ -435,9 +442,6 @@ namespace VRCRemoteTest
     /// <summary>What the window shows of a run: run.json's state and results, and the last progress line.</summary>
     internal sealed class RunSummary
     {
-        private const int MaxRunJsonBytes = 1024 * 1024;
-        private const int MaxProgressTail = 8 * 1024;
-
         internal bool Finished;
         internal string State;
         internal string Result;
@@ -447,47 +451,56 @@ namespace VRCRemoteTest
         internal readonly Dictionary<string, string> Results = new Dictionary<string, string>();
         internal string LastProgress;
 
+        /// <summary>manual-steps only: "Human answers: ok X, ng Y, skip Z (not judged by the tool)".</summary>
+        internal string HumanAnswers;
+
+        /// <summary>run.json (an ordinary file, not a link, up to 1 MiB) and the tail of progress.jsonl, or null.</summary>
         internal static RunSummary Read(string runDirectory)
         {
             var path = Path.Combine(runDirectory, "run.json");
             try
             {
-                var info = new FileInfo(path);
-                if (!info.Exists || info.Length > MaxRunJsonBytes)
+                var record = RunFiles.ReadObject(path, RunFiles.MaxRunJsonBytes, out _);
+                if (record == null || RunFiles.String(record["schema"]) != "vrcrt.run")
                 {
                     return null;
                 }
 
-                var record = BridgeMessages.Parse<JObject>(File.ReadAllText(path));
-                if (record == null || (string)record["schema"] != "vrcrt.run")
-                {
-                    return null;
-                }
-
-                var summary = new RunSummary
-                {
-                    State = Text(record["state"]),
-                    Result = Text(record["result"]),
-                    Reason = Text(record["reason"]),
-                    Detail = Text(record["detail"]),
-                    RunId = Text(record["runId"]),
-                };
-                summary.Finished = summary.State == "finished";
-                if (record["results"] is JObject results)
-                {
-                    foreach (var pair in results)
-                    {
-                        summary.Results[pair.Key] = Text(pair.Value) ?? "-";
-                    }
-                }
-
-                summary.LastProgress = LastProgressMessage(Path.Combine(runDirectory, "progress.jsonl"));
-                return summary;
+                return FromRecord(record, LastProgressMessage(Path.Combine(runDirectory, "progress.jsonl")));
             }
             catch (Exception ex) when (ex is IOException || ex is UnauthorizedAccessException)
             {
                 return null;
             }
+        }
+
+        internal static RunSummary FromRecord(JObject record, string lastProgress)
+        {
+            var summary = new RunSummary
+            {
+                State = Text(record["state"]),
+                Result = Text(record["result"]),
+                Reason = Text(record["reason"]),
+                Detail = Text(record["detail"]),
+                RunId = Text(record["runId"]),
+            };
+            summary.Finished = summary.State == "finished";
+            if (record["results"] is JObject results)
+            {
+                foreach (var pair in results)
+                {
+                    summary.Results[pair.Key] = Text(pair.Value) ?? "-";
+                }
+            }
+
+            if (RunFiles.String((record["procedure"] as JObject)?["name"]) == RunProcedures.ManualSteps || record["manualSteps"] is JObject)
+            {
+                summary.HumanAnswers = ManualStepsSummary.Describe(record)
+                                       ?? "Human answers: ok 0, ng 0, skip 0 (not judged by the tool)";
+            }
+
+            summary.LastProgress = lastProgress;
+            return summary;
         }
 
         /// <summary>"PASS: ... not judged", or the result and its reason.</summary>
@@ -501,7 +514,8 @@ namespace VRCRemoteTest
             var text = Result == "PASS"
                 ? "PASS: the clients were ready and the evidence was collected. The test itself is not judged."
                 : (Result ?? "UNKNOWN") + ": " + (Reason ?? "no reason recorded");
-            return Detail == null ? text : text + " (" + Detail + ")";
+            text = Detail == null ? text : text + " (" + Detail + ")";
+            return HumanAnswers == null ? text : text + "\n" + HumanAnswers;
         }
 
         private static string Text(JToken token)
@@ -514,29 +528,24 @@ namespace VRCRemoteTest
             return BridgeMessages.Sanitize(token.Type == JTokenType.String ? (string)token : token.ToString(), 300);
         }
 
+        /// <summary>The last progress line's message, from the last 8 KiB of progress.jsonl (an ordinary file, not a link).</summary>
         private static string LastProgressMessage(string path)
         {
-            if (!File.Exists(path))
+            var buffer = SafeFileReader.ReadBytes(path, RunFiles.MaxProgressTailBytes, true, out _);
+            if (buffer == null)
             {
                 return null;
             }
 
-            using (var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+            var lines = Encoding.UTF8.GetString(buffer).Trim().Split('\n');
+            for (var i = lines.Length - 1; i >= 0; i--)
             {
-                var start = Math.Max(0, stream.Length - MaxProgressTail);
-                stream.Seek(start, SeekOrigin.Begin);
-                var buffer = new byte[stream.Length - start];
-                var read = stream.Read(buffer, 0, buffer.Length);
-                var lines = Encoding.UTF8.GetString(buffer, 0, read).Trim().Split('\n');
-                for (var i = lines.Length - 1; i >= 0; i--)
+                var line = RunFiles.ParseObject(lines[i].Trim());
+                if (line != null)
                 {
-                    var line = BridgeMessages.Parse<JObject>(lines[i].Trim());
-                    if (line != null)
-                    {
-                        var message = Text(line["message"]) ?? string.Empty;
-                        var reasons = line["reasons"] is JObject r ? " " + Text(r) : string.Empty;
-                        return message + reasons;
-                    }
+                    var message = Text(line["message"]) ?? string.Empty;
+                    var reasons = line["reasons"] is JObject r ? " " + Text(r) : string.Empty;
+                    return message + reasons;
                 }
             }
 
