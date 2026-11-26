@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.14.0] - 2026-11-26
 
 **Update the Unity package only** (the runner is in it); the Bridge does not change. Contract: `docs/plans/end-marker-contract.md`.
 
