@@ -1,8 +1,8 @@
 # Changelog
 
-## [Unreleased] (planned as 0.12.0)
+## [0.12.0] - 2026-11-26
 
-R1b (`docs/plans/r1-automation.md` §5, contract `docs/plans/r1b-contract.md`): a single-client close or launch can carry a precondition, so one prepared from an earlier view does nothing if the Bridge or the client changed since; the runner gains the leave-and-rejoin procedure on top of it. **Update both the Unity package and the Windows Bridge.** Not tagged until it is checked on Windows (`docs/validation/slot-preconditions.md`); until then leave-rejoin runs only with `--unvalidated`. Also two small changes found in the Windows check of 0.11.0.
+R1b (`docs/plans/r1-automation.md` §5, contract `docs/plans/r1b-contract.md`): a single-client close or launch can carry a precondition, so one prepared from an earlier view does nothing if the Bridge or the client changed since; the runner gains the leave-and-rejoin procedure on top of it. **Update both the Unity package and the Windows Bridge.** Checked on Windows with two VRChat clients (`docs/validation/slot-preconditions.md`); the export cleanup and four clients are not checked on Windows yet. Also two small changes found in the Windows check of 0.11.0.
 
 ### Added (Bridge)
 
@@ -17,7 +17,7 @@ R1b (`docs/plans/r1-automation.md` §5, contract `docs/plans/r1b-contract.md`): 
 ### Added (Mac scripts)
 
 - `vrcrt.sh close-client`/`launch-client` take `--expect @FILE`, `--operation-id` and `--json`: exit 1 on a failed precondition, 2 on a malformed one (nothing sent), 3 when the Bridge does not support it (nothing sent). Without `--expect` nothing changes.
-- `vrcrt_runner.py --procedure leave-rejoin --target-slot N --unvalidated [--remaining-marker REGEX]`: after deploy-collect, closes the target slot with a precondition, waits until it is gone and the other slots are unchanged, launches it again with a precondition, and waits until it is ready in the same instance (and shows the build tag, when the world logs one). Nothing is ever resent; any surprise stops UNKNOWN, recording that the client may be left closed. Evidence before the close, after it and after the rejoin is kept apart.
+- `vrcrt_runner.py --procedure leave-rejoin --target-slot N [--remaining-marker REGEX]`: after deploy-collect, closes the target slot with a precondition, waits until it is gone and the other slots are unchanged, launches it again with a precondition, and waits until it is ready in the same instance (and shows the build tag, when the world logs one). Nothing is ever resent; any surprise stops UNKNOWN, recording that the client may be left closed. Evidence before the close, after it and after the rejoin is kept apart.
 - deploy-collect on a Bridge with the feature in Relaunch also checks that the launch plan is this deploy's and that nothing else happened on the Bridge after the clients were ready.
 
 ### Changed (Unity)
