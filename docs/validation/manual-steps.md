@@ -1,6 +1,6 @@
 # 人の段（manual-steps）の実機の確かめ（R3、v0.13.0）
 
-runner の `manual-steps`（`docs/plans/r3-contract.md`）を Windows 実機で確かめる手順と、その記録です。2026-11-26 にここで PASS を記録した commit で、runner の `VALIDATED_PROCEDURES` に manual-steps を足しました。それより前の runner では `--unvalidated` を付けたときだけ動きます。Unity の Run の始めには、画面から始めることを確かめるまで出しません（待ちの画面は出ます）。
+runner の `manual-steps`（`docs/plans/r3-contract.md`）を Windows 実機で確かめる手順と、その記録です。2026-11-26 にここで PASS を記録した commit で、runner の `VALIDATED_PROCEDURES` に manual-steps を足しました。それより前の runner では `--unvalidated` を付けたときだけ動きます。Unity の Run の始めには、画面から始めることを確かめた 0.13.1 から出します（下の 5。待ちの画面は 0.13.0 から出ます）。
 
 確かめはデスクトップの2台だけで行います（2026-11-26 に利用者が決定）。VR 台＋観戦台は「未確認」と書きます。Windows で人がすることはありません。Bridge は 0.12.0 のまま（入れ替えなし）。
 
@@ -40,7 +40,13 @@ python3 package/Tools~/vrcrt_runner.py run --build headless --unity /Application
 2. 期待すること: 5 s ほどで UNKNOWN `clientChanged`、項目 a は interrupted、待ちの画面は消え、`answer` は断られる。
 3. `vrcrt.sh launch-client 1` で戻す。
 
-## 4. 記録に書くだけのこと
+## 4. Unity の Run から始める（0.13.1）
+
+1. 試験用のプロジェクトを Unity で開き、シーン B を開く。VRC Remote Test のウィンドウの `Procedure` で manual-steps を選び、`Choose...` で確認の項目のファイル（例: a・b・c の3項目）を選び、`Leave and rejoin after` を a、`Target slot` を 1 にして `Run` を押す。
+2. 待ちの画面で、a を `OK`、b を `NG`（どちらもメモつき）で答え、c を `answer ... skip` で答える。
+3. 期待すること: `--unvalidated` なしで始まる（`procedure.parameters.unvalidated` が false）、a のあと slot 1 が退出と起動し直しをして、b と c は新しい世代で聞く。results の道具の欄（deploy・launch・clientReadiness・worldBuildMatch・evidence・leaveRejoin）は PASS、`manualSteps` は FAIL（NG があるため）、run 全体は FAIL `humanNg`、`testVerdict` は notJudged。a と b の `by` は unity、c は cli。
+
+## 5. 記録に書くだけのこと
 
 - VR 台＋観戦台（`VrchatMode: VR`）: 未確認。
 - 4台: 未確認。
@@ -59,7 +65,17 @@ Mac のエージェントが CLI と computer use で確かめた。Windows で�
 | 3. 待っているあいだの変化 | **PASS**。同じ run の項目 b の待ちのあいだに、Mac から本文なしの `vrcrt.sh close-client 1`。5 s で UNKNOWN `clientChanged`（`revisionChanged: operationRevision 39, this run expected 38`）、項目 b は interrupted、c は notAsked、`waiting.json` は閉じ、そのあとの `answer` は `notWaiting` で断られた（終了コード 1）。Unity の待ちの画面も消えた。`launch-client 1` で戻し、2台が同じインスタンスに入った |
 | VR 台＋観戦台 | 未確認（利用者の決定） |
 | 4台 | 未確認 |
-| Unity の Run から manual-steps を始めること | 未確認（確かめはターミナルから始めた）。そのため画面の手順の選びには、まだ manual-steps を出さない |
+| Unity の Run から manual-steps を始めること | 未確認（確かめはターミナルから始めた）。そのため画面の手順の選びには、まだ manual-steps を出さない。下の 2026-11-26（2回目）で確かめた |
+
+### 2026-11-26（UTC、2回目）、Bridge 0.12.0+4892f91、パッケージ claude/r3-unity-start（v0.13.0 に `ManualStepsStartEnabled = true` を足したもの）
+
+Mac のエージェントが computer use と CLI で確かめた。Windows で人がしたことは無い。統合役の drawstats（Mac の中だけ）のあいだに、統合役と合意して Bridge を使った（15:58〜16:02 JST）。Bridge の exe・設定・`VrchatProfiles`（`[0,1]` のまま）には触れていない。
+
+| 項目 | 結果 |
+|---|---|
+| 4. Unity の Run から始める | **PASS**。run `20261126T065941Z-c8b332b3`、build `20261126T065951779Z-87a1a580`。ウィンドウの `Procedure` に manual-steps が出て、checklist（3項目）、`Leave and rejoin after` a、`Target slot` 1 を選んで `Run` を押すと、`--unvalidated` なしで始まった（`unvalidated: false`）。Unity の Run の配備（Relaunch のため2台とも起動し直し）のあと、待ちの画面が出た。a を Unity の画面から OK（`by: unity`、メモつき）、そのあと slot 1 を前提つきで閉じて起動し直し、b を Unity の画面から NG（`by: unity`、メモつき）、c を `answer` から skip（`by: cli`）。results は deploy・launch・clientReadiness・worldBuildMatch・evidence・leaveRejoin が PASS、manualSteps が FAIL、run 全体は FAIL `humanNg`（契約のとおり。道具の結果は PASS のまま）、testVerdict notJudged。各項目の `seqRange` があり、`evidenceGap` は無し。手順の段 25 がすべて PASS。証拠 34 件の sha256 が一致。run のフォルダーは 0700、`run.json`・`checklist.json`・答えのファイルは 0600。終わったあと、2台が同じインスタンスにいた |
+
+これをもって、Unity の手順の選びに manual-steps を出した（0.13.1）。Unity 2022.3.22f1 の EditMode は、このパッケージの試験 394 件がすべて通った（プロジェクト全体では VRChat の SDK の `GraphNodeTests` が前から1件落ちる）。
 
 ### 確かめの中で直したこと
 
@@ -73,4 +89,4 @@ Mac のエージェントが CLI と computer use で確かめた。Windows で�
 
 ## 結論
 
-manual-steps は、本物の Bridge 0.12.0 と VRChat 2台（デスクトップ）で、Unity の画面とターミナルの両方から答えられ、途中の退出と起動し直しのあとも新しい世代で聞き続け、待ちのあいだの変化では送り直さずに止まることを確かめた。これをもって runner の `VALIDATED_PROCEDURES` に manual-steps を足した。VR、4台、Unity の Run からの始めは未確認。
+manual-steps は、本物の Bridge 0.12.0 と VRChat 2台（デスクトップ）で、Unity の画面とターミナルの両方から答えられ、途中の退出と起動し直しのあとも新しい世代で聞き続け、待ちのあいだの変化では送り直さずに止まることを確かめた。これをもって runner の `VALIDATED_PROCEDURES` に manual-steps を足した。VR と4台は未確認。Unity の Run からの始めは、2回目の確かめ（0.13.1）で確かめた。

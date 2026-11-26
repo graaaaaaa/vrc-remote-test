@@ -125,7 +125,7 @@ python3 package/Tools~/vrcrt_runner.py answer --run <runDir> --wait-id <waitId> 
 - `--leave-rejoin-after <id> --target-slot N` で、その項目の答えのあとに slot N を前提つきで閉じて起動し直します（代表の件 A の「持ち主が退出・途中参加」）。
 - 答えは人の言ったとおりに `results.manualSteps` に残し、道具は試験の合否を決めません（`testVerdict` は `notJudged`）。待っているあいだに台や Bridge が変われば UNKNOWN で止めます。
 - VR 台（slot 0）とデスクトップの観戦台（slot 1）は、Bridge の設定 `VrchatMode: VR`・`VrchatProfiles: [0,1]` で起動できますが、ヘッドセットでの確かめはまだです。
-- 始めるのはターミナルからです（Unity の Run の手順の選びには、画面から始めることを確かめるまで出しません）。待っている run への答えは、Unity の画面からもできます。
+- ターミナルからも、Unity の Run（`Procedure` で manual-steps を選び、checklist のファイル、`Leave and rejoin after`、`Target slot` を決める）からも始められます（0.13.1 から）。待っている run への答えは、どちらで始めた run でも、Unity の画面からもターミナルからもできます。
 
 ## 構成
 
